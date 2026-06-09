@@ -1,7 +1,7 @@
 """CLI: `python -m espjtag [usb_path] [--selftest]`."""
 import sys
 
-from .jtag import EspUsbJtag, selftest
+from .debug import EspUsbJtag, selftest
 
 
 def main():
