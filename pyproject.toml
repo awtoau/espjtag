@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "espjtag"
+version = "0.1.0"
+description = "Pure-Python RISC-V JTAG debugger for the ESP32 built-in USB-JTAG (no OpenOCD)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+authors = [{ name = "AWTO" }]
+keywords = ["esp32", "esp32c6", "jtag", "riscv", "debug", "usb-jtag", "openocd"]
+dependencies = ["pyusb>=1.2"]
+
+[project.urls]
+Homepage = "https://github.com/awtoau/espjtag"
+
+[project.scripts]
+espjtag = "espjtag.__main__:main"
+
+[tool.setuptools]
+packages = ["espjtag"]
