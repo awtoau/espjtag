@@ -15,7 +15,8 @@ import usb.util
 from .constants import (
     VID, PID,
     DMCONTROL, DMSTATUS, HARTINFO, ABSTRACTCS, COMMAND, DATA0,
-    SBCS, SBADDRESS0, SBDATA0,
+    SBCS, SBADDRESS0, SBDATA0, DMI_READ, DMI_WRITE, DMI_NOP,
+    SB_SBERROR, SB_SBBUSYERROR,
     DM_DMACTIVE, DM_NDMRESET, DM_ACKHAVERESET, DM_RESUMEREQ, DM_HALTREQ,
     DM_ALLHALTED, DM_ALLRUNNING, DM_ALLHAVERESET,
     DM_ANYRUNNING, DM_ALLRESUMEACK, DM_ALLUNAVAIL,
@@ -113,11 +114,55 @@ class EspUsbJtag(EspUsbJtagTransport):
         self.dmi_write(SBADDRESS0, addr & 0xFFFFFFFF)
         self.dmi_write(SBDATA0, value & 0xFFFFFFFF)
 
-    def read_mem(self, addr, nwords):
-        """Read nwords 32-bit words starting at addr (autoincrement)."""
+    def _read_mem_slow(self, addr, nwords):
+        """The original per-word read_mem: one USB round-trip per word. Kept as a
+        proven fallback for when the batched path detects an SBA bus error."""
         self._sb_setup(autoincrement=True, readondata=True, readonaddr=True)
         self.dmi_write(SBADDRESS0, addr & 0xFFFFFFFF)
         out = [self.dm_read(SBDATA0) for _ in range(nwords)]
+        self.dmi_write(SBCS, 0)
+        return out
+
+    def read_mem(self, addr, nwords):
+        """Read nwords 32-bit words from addr via System Bus Access, BATCHED.
+
+        SBA with sbreadonaddr+sbreadondata+sbautoincrement makes the hardware do
+        the walking: writing SBADDRESS0 fetches word0 (readonaddr); each READ of
+        SBDATA0 returns the current word AND auto-triggers the next bus read +
+        bumps the address (readondata+autoincrement). So instead of N separate
+        round-trips we issue ONE address write + a PIPELINE of READ(SBDATA0)
+        scans in one batched scan stream (chunked at the IN-FIFO limit).
+
+        Two pipelines stack and BOTH must be accounted for:
+          * the RISC-V DTM read pipeline — a DMI READ scan returns the PREVIOUS
+            DMI access's data, so the data for read #k appears in scan #k+1;
+          * the SBA readondata pipeline — reading SBDATA0 yields the current word
+            and arms the next.
+        Net effect (verified on the bench against the per-word path and OpenOCD
+        `mdw`): issue nwords+1 READ(SBDATA0) scans after the address write; the
+        word stream lands in capture slots [2 .. 2+nwords). We then read SBCS and
+        fall back to the slow per-word path if the burst hit an SBA bus error."""
+        if nwords <= 0:
+            return []
+        self._ensure_dtmcs()
+        self._sb_setup(autoincrement=True, readondata=True, readonaddr=True)
+        reqs = [(SBADDRESS0, addr & 0xFFFFFFFF, DMI_WRITE)]   # arms word0 fetch
+        reqs += [(SBDATA0, 0, DMI_READ)] * (nwords + 1)       # pipeline of reads
+        reqs += [(SBDATA0, 0, DMI_NOP)]                       # flush last DTM read
+        res = self._dmi_batch(reqs)
+        # res[0] is the address write; res[1] is the read-phase that returns the
+        # SBADDRESS0-write's (stale) result; res[2..2+nwords) carry word0..wordN-1.
+        out = [res[2 + i][0] for i in range(nwords)]
+        # Guard: any DTM op-status 3 (busy) in the burst = pipeline stall.
+        if any(res[i][1] == 3 for i in range(1, 2 + nwords)):
+            self.dmi_write(SBCS, 0)
+            return self._read_mem_slow(addr, nwords)
+        # Guard: SBA bus error (sberror / sbbusyerror) -> the burst raced the bus.
+        sbcs = self.dm_read(SBCS)
+        if sbcs & (SB_SBERROR | SB_SBBUSYERROR):
+            self.dmi_write(SBCS, SB_SBERROR | SB_SBBUSYERROR)  # W1C clear
+            self.dmi_write(SBCS, 0)
+            return self._read_mem_slow(addr, nwords)
         self.dmi_write(SBCS, 0)
         return out
 

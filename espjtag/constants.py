@@ -50,6 +50,11 @@ PROGBUF0 = 0x20       # program buffer 0..N
 SBCS = 0x38
 SBADDRESS0 = 0x39
 SBDATA0 = 0x3C
+# sbcs status fields (RISC-V debug spec): sberror[14:12] (0 = no error, W1C),
+# sbbusy[21], sbbusyerror[22] (a read/write was attempted while busy — W1C).
+SB_SBERROR = 0x7 << 12
+SB_SBBUSY = 1 << 21
+SB_SBBUSYERROR = 1 << 22
 # dmcontrol bits
 DM_DMACTIVE = 1 << 0
 DM_NDMRESET = 1 << 1
