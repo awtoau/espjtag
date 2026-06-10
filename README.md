@@ -71,6 +71,29 @@ python -m espjtag --selftest      # verify the JTAG stack (C6)
 | Cross-platform USB reset (Win/Linux/mac) | ✅ pyusb `dev.reset()` — see [docs/CROSS-PLATFORM-USB.md](docs/CROSS-PLATFORM-USB.md) |
 | Flash programming over JTAG | 🚧 roadmap (ROM `esp_rom_spiflash_*` call) |
 
+## MCP server (debug from an AI client)
+
+`espjtag` ships an [MCP](https://modelcontextprotocol.io) server so an MCP client
+(Claude Code, the planned VS Code extension
+[#15](https://github.com/awtoau/espjtag/issues/15), …) can drive the debugger as
+tools — list probes, read IDCODE/memory/registers, halt/resume, and reset an
+ESP32 over JTAG:
+
+```sh
+pip install mcp                 # the official Python SDK (extra dependency)
+python -m espjtag.mcp           # serve MCP over stdio
+
+# register with Claude Code:
+claude mcp add espjtag -- python -m espjtag.mcp
+```
+
+Read-only tools (`list_probes`, `idcode`, `diag`, `read_memory`, `probe`) don't
+disturb the running firmware; mutating tools (`halt`, `resume`, `read_register`,
+`write_register`, `write_memory`, `reset_run`, `reset_from_rom`) pause or reset
+the target and are annotated accordingly. With many boards on the bus, every tool
+pins a unit by `usb_path` or `serial`. Full tool list, design notes, and client
+config: **[docs/MCP-SERVER.md](docs/MCP-SERVER.md)**.
+
 ## Scope
 
 RISC-V parts only (C3/C5/C6/H2). The Xtensa parts (S2/S3) use the **same USB

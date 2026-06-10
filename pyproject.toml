@@ -13,11 +13,18 @@ authors = [{ name = "AWTO" }]
 keywords = ["esp32", "esp32c6", "jtag", "riscv", "debug", "usb-jtag", "openocd"]
 dependencies = ["pyusb>=1.2"]
 
+[project.optional-dependencies]
+# The MCP server (python -m espjtag.mcp) needs the official MCP Python SDK.
+# It's an EXTRA, not a core dep: `import espjtag` and the CLI work without it
+# (the SDK is imported lazily inside espjtag.mcp_server.build_server).
+mcp = ["mcp>=1.0"]
+
 [project.urls]
 Homepage = "https://github.com/awtoau/espjtag"
 
 [project.scripts]
 espjtag = "espjtag.__main__:main"
+espjtag-mcp = "espjtag.mcp_server:main"
 
 [tool.setuptools]
 packages = ["espjtag"]
