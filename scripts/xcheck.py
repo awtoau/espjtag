@@ -62,7 +62,10 @@ PROFILES = {
                     gpio={"GPIO_OUT": 0x60004004, "GPIO_ENABLE": 0x60004020,
                           "GPIO_STRAP": 0x60004038, "GPIO_IN": 0x6000403C,
                           "GPIO_STATUS": 0x60004044},
-                    sensor={}),
+                    sensor={},
+                    # the two Xtensa OCD targets — read each core's PC to show the
+                    # dual cores (PRO_CPU + APP_CPU) are genuinely independent.
+                    ocd_cores=["esp32s3.cpu0", "esp32s3.cpu1"]),
 }
 
 # RISC-V DM registers (DMI address space) — espjtag AND OpenOCD (`riscv dmi_read`).
@@ -149,6 +152,9 @@ def read_openocd(usb_loc, prof, mem_addr, nwords):
             argv += ["-c", f'echo "X {nm}=[format 0x%08x [lindex [read_memory '
                             f'0x{addr:08x} 32 1] 0]]"']
         argv += ["-c", f'echo "X mem=[read_memory 0x{mem_addr:08x} 32 {nwords}]"']
+        for cn in prof.get("ocd_cores", []):           # per-core PC (dual-core proof)
+            argv += ["-c", f"targets {cn}", "-c", f'echo "CORE={cn}"',
+                     "-c", "reg pc -force"]
         argv += ["-c", "resume"]
     argv += ["-c", "exit"]
     r = subprocess.run(argv, capture_output=True, text=True)
@@ -165,6 +171,12 @@ def read_openocd(usb_loc, prof, mem_addr, nwords):
     cores = re.findall(r"^\s*\d+\*?\s+(\S+)\s+\S+\s+\S+\s+\S+\s+(\w+)\s*$", text, re.M)
     if cores:
         out["cores"] = cores
+    # per-core PC: each "CORE=<name>" marker is followed by that core's "pc (/N): 0x.."
+    core_pc = {}
+    for m in re.finditer(r"CORE=(\S+).*?\bpc \(/\d+\): (0x[0-9a-fA-F]+)", text, re.S):
+        core_pc.setdefault(m.group(1), int(m.group(2), 16))
+    if core_pc:
+        out["core_pc"] = core_pc
     for m in re.finditer(r"^X (\w+)=(0x[0-9a-fA-F]+)\s*$", text, re.M):
         out[m.group(1)] = int(m.group(2), 16)
     m = re.search(r"^X mem=(.+)$", text, re.M)               # echo->stderr, hex tokens
@@ -263,10 +275,14 @@ def main():
     # Dual-core awareness: list EVERY core OpenOCD examined + its run state. C6 = HP
     # + LP RISC-V (2 harts); S3 = PRO + APP Xtensa (2 targets); C5's cfg exposes 1.
     cores = ocd.get("cores") or []
+    cpc = ocd.get("core_pc") or {}
     harts = ocd.get("harts") or 0
     print("-- cores (OpenOCD targets — these are multi-core parts) --")
     for nm, st in cores:
-        print(f"    {nm:22} {st}")
+        pc = cpc.get(nm)
+        print(f"    {nm:22} {st}" + (f"  pc={h(pc)}" if pc is not None else ""))
+    if len(cpc) >= 2 and len(set(cpc.values())) > 1:
+        print("    -> cores are at DIFFERENT PCs — genuinely independent CPUs")
     if len(cores) <= 1 and harts > 1:                   # C6: 2 harts under 1 target
         print(f"    (1 OpenOCD target exposing {harts} harts — e.g. C6 HP + LP)")
     if prof["core"] == "riscv":
