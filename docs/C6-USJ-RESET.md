@@ -47,8 +47,7 @@ is a **combination**, and the distinction matters:
   **+** the full SoC reset-register / ndmreset / deassert / halt → dcsr → resume
   handshake. That is exactly what `reset_run_from_rom()` does, and it is bench-proven
   on a C6. (See
-  [DEVICES-AND-FLASHING.md](https://github.com/awto-au/esp32-zephyr/blob/main/docs/DEVICES-AND-FLASHING.md)
-  in the esp32-zephyr repo, [ESPJTAG-STORY.md](ESPJTAG-STORY.md),
+  [ESPJTAG-STORY.md](ESPJTAG-STORY.md),
   [GIT-HISTORY-IDEAS.md](GIT-HISTORY-IDEAS.md) §3b.)
 
 So `dev.py` **still delegates to OpenOCD** here as the long-established proven path,
@@ -79,7 +78,7 @@ A robust fix is to clear `RTC_CNTL_OPTION1_REG` (the sticky force-download bit)
 and provoke a chip-level RTC-WDT reset (set `WDT_CHIP_RESET_EN` +
 `WDT_CHIP_RESET_WIDTH`) on the app's "reboot to bootloader/app" path, so resets
 re-sample the strap in software. Not yet implemented — tracked as
-[esp32-zephyr#39](https://github.com/awto-au/esp32-zephyr/issues/39).
+[espjtag#2](https://github.com/awtoau/espjtag/issues/2).
 
 ## Refs
 esptool #970, esp-idf #13287, esptool C6 troubleshooting docs, openocd-esp32 #316,

@@ -5,9 +5,9 @@ pure-Python RISC-V JTAG debugger that does halt/registers/memory/reset with **no
 OpenOCD binary**, got ~235× faster through a bag of tricks, and ended up *faster
 than OpenOCD's per-word path* — while staying a few-hundred-lines pyusb script.
 
-> Context: why we needed JTAG at all is in
-> [DEVICES-AND-FLASHING.md](https://github.com/awto-au/esp32-zephyr/blob/main/docs/DEVICES-AND-FLASHING.md)
-> (in the esp32-zephyr repo — the Espressif post-flash-reset bug). This doc is the espjtag side: how it works,
+> Context: why we needed JTAG at all is summarized in
+> [C6-USJ-RESET.md](C6-USJ-RESET.md)
+> (the Espressif post-flash-reset bug). This doc is the espjtag side: how it works,
 > how it improved, and every speed trick used.
 
 ## How it works (in one breath)
@@ -110,9 +110,7 @@ Measured/estimated and tracked as perf issues under
 ## Why it matters
 
 - **Kills the OpenOCD dependency** for flash+boot+debug on the RISC-V parts — just
-  the USB cable and Python (see
-  [DEVICES-AND-FLASHING.md](https://github.com/awto-au/esp32-zephyr/blob/main/docs/DEVICES-AND-FLASHING.md),
-  in the esp32-zephyr repo).
+   the USB cable and Python (see [C6-USJ-RESET.md](C6-USJ-RESET.md)).
 - **It's a library**, so it became an esptool reset-fix (`--after jtag-reset`), an
   **MCP server** (debug a chip conversationally from Claude Code), and the backend
   for a planned VS Code extension + Flutter GUI.

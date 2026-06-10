@@ -1,4 +1,4 @@
-<img src="assets/awto-logo.svg" alt="awto.au" width="200">
+<img src="https://awto.au/assets/awto-logo-primary.png" alt="awto.au" width="200">
 
 # espjtag
 

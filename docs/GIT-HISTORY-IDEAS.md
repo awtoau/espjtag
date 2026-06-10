@@ -239,9 +239,8 @@ ops"). The arc:
   boot from ROM via `reset_run_from_rom`; it cannot via a bare `reset_run()`. The
   esptool JTAG-reset class must therefore carry the *deeper* sequence, not just the
   pulse (ESPTOOL-JTAG-INTEGRATION-PLAN.md §0 / Action Item 0, resolved). See
-  [DEVICES-AND-FLASHING.md](https://github.com/awto-au/esp32-zephyr/blob/main/docs/DEVICES-AND-FLASHING.md)
-  (in the esp32-zephyr repo) and
-  [C6-USJ-RESET.md](C6-USJ-RESET.md) for the canonical statement.
+  [C6-USJ-RESET.md](C6-USJ-RESET.md) and
+  [ESPJTAG-STORY.md](ESPJTAG-STORY.md) for the canonical statement.
 
 ### 3c. The batching win — TAP-stays-in-DMI across DR scans (the #8 lever)
 `espjtag/transport.py:429-492` (`_dmi_batch`) and `debug.py:126-167`

@@ -35,9 +35,8 @@ Three coupled threads, all driven from the esp32-zephyr bench:
    [BOARD-GEOMETRY-RESEARCH.md](BOARD-GEOMETRY-RESEARCH.md)).
 
 Issues live on **[awtoau/espjtag](https://github.com/awtoau/espjtag/issues)** (the
-JTAG library + GUI + MCP, no hyphen). Firmware / bench / tooling issues live on
-**[awto-au/esp32-zephyr](https://github.com/awto-au/esp32-zephyr/issues)** (with
-hyphen).
+JTAG library + GUI + MCP, no hyphen). Firmware / bench / tooling follow-ups are
+tracked here too as the docs/work migrated in [#26](https://github.com/awtoau/espjtag/issues/26).
 
 ---
 
@@ -66,8 +65,8 @@ that align to them.
 | [MCP-SERVER.md](MCP-SERVER.md) | The espjtag MCP server (tools, pinning, safety tiers) + capability table | [#14](https://github.com/awtoau/espjtag/issues/14) |
 
 > The firmware/bench side of this story — the fleet, per-chip flashing, and *why*
-> the C6 reset mess pulled in JTAG/OpenOCD — stays in the esp32-zephyr repo:
-> [DEVICES-AND-FLASHING.md](https://github.com/awto-au/esp32-zephyr/blob/main/docs/DEVICES-AND-FLASHING.md).
+> the C6 reset mess pulled in JTAG/OpenOCD — is summarized in
+> [C6-USJ-RESET.md](C6-USJ-RESET.md) and [ESPJTAG-STORY.md](ESPJTAG-STORY.md).
 
 ---
 
@@ -139,8 +138,8 @@ the GUI needs reduces to **halt/resume + read-register + read-memory**. Ship
 **Shape A** (Flutter → OpenOCD-Tcl directly) first, then a **Shape B** adapter that
 can swap the backend to espjtag. The geometry side (BOARD-GEOMETRY-RESEARCH.md)
 recommends **kiutils** to emit `board-geometry.json` from vendored KiCad, joined to
-the live GPIO bit via the existing pad↔GPIO map (which lives in
-[esp32-zephyr's XIAO-PINOUT.md](https://github.com/awto-au/esp32-zephyr/blob/main/docs/XIAO-PINOUT.md)).
+the live GPIO bit via the existing pad↔GPIO map (tracked for migration in
+[#26](https://github.com/awtoau/espjtag/issues/26)).
 The MCP server (MCP-SERVER.md, [#14](https://github.com/awtoau/espjtag/issues/14))
 exposes the debugger as AI tools.
 
