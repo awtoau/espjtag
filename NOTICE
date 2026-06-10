@@ -1,0 +1,26 @@
+espjtag
+Copyright (c) AWTO
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It includes numeric interface constants (register addresses, bit-field offsets,
+and a USB-JTAG command encoding) hand-transcribed from the following upstream
+projects. No source code, macro text, or comments were copied; only the numeric
+facts required to interoperate, plus an independently re-expressed TAP scan
+algorithm. See ACKNOWLEDGEMENTS.md for the full analysis and the pinned commit
+(upstream.lock).
+
+1. openocd-esp32 — https://github.com/espressif/openocd-esp32
+   - src/jtag/drivers/esp_usb_jtag.c   (GPL-2.0-or-later, Copyright Espressif Systems)
+   - src/jtag/drivers/bitq.c           (GPL-2.0-or-later)
+   Ported: the esp_usb_jtag USB-JTAG command nibble layout, VEND_JTAG_SETDIV,
+   CMD_FLUSH, the JTAG caps descriptor wValue, and the TAP scan model. These are
+   used as uncopyrightable hardware-interface facts; attribution is provided here
+   as a courtesy and to document provenance.
+
+2. RISC-V External Debug Support specification, via openocd-esp32
+   - src/target/riscv/debug_defines.h  (SPDX: BSD-2-Clause OR CC-BY-4.0)
+   Auto-generated from https://github.com/riscv/riscv-debug-spec
+   Ported under the BSD-2-Clause option: the RISC-V Debug Module register
+   addresses and field bit-offsets. The BSD-2-Clause copyright notice and
+   disclaimer apply to those constants; this NOTICE preserves the attribution.

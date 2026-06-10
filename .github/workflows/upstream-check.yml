@@ -1,0 +1,84 @@
+name: upstream-check
+
+# Go/no-go drift check for the numeric constants espjtag hand-ports from
+# openocd-esp32 (esp_usb_jtag.c / bitq.c) and the RISC-V debug spec
+# (debug_defines.h). See upstream.lock + scripts/check_upstream.py.
+#
+#   exit 0 = GO       (nothing we depend on moved)        -> green
+#   exit 1 = NO-GO    (a depended-on value changed)       -> fail + open issue
+#   exit 2 = UNKNOWN  (offline / rate-limited / 404)      -> warn, don't fail
+
+on:
+  schedule:
+    # Weekly, Mondays 06:17 UTC. Off the hour to avoid the cron rush; weekly is
+    # plenty -- upstream register defs change on the order of months, not days.
+    - cron: "17 6 * * 1"
+  workflow_dispatch: {}        # run on demand from the Actions tab
+  push:
+    paths:
+      - upstream.lock
+      - scripts/check_upstream.py
+      - .github/workflows/upstream-check.yml
+
+permissions:
+  contents: read
+  issues: write                # to open/append the NO-GO alert issue
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run upstream drift check
+        id: check
+        env:
+          # check_upstream.py prefers `gh`, which the runner has pre-authed via
+          # this token -> higher rate limit than anonymous HTTPS.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          python3 scripts/check_upstream.py | tee check_output.txt
+          code=${PIPESTATUS[0]}
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          set -e
+          # exit 2 (UNKNOWN/offline) must NOT fail the job -- transient only.
+          if [ "$code" = "2" ]; then
+            echo "::warning::upstream-check could not fetch some sources (UNKNOWN); not failing."
+            exit 0
+          fi
+          exit "$code"
+
+      - name: Open / update NO-GO alert issue
+        if: failure() && steps.check.outputs.exit_code == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="upstream-check NO-GO: a ported constant drifted"
+          body_file=alert_body.md
+          {
+            echo "The scheduled upstream drift check found that a value espjtag"
+            echo "**depends on** changed upstream. Re-audit the affected port in"
+            echo "\`espjtag/constants.py\` against the new upstream, then bump"
+            echo "\`pinned_sha\` + the changed \`expected\` in \`upstream.lock\`."
+            echo ""
+            echo "Run: [\`${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
+            echo ""
+            echo '```'
+            cat check_output.txt
+            echo '```'
+          } > "$body_file"
+
+          existing=$(gh issue list --state open --search "$title in:title" \
+            --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file "$body_file"
+          else
+            gh issue create --title "$title" --body-file "$body_file" \
+              --label upstream-drift || \
+            gh issue create --title "$title" --body-file "$body_file"
+          fi

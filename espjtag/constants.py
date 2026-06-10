@@ -1,6 +1,14 @@
 """espjtag.constants — esp_usb_jtag protocol + RISC-V Debug Module register/field
-definitions. Ported from openocd-esp32 (esp_usb_jtag.c) and the RISC-V external
-debug spec (debug_defines.h). Shared by the transport, reset, and debug layers.
+definitions. Shared by the transport, reset, and debug layers.
+
+Ported (hand-transcribed numeric facts, not copied code) from:
+  - openocd-esp32  src/jtag/drivers/esp_usb_jtag.c   (GPL-2.0-or-later)
+        the CMD_* nibble layout, VEND_JTAG_SETDIV, caps descriptor wValue
+  - openocd-esp32  src/target/riscv/debug_defines.h  (BSD-2-Clause OR CC-BY-4.0)
+        the RISC-V Debug Module register addresses + field bit-offsets
+Pinned upstream commit + the exact symbols we depend on: ../upstream.lock.
+Provenance + licensing analysis: ../ACKNOWLEDGEMENTS.md. Drift check:
+scripts/check_upstream.py. Not affiliated with Espressif / OpenOCD / RISC-V.
 """
 
 VID, PID = 0x303A, 0x1001
@@ -50,9 +58,15 @@ DM_HARTRESET = 1 << 29             # 0x20000000
 DM_RESUMEREQ = 1 << 30            # 0x40000000
 DM_HALTREQ = 1 << 31             # 0x80000000
 # dmstatus bits
+DM_ANYRUNNING = 1 << 10
 DM_ALLHALTED = 1 << 9
 DM_ALLRUNNING = 1 << 11
+DM_ANYRESUMEACK = 1 << 16
+DM_ALLRESUMEACK = 1 << 17
+DM_ANYHAVERESET = 1 << 18
 DM_ALLHAVERESET = 1 << 19
+DM_ANYUNAVAIL = 1 << 12
+DM_ALLUNAVAIL = 1 << 13
 # abstractcs
 ABS_BUSY = 1 << 12
 ABS_CMDERR = 0x7 << 8
@@ -67,3 +81,23 @@ CSR_DCSR = 0x7B0
 CSR_DPC = 0x7B1
 # GPR register index in abstract-command regno space (0x1000 + gpr)
 REG_GPR_BASE = 0x1000
+
+# === ESP32-C6-specific reset-controller registers (LP_AON), from openocd-esp32
+# tcl/target/esp32c6.cfg esp32c6_soc_reset. Written via System Bus Access while
+# the hart is halted. These are the chip's software-reset registers the C6 needs
+# instead of (well, in addition to) ndmreset, because a bare ndmreset is a CORE
+# reset that does NOT re-sample the BOOT strap (esp-idf USB-Serial/JTAG console
+# guide). 0x600b1034 bit31 = LP_AON_HPSYS_SW_RESET (reset the whole HP system);
+# 0x600b1038 bit28 = LP_AON_CPU_CORE0_SW_RESET.
+C6_LP_AON_SYS_CFG = 0x600B1034          # write 0x80000000 = HPSYS_SW_RESET
+C6_LP_AON_SYS_CFG_HPSYS_SW_RESET = 0x80000000
+C6_LP_AON_CPUCORE0_CFG = 0x600B1038     # write 0x10000000 = CPU_CORE0_SW_RESET
+C6_LP_AON_CPUCORE0_SW_RESET = 0x10000000
+
+# dcsr value OpenOCD writes after a reset (set_dcsr_ebreak): ebreakm|ebreaku set
+# so an EBREAK in any privilege mode enters debug mode rather than trapping. Read
+# (0xc3 on the C6 at reset), OR in the ebreak bits, write back -> 0x90c3. This is
+# part of OpenOCD's reset-run handshake the bare-write list omitted.
+DCSR_EBREAKU = 1 << 12                   # 0x1000
+DCSR_EBREAKM = 1 << 15                   # 0x8000
+DCSR_EBREAK_BITS = DCSR_EBREAKM | DCSR_EBREAKU   # -> turns 0xc3 into 0x90c3

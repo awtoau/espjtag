@@ -16,6 +16,10 @@ Sequence mirrors OpenOCD's `reset run` (captured from its -d3 log):
     dmcontrol <- haltreq | dmactive              (deassert ndmreset, hold halted)
     dmcontrol <- ackhavereset | dmactive
     dmcontrol <- resumereq | dmactive            (run the freshly-strapped app)
+
+dmcontrol bit offsets come from the RISC-V debug spec (openocd-esp32
+src/target/riscv/debug_defines.h, BSD-2-Clause OR CC-BY-4.0). Pinned upstream:
+../upstream.lock. Provenance + licensing: ../ACKNOWLEDGEMENTS.md.
 """
 
 import time
