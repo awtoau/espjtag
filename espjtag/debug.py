@@ -289,14 +289,31 @@ class EspUsbJtag(EspUsbJtagTransport):
         run` both boot 0/3 from this state; the core just lands back at the ROM
         reset vector with download still latched.
 
-        What DOES clear the strap latch is a USB *bus* reset (USBDEVFS_RESET),
-        which re-enumerates the USJ peripheral. But a USB reset ALONE is also 0/3
-        (the core is still parked in esptool's download stub). The reliable boot,
-        proven 3/3 on xiao-c6-b, is the COMBINATION, in this order:
+        What DOES clear the strap latch is a USB *bus* reset, which re-enumerates
+        the USJ peripheral. But a USB reset ALONE is also 0/3 (the core is still
+        parked in esptool's download stub). The reliable boot, proven 3/3 on
+        xiao-c6-b, is the COMBINATION, in this order:
 
             1. USB bus reset      -> re-enumerate USJ, clear the download latch
             2. ndmreset + resume  -> restart the core so the just-re-strapped ROM
                                      boots from flash instead of the stub
+
+        The USB bus reset goes through the cross-platform helper
+        espjtag.usbreset.reset_device (pyusb dev.reset() == libusb_reset_device;
+        on Linux that is the SAME USBDEVFS_RESET ioctl this flow was proven with —
+        see usbreset.py and docs/CROSS-PLATFORM-USB.md for the per-OS behaviour).
+
+        == REQUIRED BENCH RE-VERIFICATION (espjtag #13) =======================
+        The 3/3 ROM-boot result was measured with the OLD code path on Linux.
+        Routing the reset through usbreset.reset_device does NOT change the
+        underlying call on Linux (still USBDEVFS_RESET via libusb), so the strap-
+        clear SHOULD be unchanged — but this MUST be re-verified on the bench
+        (flash a C6 with esptool --after no-reset, then reset_run_from_rom, and
+        confirm it boots the app, repeated for confidence) before this path is
+        trusted. The USB reset is load-bearing for the strap clear; do NOT assume
+        it boots untested. macOS is expected NOT to work (libusb_reset_device is a
+        documented silent no-op there); Windows is untested.
+        ======================================================================
 
         Around the ndmreset we run OpenOCD's faithful reset-run handshake (ported
         from openocd-esp32 riscv-013.c + esp32c6.cfg): the esp32c6_soc_reset SBA
@@ -308,7 +325,7 @@ class EspUsbJtag(EspUsbJtagTransport):
         Returns True on a clean resume. Leaves the app running. The USB reset
         invalidates this object's handle, so a NEW transport is opened internally
         for the JTAG phase; the caller's `self.dev` is disposed."""
-        import usb.core
+        from .usbreset import reset_device, platform_reset_note
 
         def _log(m):
             if log:
@@ -316,14 +333,14 @@ class EspUsbJtag(EspUsbJtagTransport):
 
         # --- phase 1: USB bus reset to clear the BOOT-strap-LOW download latch ---
         # Remember how to re-find this exact unit (the reset re-enumerates it).
+        # (bus, port_numbers) is the stable identity that SURVIVES a bus reset —
+        # the bus address changes, the physical port path does not.
         bus = self.dev.bus
         ports = tuple(self.dev.port_numbers or ())
         _log(f"  reset_run_from_rom: USB bus reset (clears C6 strap latch) "
              f"on bus {bus} ports {ports}")
-        try:
-            self.dev.reset()                         # USBDEVFS_RESET — re-enumerates
-        except usb.core.USBError as e:
-            _log(f"    (USB reset raised {e}; usually benign — device re-enumerates)")
+        _log(f"    {platform_reset_note()}")
+        reset_device(self.dev, log=_log)             # cross-platform; re-enumerates
         usb.util.dispose_resources(self.dev)
 
         # --- phase 2: reopen JTAG on the same unit and run the reset handshake ---

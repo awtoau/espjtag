@@ -15,6 +15,7 @@ import time
 import usb.core
 import usb.util
 
+from .usbreset import IS_LINUX as _IS_LINUX
 from .constants import (
     VID, PID, VENDOR_CLASS, CMD_FLUSH, _clk, _bits_to_int,
     IR_DTMCS, IR_DMI, IR_LEN, DMI_NOP, DMI_READ, DMI_WRITE,
@@ -76,11 +77,21 @@ class EspUsbJtagTransport:
         if intf is None:
             raise RuntimeError("esp_usb_jtag: no vendor-spec (JTAG) interface")
         self.iface = intf.bInterfaceNumber
-        try:
-            if dev.is_kernel_driver_active(self.iface):
-                dev.detach_kernel_driver(self.iface)
-        except (NotImplementedError, usb.core.USBError):
-            pass
+        # Detaching a kernel driver is a LINUX concept: on Linux the cdc_acm /
+        # usbhid kernel driver may have grabbed an interface and must be detached
+        # before libusb can claim it. On Windows and macOS there is no kernel
+        # driver to detach for a WinUSB/libusb-bound vendor interface, and pyusb's
+        # is_kernel_driver_active / detach_kernel_driver raise NotImplementedError
+        # there — so we SKIP them off-Linux by design (not by swallowing an
+        # error). The JTAG iface is class 0xFF; on Windows it needs a WinUSB
+        # driver bound (Zadig / a bundled .inf) — see docs/CROSS-PLATFORM-USB.md.
+        if _IS_LINUX:
+            try:
+                if dev.is_kernel_driver_active(self.iface):
+                    dev.detach_kernel_driver(self.iface)
+            except (NotImplementedError, usb.core.USBError):
+                # Already detached, or the backend doesn't support it — harmless.
+                pass
         usb.util.claim_interface(dev, self.iface)
         self.ep_out = usb.util.find_descriptor(
             intf, custom_match=lambda e: usb.util.endpoint_direction(

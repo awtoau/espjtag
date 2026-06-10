@@ -6,6 +6,7 @@ drives the RISC-V Debug Module.
 Layers (see issue #5 — kept separable so a minimal esptool PR can take just the
 transport + reset, not the whole debugger):
   espjtag.transport  — esp_usb_jtag USB + JTAG TAP + DMI read/write  (the base)
+  espjtag.usbreset   — cross-platform USB bus-reset helper (pyusb dev.reset())
   espjtag.reset      — the reset-after-flash fix (ndmreset), transport-only
   espjtag.debug      — halt/resume, GPR/CSR, memory r/w, diag  (the full debugger)
 
@@ -23,6 +24,8 @@ transport + reset, not the whole debugger):
 from .transport import EspUsbJtagTransport
 from .debug import EspUsbJtag, diag, selftest
 from .reset import reset_run
+from .usbreset import reset_device, platform_reset_note
 
-__all__ = ["EspUsbJtag", "EspUsbJtagTransport", "reset_run", "diag", "selftest"]
+__all__ = ["EspUsbJtag", "EspUsbJtagTransport", "reset_run", "diag", "selftest",
+           "reset_device", "platform_reset_note"]
 __version__ = "0.4.0"

@@ -63,7 +63,8 @@ python -m espjtag --selftest      # verify the JTAG stack (C6)
 | GPR + CSR read/write (abstract command) | ✅ |
 | Memory read/write (System Bus Access) | ✅ |
 | `reset_run()` — ndmreset, reboot a running core | ✅ |
-| Boot a chip out of post-flash ROM download | ⚠️ use OpenOCD (deeper sequence) |
+| Boot a chip out of post-flash ROM download (`reset_run_from_rom()`) | ⚠️ Linux: needs bench re-verify after the cross-platform refactor ([#13](docs/CROSS-PLATFORM-USB.md)); macOS no-op |
+| Cross-platform USB reset (Win/Linux/mac) | ✅ pyusb `dev.reset()` — see [docs/CROSS-PLATFORM-USB.md](docs/CROSS-PLATFORM-USB.md) |
 | Flash programming over JTAG | 🚧 roadmap (ROM `esp_rom_spiflash_*` call) |
 
 ## Scope
