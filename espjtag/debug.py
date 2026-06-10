@@ -8,13 +8,18 @@ import time
 import usb.util
 
 from .constants import (
+    VID, PID,
     DMCONTROL, DMSTATUS, HARTINFO, ABSTRACTCS, COMMAND, DATA0,
     SBCS, SBADDRESS0, SBDATA0,
     DM_DMACTIVE, DM_NDMRESET, DM_ACKHAVERESET, DM_RESUMEREQ, DM_HALTREQ,
     DM_ALLHALTED, DM_ALLRUNNING, DM_ALLHAVERESET,
+    DM_ANYRUNNING, DM_ALLRESUMEACK, DM_ALLUNAVAIL,
     ABS_BUSY, ABS_CMDERR,
     CMD_ACCESS_REGISTER, AC_TRANSFER, AC_WRITE, AC_AARSIZE32,
-    CSR_DPC, REG_GPR_BASE,
+    CSR_DCSR, CSR_DPC, REG_GPR_BASE,
+    C6_LP_AON_SYS_CFG, C6_LP_AON_SYS_CFG_HPSYS_SW_RESET,
+    C6_LP_AON_CPUCORE0_CFG, C6_LP_AON_CPUCORE0_SW_RESET,
+    DCSR_EBREAK_BITS,
 )
 from .transport import EspUsbJtagTransport
 
@@ -147,6 +152,168 @@ class EspUsbJtag(EspUsbJtagTransport):
         self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)           # RUN
         self.dmi_write(DMCONTROL, 0)                                    # release DM
         usb.util.dispose_resources(self.dev)
+
+    # === Faithful OpenOCD `reset run` building blocks (riscv-013.c) =========
+    # These mirror the riscv013_* helpers OpenOCD runs around its reset, which the
+    # captured 12-write list omitted (it logged only the dmi_write *commands*, not
+    # the stateful halt/dcsr/resume polls). Ported by LOGIC, not literal C.
+
+    def _halt_go(self, timeout=256):
+        """riscv013_halt_go: set haltreq, poll dmstatus until no hart is running,
+        then drop haltreq. Returns True if halted."""
+        self.dmi_write(DMCONTROL, DM_HALTREQ | DM_DMACTIVE)
+        ok = False
+        for _ in range(timeout):
+            if not (self.dm_read(DMSTATUS) & DM_ANYRUNNING):
+                ok = True
+                break
+        self.dmi_write(DMCONTROL, DM_DMACTIVE)            # haltreq <- 0
+        return ok
+
+    def _set_dcsr_ebreak(self):
+        """set_dcsr_ebreak(step=false): read dcsr, OR in ebreakm|ebreaku, write it
+        back (only if changed). On the C6 this turns 0xc3 into 0x90c3 — exactly
+        what OpenOCD's -d3 trace shows (dcsr <- 0x90c3). The hart must be halted."""
+        dcsr = self.read_register(CSR_DCSR)
+        new = dcsr | DCSR_EBREAK_BITS
+        if new != dcsr:
+            self.write_register(CSR_DCSR, new)
+        return dcsr, new
+
+    def _resume_go(self, timeout=256):
+        """riscv013_step_or_resume_current_hart(step=false): set resumereq, poll
+        dmstatus until allresumeack (fail on allunavail), then clear resumereq.
+        Returns True on a clean resume. The hart must be halted first."""
+        self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)
+        for _ in range(timeout):
+            st = self.dm_read(DMSTATUS)
+            if st & DM_ALLUNAVAIL:
+                self.dmi_write(DMCONTROL, DM_DMACTIVE)
+                return False
+            if st & DM_ALLRESUMEACK:
+                self.dmi_write(DMCONTROL, DM_DMACTIVE)    # resumereq <- 0
+                return True
+        self.dmi_write(DMCONTROL, DM_DMACTIVE)
+        return False
+
+    def _c6_soc_reset(self):
+        """esp32c6_soc_reset (openocd-esp32 tcl/target/esp32c6.cfg, run from the
+        reset-assert-post event): the ESP32-C6-specific assert. Halt the hart,
+        then via System Bus Access poke the two LP_AON software-reset registers,
+        clearing dmactive between them to drop SBA's sbbusy (or the DM wedges).
+        Ends by re-asserting haltreq|ndmreset (0x80000003) to hold the hart in
+        reset — exactly the captured 12 writes, in order."""
+        self.dmi_write(DMCONTROL, DM_HALTREQ | DM_DMACTIVE)              # 0x80000001
+        # LP_AON_SYS_CFG = HPSYS_SW_RESET  (write 0x80000000 to 0x600b1034 via SBA)
+        self.write_mem32(C6_LP_AON_SYS_CFG, C6_LP_AON_SYS_CFG_HPSYS_SW_RESET)
+        self.dmi_write(DMCONTROL, 0)                                     # clear sbbusy
+        # LP_AON_CPUCORE0_CFG = CPU_CORE0_SW_RESET (0x10000000 to 0x600b1038)
+        self.write_mem32(C6_LP_AON_CPUCORE0_CFG, C6_LP_AON_CPUCORE0_SW_RESET)
+        self.dmi_write(DMCONTROL, 0)                                     # clear sbbusy
+        self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)            # 0x40000001
+        time.sleep(0.01)                                                 # OpenOCD `sleep 10` (ms): let the SW reset propagate before re-asserting
+        self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)            # 0x40000001 (clear allhalted)
+        self.dmi_write(DMCONTROL, DM_HALTREQ | DM_NDMRESET | DM_DMACTIVE)  # 0x80000003 hold in reset
+
+    def _deassert_reset(self, timeout=256):
+        """riscv_deassert_reset: clear ndmreset (write dmactive, haltreq=0 for a
+        `run`), poll dmstatus until the hart has left reset (NOT allunavail-without-
+        havereset), then ackhavereset."""
+        self.dmi_write(DMCONTROL, DM_DMACTIVE)            # ndmreset <- 0, haltreq <- 0
+        for _ in range(timeout):
+            st = self.dm_read(DMSTATUS)
+            if not (st & DM_ALLUNAVAIL) or (st & DM_ALLHAVERESET):
+                break
+        self.dmi_write(DMCONTROL, DM_ACKHAVERESET | DM_DMACTIVE)
+
+    def reset_run_from_rom(self, log=None):
+        """Boot a freshly-flashed ESP32-C6 OUT of post-flash USB-Serial/JTAG ROM
+        download mode and into its app — the case the plain reset_run() can't do.
+
+        WHY reset_run() isn't enough (verified on the bench): when esptool leaves
+        the chip with `--after no-reset`, the C6 is held in download mode by the
+        BOOT-strap being *sampled LOW*. Per Espressif's USB-Serial/JTAG console
+        guide, the USJ can only trigger a CORE reset, which does NOT re-sample the
+        strap — so a bare ndmreset (or even OpenOCD's pure-JTAG `reset run`)
+        re-enters the ROM downloader. Measured: ndmreset-only and OpenOCD `reset
+        run` both boot 0/3 from this state; the core just lands back at the ROM
+        reset vector with download still latched.
+
+        What DOES clear the strap latch is a USB *bus* reset (USBDEVFS_RESET),
+        which re-enumerates the USJ peripheral. But a USB reset ALONE is also 0/3
+        (the core is still parked in esptool's download stub). The reliable boot,
+        proven 3/3 on xiao-c6-b, is the COMBINATION, in this order:
+
+            1. USB bus reset      -> re-enumerate USJ, clear the download latch
+            2. ndmreset + resume  -> restart the core so the just-re-strapped ROM
+                                     boots from flash instead of the stub
+
+        Around the ndmreset we run OpenOCD's faithful reset-run handshake (ported
+        from openocd-esp32 riscv-013.c + esp32c6.cfg): the esp32c6_soc_reset SBA
+        writes (assert), riscv_deassert_reset's poll+ackhavereset, then the
+        halt_set_dcsr_ebreak step OpenOCD does whenever a hart spontaneously
+        resets — halt_go, dcsr <- 0x90c3 (ebreakm|ebreaku), and the resume
+        handshake (resumereq, poll allresumeack, clear resumereq).
+
+        Returns True on a clean resume. Leaves the app running. The USB reset
+        invalidates this object's handle, so a NEW transport is opened internally
+        for the JTAG phase; the caller's `self.dev` is disposed."""
+        import usb.core
+
+        def _log(m):
+            if log:
+                log(m)
+
+        # --- phase 1: USB bus reset to clear the BOOT-strap-LOW download latch ---
+        # Remember how to re-find this exact unit (the reset re-enumerates it).
+        bus = self.dev.bus
+        ports = tuple(self.dev.port_numbers or ())
+        _log(f"  reset_run_from_rom: USB bus reset (clears C6 strap latch) "
+             f"on bus {bus} ports {ports}")
+        try:
+            self.dev.reset()                         # USBDEVFS_RESET — re-enumerates
+        except usb.core.USBError as e:
+            _log(f"    (USB reset raised {e}; usually benign — device re-enumerates)")
+        usb.util.dispose_resources(self.dev)
+
+        # --- phase 2: reopen JTAG on the same unit and run the reset handshake ---
+        # Re-enumeration takes a moment; retry the open until the unit is back.
+        # 100 tries x ~the open's own latency covers the USJ re-enumeration with
+        # margin (measured back in well under a second); each failed open is the
+        # device simply not on the bus yet, so we just try again.
+        j = None
+        last = None
+        for _ in range(100):
+            try:
+                j = EspUsbJtag._reopen(bus, ports)
+                break
+            except Exception as e:                   # noqa: BLE001
+                last = e
+        if j is None:
+            raise RuntimeError(f"reset_run_from_rom: USJ did not re-enumerate "
+                               f"after USB reset (last: {last})")
+
+        _log("  reset_run_from_rom: JTAG back; running OpenOCD-faithful reset run")
+        j.examine()
+        j._c6_soc_reset()                            # assert (esp32c6_soc_reset)
+        j._deassert_reset()                          # leave reset, ackhavereset
+        # halt_set_dcsr_ebreak: the hart just reset -> halt, set dcsr.ebreak, resume
+        j._halt_go()
+        old, new = j._set_dcsr_ebreak()
+        _log(f"    dcsr 0x{old:08x} -> 0x{new:08x}")
+        ran = j._resume_go()
+        _log(f"    resume {'ACKed (app running)' if ran else 'did NOT ack'}")
+        j.dmi_write(DMCONTROL, 0)                    # release DM
+        usb.util.dispose_resources(j.dev)
+        return ran
+
+    @classmethod
+    def _reopen(cls, bus, ports):
+        """Open the EspUsbJtag for the unit at (bus, port_numbers) — used to
+        re-acquire THIS device after a USB bus reset re-enumerated it. Builds a
+        usb_path string the transport's matcher understands ("bus-p.p.p")."""
+        usb_path = f"{bus}-" + ".".join(str(p) for p in ports) if ports else None
+        return cls(usb_path)
 
 
 def diag(usb_path=None, log=print):
