@@ -25,4 +25,4 @@ from .debug import EspUsbJtag, diag, selftest
 from .reset import reset_run
 
 __all__ = ["EspUsbJtag", "EspUsbJtagTransport", "reset_run", "diag", "selftest"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"
