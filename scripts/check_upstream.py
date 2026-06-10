@@ -4,6 +4,8 @@
 espjtag hand-transcribes a handful of numeric values from upstream:
   - openocd-esp32  src/jtag/drivers/esp_usb_jtag.c   (USB-JTAG command nibbles)
   - openocd-esp32  src/jtag/drivers/bitq.c           (the TAP scan model)
+  - openocd-esp32  tcl/target/esp32c6.cfg            (WDT-disable + SoC-reset regs
+                                                      -> chips.py wdt/reset dicts)
   - riscv          src/target/riscv/debug_defines.h  (DM register + field offsets)
 
 These are pinned in ../upstream.lock at a specific commit SHA. This script

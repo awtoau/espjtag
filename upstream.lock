@@ -60,6 +60,34 @@
           "ported_into": ["espjtag/transport.py"],
           "note": "TAP scan model: N-1 bits shifted with TMS=0, last bit TMS=1 -> Exit1, all captured. This is an algorithm, not a #define; no extractable symbol -- tracked by file presence + SHA only. The scan loop in transport._scan() mirrors bitq_scan_field().",
           "symbols": []
+        },
+        "esp32c6.cfg": {
+          "path": "tcl/target/esp32c6.cfg",
+          "ported_into": ["espjtag/chips.py"],
+          "note": "OpenOCD config-as-CODE: the esp32c6_wdt_disable + esp32c6_soc_reset Tcl procs. chips.py CHIPS[0x0000dc25] wdt/reset dicts are the de-scripted DATA form of these. We track the WDT unlock key and the two SoC SW-reset (register,value) pairs so a change to the upstream reset/WDT sequence -> NO-GO. (Closes the gap where only the C headers were drift-checked, not the Tcl that feeds chips.py.)",
+          "symbols": [
+            {
+              "name": "esp32c6_wdt_disable TG0_WKEY",
+              "kind": "define_int",
+              "regex": "mww 0x60008064 (0x[0-9A-Fa-f]+)",
+              "expected": 1356348065,
+              "depends": "chips.py wdt.key = 0x50D83AA1 (the unlock key written to every WDT WKEY before zeroing its config)"
+            },
+            {
+              "name": "esp32c6_soc_reset HPSYS_SW_RESET",
+              "kind": "define_int",
+              "regex": "SB_ADDR0\\s+0x600b1034\\s+riscv dmi_write \\$_RISCV_SB_DATA0\\s+(0x[0-9A-Fa-f]+)",
+              "expected": 2147483648,
+              "depends": "chips.py reset.hpsys_cfg=0x600B1034 + hpsys_sw_reset=0x80000000 (reset_run_from_rom)"
+            },
+            {
+              "name": "esp32c6_soc_reset CPUCORE0_SW_RESET",
+              "kind": "define_int",
+              "regex": "SB_ADDR0\\s+0x600b1038\\s+riscv dmi_write \\$_RISCV_SB_DATA0\\s+(0x[0-9A-Fa-f]+)",
+              "expected": 268435456,
+              "depends": "chips.py reset.cpucore0_cfg=0x600B1038 + cpucore0_sw_reset=0x10000000"
+            }
+          ]
         }
       }
     },
