@@ -35,14 +35,35 @@ class EspUsbJtag(EspUsbJtagTransport):
         d, _ = self.dmi_read(addr)
         return d
 
-    def halt(self, timeout=200):
-        """Request halt and wait for allhalted. Returns True if halted."""
+    def halt(self, timeout=200, disable_wdt=True):
+        """Request halt and wait for allhalted. Returns True if halted.
+
+        On success, by default disables the chip's watchdogs (`disable_wdt`) so a
+        WDT can't reset the chip out from under the debugger while it's held halted
+        — the C6 halt-flakiness fix (probe-rs + OpenOCD both do this). Pass
+        disable_wdt=False to leave them running."""
         self.dmi_write(DMCONTROL, DM_HALTREQ | DM_DMACTIVE)
         for _ in range(timeout):
             if self.dm_read(DMSTATUS) & DM_ALLHALTED:
                 self.dmi_write(DMCONTROL, DM_DMACTIVE)     # drop haltreq
+                if disable_wdt:
+                    self._wdt_disable()
                 return True
         return False
+
+    def _wdt_disable(self):
+        """Disable this chip's watchdogs (TG0/TG1/LP-RTC/super-WDT) so none resets
+        the chip while it's halted. Data-driven from chips.py `wdt`; a no-op on a
+        chip without a wdt table. Writes the memory-mapped WDT regs via SBA — the
+        VERBATIM esp32c6.cfg esp32c6_wdt_disable sequence. Core must be halted."""
+        w = self._chip().get("wdt")
+        if not w:
+            return                                 # untabled chip — leave WDTs alone
+        for wkey_reg, cfg_reg, cfg_val in w["disable"]:
+            self.write_mem32(wkey_reg, w["key"])   # unlock
+            self.write_mem32(cfg_reg, cfg_val)     # zero/feed the config
+        for reg, val in w.get("int_clear", ()):
+            self.write_mem32(reg, val)             # clear pending WDT int state
 
     def resume(self, timeout=200):
         self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)

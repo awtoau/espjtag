@@ -81,6 +81,27 @@ CHIPS = {
             cache_disable_icache=0x40000690,
             cache_enable_icache=0x40000694,
         ),
+        # Watchdogs to disable while the hart is HALTED, so a WDT can't reset the
+        # chip out from under the debugger (the C6 halt-flakiness fix — probe-rs and
+        # OpenOCD both do this). VERBATIM from openocd-esp32 tcl/target/esp32c6.cfg
+        # esp32c6_wdt_disable: write the unlock key 0x50D83AA1 to each WDT's WKEY
+        # reg, then zero its config; the LP_WDT_SWD (super-WDT) config takes
+        # 0x40000000 (auto-feed) not 0. Each entry: (wkey_reg, cfg_reg, cfg_value).
+        # `int_clear` clears the pending WDT interrupt states afterwards.
+        wdt=dict(
+            key=0x50D83AA1,
+            disable=[
+                (0x60008064, 0x60008048, 0x00000000),   # TG0 WDT
+                (0x60009064, 0x60009048, 0x00000000),   # TG1 WDT
+                (0x600B1C18, 0x600B1C00, 0x00000000),   # LP_WDT_RTC
+                (0x600B1C20, 0x600B1C1C, 0x40000000),   # LP_WDT_SWD (super-WDT)
+            ],
+            int_clear=[
+                (0x6000807C, 0x00000002),                # TG0 wdt int state
+                (0x6000907C, 0x00000002),                # TG1 wdt int state
+                (0x600B1C30, 0xC0000000),                # LP_WDT_RTC + SWD int state
+            ],
+        ),
         # A scratch SRAM window the flash loader uses while the hart is HALTED.
         # C6 SRAM is a unified byte-addressable 512 KiB block 0x40800000..0x40880000
         # (soc.h SOC_IRAM_LOW/HIGH). We carve the TOP for scratch — the app image
