@@ -1,6 +1,14 @@
 """espjtag.constants — esp_usb_jtag protocol + RISC-V Debug Module register/field
-definitions. Ported from openocd-esp32 (esp_usb_jtag.c) and the RISC-V external
-debug spec (debug_defines.h). Shared by the transport, reset, and debug layers.
+definitions. Shared by the transport, reset, and debug layers.
+
+Ported (hand-transcribed numeric facts, not copied code) from:
+  - openocd-esp32  src/jtag/drivers/esp_usb_jtag.c   (GPL-2.0-or-later)
+        the CMD_* nibble layout, VEND_JTAG_SETDIV, caps descriptor wValue
+  - openocd-esp32  src/target/riscv/debug_defines.h  (BSD-2-Clause OR CC-BY-4.0)
+        the RISC-V Debug Module register addresses + field bit-offsets
+Pinned upstream commit + the exact symbols we depend on: ../upstream.lock.
+Provenance + licensing analysis: ../ACKNOWLEDGEMENTS.md. Drift check:
+scripts/check_upstream.py. Not affiliated with Espressif / OpenOCD / RISC-V.
 """
 
 VID, PID = 0x303A, 0x1001

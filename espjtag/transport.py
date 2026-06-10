@@ -3,7 +3,11 @@ DMI read/write. This is the BASE layer: everything (the reset fix and the full
 debugger) builds on it. It has NO debug-module knowledge beyond DMI access, so a
 minimal consumer (e.g. an esptool reboot fix) can depend on just this.
 
-Ported from openocd-esp32 esp_usb_jtag.c + bitq.c.
+Ported (hand-transcribed facts + re-expressed algorithm, not copied code) from
+openocd-esp32 (GPL-2.0-or-later): src/jtag/drivers/esp_usb_jtag.c (USB transport,
+SETDIV) and src/jtag/drivers/bitq.c (the TAP scan model). DMI field layout from
+src/target/riscv/debug_defines.h (BSD-2-Clause OR CC-BY-4.0). Pinned upstream
+commit: ../upstream.lock. Provenance + licensing: ../ACKNOWLEDGEMENTS.md.
 """
 
 import time

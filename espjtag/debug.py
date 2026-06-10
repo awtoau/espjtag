@@ -1,6 +1,11 @@
 """espjtag.debug — the full RISC-V debugger built on the transport: halt/resume,
 GPR/CSR read+write (abstract command), memory read/write (System Bus Access),
 diag, and the reset_run() method. EspUsbJtag is the public class most users want.
+
+DM register addresses + field offsets used here are ported from the RISC-V debug
+spec via openocd-esp32 src/target/riscv/debug_defines.h (BSD-2-Clause OR
+CC-BY-4.0); the reset_run() DMI sequence was captured from OpenOCD's `reset run`
+-d3 log. Pinned upstream: ../upstream.lock. Provenance: ../ACKNOWLEDGEMENTS.md.
 """
 
 import time

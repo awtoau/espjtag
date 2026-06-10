@@ -72,16 +72,26 @@ RISC-V parts only (C3/C5/C6/H2). The Xtensa parts (S2/S3) use the **same USB
 transport** but a different debug module (Xtensa OCD/TRAX, not the RISC-V Debug
 Module), so the register-level API here doesn't apply to them.
 
-## Credits
+## Credits & provenance
 
 The `esp_usb_jtag` USB protocol and the JTAG/RISC-V debug details were ported from
-[openocd-esp32] (`esp_usb_jtag.c`, `bitq.c`) and the
-[RISC-V External Debug Support][riscv-debug] spec / Espressif's `debug_defines.h`.
-Not affiliated with Espressif.
+[openocd-esp32] (`src/jtag/drivers/esp_usb_jtag.c`, `bitq.c`, GPL-2.0-or-later)
+and the [RISC-V External Debug Support][riscv-debug] register map via openocd-esp32's
+`src/target/riscv/debug_defines.h` (BSD-2-Clause OR CC-BY-4.0). Not affiliated with
+Espressif, OpenOCD, or RISC-V International.
+
+See **[ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md)** for the full per-file provenance,
+the pinned upstream commit, and a license-compatibility note (Apache-2.0 vs. the
+GPL-2.0 / BSD sources — what was ported and why it's the mainstream reading that
+bare interface constants are usable). The exact upstream pin and the symbols we
+depend on are in [`upstream.lock`](upstream.lock); `python3 scripts/check_upstream.py`
+gives a GO/NO-GO if upstream drifts.
 
 ## License
 
-Apache-2.0.
+Apache-2.0 (see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE)). Ported numeric
+constants are credited per the upstream licenses in
+[ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md).
 
 [pyusb]: https://github.com/pyusb/pyusb
 [openocd-esp32]: https://github.com/espressif/openocd-esp32

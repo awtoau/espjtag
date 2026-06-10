@@ -1,0 +1,128 @@
+{
+  "_comment": [
+    "Provenance lock for espjtag's hand-ported upstream constants.",
+    "espjtag/constants.py + transport.py + debug.py transcribe numeric register",
+    "addresses, bit-field offsets and the USB-JTAG wire protocol from the files",
+    "pinned below. scripts/check_upstream.py re-fetches each source at the",
+    "upstream default branch HEAD, re-extracts ONLY the symbols listed in",
+    "`symbols`, and emits GO (nothing we depend on moved) or NO-GO (a depended-on",
+    "value changed -> a human must review the port). Bump `pinned_sha` + any",
+    "changed `expected` value only after re-auditing constants.py against it.",
+    "See ACKNOWLEDGEMENTS.md for licensing of these sources."
+  ],
+  "schema": 1,
+  "sources": {
+    "openocd-esp32": {
+      "repo": "espressif/openocd-esp32",
+      "host": "github.com",
+      "default_branch": "master",
+      "license": "GPL-2.0-or-later",
+      "pinned_sha": "f10eceff22fb8dcd3db69bf3ebc5c70602454af6",
+      "pinned_date": "2026-06-10",
+      "files": {
+        "esp_usb_jtag.c": {
+          "path": "src/jtag/drivers/esp_usb_jtag.c",
+          "ported_into": ["espjtag/constants.py", "espjtag/transport.py"],
+          "note": "USB-JTAG vendor protocol: command nibble layout + vendor requests.",
+          "symbols": [
+            {
+              "name": "CMD_CLK",
+              "kind": "macro_line",
+              "regex": "#define\\s+CMD_CLK\\(cap, tdi, tms\\)\\s+(.+)",
+              "expected": "((cap ? BIT(2) : 0) | (tms ? BIT(1) : 0) | (tdi ? BIT(0) : 0))",
+              "depends": "constants._clk(): nibble = (cap<<2)|(tms<<1)|tdi  (bit0=TDI, bit1=TMS, bit2=capture)"
+            },
+            {
+              "name": "CMD_FLUSH",
+              "kind": "define_int",
+              "regex": "#define\\s+CMD_FLUSH\\s+(0x[0-9A-Fa-f]+|\\d+)",
+              "expected": 10,
+              "depends": "constants.CMD_FLUSH = 0xA"
+            },
+            {
+              "name": "VEND_JTAG_SETDIV",
+              "kind": "define_int",
+              "regex": "#define\\s+VEND_JTAG_SETDIV\\s+(0x[0-9A-Fa-f]+|\\d+)",
+              "expected": 0,
+              "depends": "transport SETDIV control request number (ctrl_transfer(0x40, 0, div, 0))"
+            },
+            {
+              "name": "VEND_DESCR_BUILTIN_JTAG_CAPS",
+              "kind": "define_int",
+              "regex": "#define\\s+VEND_DESCR_BUILTIN_JTAG_CAPS\\s+(0x[0-9A-Fa-f]+|\\d+)",
+              "expected": 8192,
+              "depends": "constants.CAPS_DESCRIPTOR = 0x2000 (GET_DESCRIPTOR wValue)"
+            }
+          ]
+        },
+        "bitq.c": {
+          "path": "src/jtag/drivers/bitq.c",
+          "ported_into": ["espjtag/transport.py"],
+          "note": "TAP scan model: N-1 bits shifted with TMS=0, last bit TMS=1 -> Exit1, all captured. This is an algorithm, not a #define; no extractable symbol -- tracked by file presence + SHA only. The scan loop in transport._scan() mirrors bitq_scan_field().",
+          "symbols": []
+        }
+      }
+    },
+    "riscv-debug-spec": {
+      "repo": "espressif/openocd-esp32",
+      "host": "github.com",
+      "default_branch": "master",
+      "license": "BSD-2-Clause OR CC-BY-4.0",
+      "license_note": "debug_defines.h is auto-generated from the RISC-V external debug spec (riscv/riscv-debug-spec) and carries an SPDX dual license; the BSD-2-Clause arm is Apache-2.0 compatible. Vendored in the openocd-esp32 tree, so pinned at the same SHA.",
+      "pinned_sha": "f10eceff22fb8dcd3db69bf3ebc5c70602454af6",
+      "pinned_date": "2026-06-10",
+      "files": {
+        "debug_defines.h": {
+          "path": "src/target/riscv/debug_defines.h",
+          "ported_into": ["espjtag/constants.py", "espjtag/transport.py", "espjtag/debug.py"],
+          "note": "RISC-V Debug Module register addresses + field offsets. Values are *_OFFSET (bit position) or bare register address; espjtag derives masks as 1<<OFFSET.",
+          "symbols": [
+            {"name": "DTM_DMI_OP_OFFSET",        "kind": "define_int", "regex": "#define\\s+DTM_DMI_OP_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",        "expected": 0,  "depends": "DMI scan op field at bits[1:0]"},
+            {"name": "DTM_DMI_DATA_OFFSET",      "kind": "define_int", "regex": "#define\\s+DTM_DMI_DATA_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",      "expected": 2,  "depends": "DMI scan data field at bits[33:2] -> word=(data<<2)"},
+            {"name": "DTM_DMI_ADDRESS_OFFSET",   "kind": "define_int", "regex": "#define\\s+DTM_DMI_ADDRESS_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",   "expected": 34, "depends": "DMI scan address field above data -> word=(address<<34)"},
+            {"name": "DTM_DTMCS_ABITS_OFFSET",   "kind": "define_int", "regex": "#define\\s+DTM_DTMCS_ABITS_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",   "expected": 4,  "depends": "transport.read_dtmcs(): abits = (v>>4) & 0x3F"},
+            {"name": "DTM_DTMCS_IDLE_OFFSET",    "kind": "define_int", "regex": "#define\\s+DTM_DTMCS_IDLE_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",    "expected": 12, "depends": "transport.read_dtmcs(): idle = (v>>12) & 0x7"},
+
+            {"name": "DM_DMCONTROL",             "kind": "define_int", "regex": "#define\\s+DM_DMCONTROL\\s+(0x[0-9A-Fa-f]+|\\d+)",             "expected": 16, "depends": "constants.DMCONTROL = 0x10"},
+            {"name": "DM_DMSTATUS",              "kind": "define_int", "regex": "#define\\s+DM_DMSTATUS\\s+(0x[0-9A-Fa-f]+|\\d+)",              "expected": 17, "depends": "constants.DMSTATUS = 0x11"},
+            {"name": "DM_HARTINFO",              "kind": "define_int", "regex": "#define\\s+DM_HARTINFO\\s+(0x[0-9A-Fa-f]+|\\d+)",              "expected": 18, "depends": "constants.HARTINFO = 0x12"},
+            {"name": "DM_ABSTRACTCS",            "kind": "define_int", "regex": "#define\\s+DM_ABSTRACTCS\\s+(0x[0-9A-Fa-f]+|\\d+)",            "expected": 22, "depends": "constants.ABSTRACTCS = 0x16"},
+            {"name": "DM_COMMAND",               "kind": "define_int", "regex": "#define\\s+DM_COMMAND\\s+(0x[0-9A-Fa-f]+|\\d+)",               "expected": 23, "depends": "constants.COMMAND = 0x17"},
+            {"name": "DM_DATA0",                 "kind": "define_int", "regex": "#define\\s+DM_DATA0\\s+(0x[0-9A-Fa-f]+|\\d+)",                 "expected": 4,  "depends": "constants.DATA0 = 0x04"},
+            {"name": "DM_SBCS",                  "kind": "define_int", "regex": "#define\\s+DM_SBCS\\s+(0x[0-9A-Fa-f]+|\\d+)",                  "expected": 56, "depends": "constants.SBCS = 0x38"},
+            {"name": "DM_SBADDRESS0",            "kind": "define_int", "regex": "#define\\s+DM_SBADDRESS0\\s+(0x[0-9A-Fa-f]+|\\d+)",            "expected": 57, "depends": "constants.SBADDRESS0 = 0x39"},
+            {"name": "DM_SBDATA0",               "kind": "define_int", "regex": "#define\\s+DM_SBDATA0\\s+(0x[0-9A-Fa-f]+|\\d+)",               "expected": 60, "depends": "constants.SBDATA0 = 0x3C"},
+
+            {"name": "DM_DMCONTROL_DMACTIVE_OFFSET",     "kind": "define_int", "regex": "#define\\s+DM_DMCONTROL_DMACTIVE_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",     "expected": 0,  "depends": "constants.DM_DMACTIVE = 1<<0"},
+            {"name": "DM_DMCONTROL_NDMRESET_OFFSET",     "kind": "define_int", "regex": "#define\\s+DM_DMCONTROL_NDMRESET_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",     "expected": 1,  "depends": "constants.DM_NDMRESET = 1<<1 (the reset_run() ndmreset pulse)"},
+            {"name": "DM_DMCONTROL_ACKHAVERESET_OFFSET", "kind": "define_int", "regex": "#define\\s+DM_DMCONTROL_ACKHAVERESET_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)", "expected": 28, "depends": "constants.DM_ACKHAVERESET = 1<<28"},
+            {"name": "DM_DMCONTROL_HARTRESET_OFFSET",    "kind": "define_int", "regex": "#define\\s+DM_DMCONTROL_HARTRESET_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",    "expected": 29, "depends": "constants.DM_HARTRESET = 1<<29"},
+            {"name": "DM_DMCONTROL_RESUMEREQ_OFFSET",    "kind": "define_int", "regex": "#define\\s+DM_DMCONTROL_RESUMEREQ_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",    "expected": 30, "depends": "constants.DM_RESUMEREQ = 1<<30"},
+            {"name": "DM_DMCONTROL_HALTREQ_OFFSET",      "kind": "define_int", "regex": "#define\\s+DM_DMCONTROL_HALTREQ_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",      "expected": 31, "depends": "constants.DM_HALTREQ = 1<<31"},
+
+            {"name": "DM_DMSTATUS_ANYHALTED_OFFSET",     "kind": "define_int", "regex": "#define\\s+DM_DMSTATUS_ANYHALTED_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",     "expected": 8,  "depends": "diag anyhalted bit"},
+            {"name": "DM_DMSTATUS_ALLHALTED_OFFSET",     "kind": "define_int", "regex": "#define\\s+DM_DMSTATUS_ALLHALTED_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",     "expected": 9,  "depends": "constants.DM_ALLHALTED = 1<<9 (halt() success test)"},
+            {"name": "DM_DMSTATUS_ANYRUNNING_OFFSET",    "kind": "define_int", "regex": "#define\\s+DM_DMSTATUS_ANYRUNNING_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",    "expected": 10, "depends": "constants.DM_ANYRUNNING = 1<<10"},
+            {"name": "DM_DMSTATUS_ALLRUNNING_OFFSET",    "kind": "define_int", "regex": "#define\\s+DM_DMSTATUS_ALLRUNNING_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",    "expected": 11, "depends": "constants.DM_ALLRUNNING = 1<<11 (resume() success test)"},
+            {"name": "DM_DMSTATUS_ANYHAVERESET_OFFSET",  "kind": "define_int", "regex": "#define\\s+DM_DMSTATUS_ANYHAVERESET_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",  "expected": 18, "depends": "constants.DM_ANYHAVERESET = 1<<18"},
+            {"name": "DM_DMSTATUS_ALLHAVERESET_OFFSET",  "kind": "define_int", "regex": "#define\\s+DM_DMSTATUS_ALLHAVERESET_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",  "expected": 19, "depends": "constants.DM_ALLHAVERESET = 1<<19 (examine() ack)"},
+
+            {"name": "DM_ABSTRACTCS_BUSY_OFFSET",        "kind": "define_int", "regex": "#define\\s+DM_ABSTRACTCS_BUSY_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",        "expected": 12, "depends": "constants.ABS_BUSY = 1<<12"},
+            {"name": "DM_ABSTRACTCS_CMDERR_OFFSET",      "kind": "define_int", "regex": "#define\\s+DM_ABSTRACTCS_CMDERR_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",      "expected": 8,  "depends": "constants.ABS_CMDERR = 0x7<<8"},
+            {"name": "DM_COMMAND_CMDTYPE_OFFSET",        "kind": "define_int", "regex": "#define\\s+DM_COMMAND_CMDTYPE_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",        "expected": 24, "depends": "constants.CMD_ACCESS_REGISTER = 0<<24"},
+
+            {"name": "AC_ACCESS_REGISTER_AARSIZE_OFFSET",  "kind": "define_int", "regex": "#define\\s+AC_ACCESS_REGISTER_AARSIZE_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",  "expected": 20, "depends": "constants.AC_AARSIZE32 = 2<<20"},
+            {"name": "AC_ACCESS_REGISTER_POSTEXEC_OFFSET", "kind": "define_int", "regex": "#define\\s+AC_ACCESS_REGISTER_POSTEXEC_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)", "expected": 18, "depends": "constants.AC_POSTEXEC = 1<<18"},
+            {"name": "AC_ACCESS_REGISTER_TRANSFER_OFFSET", "kind": "define_int", "regex": "#define\\s+AC_ACCESS_REGISTER_TRANSFER_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)", "expected": 17, "depends": "constants.AC_TRANSFER = 1<<17"},
+            {"name": "AC_ACCESS_REGISTER_WRITE_OFFSET",    "kind": "define_int", "regex": "#define\\s+AC_ACCESS_REGISTER_WRITE_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",    "expected": 16, "depends": "constants.AC_WRITE = 1<<16"},
+
+            {"name": "DM_SBCS_SBREADONADDR_OFFSET",      "kind": "define_int", "regex": "#define\\s+DM_SBCS_SBREADONADDR_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",      "expected": 20, "depends": "debug._sb_setup() readonaddr = 1<<20"},
+            {"name": "DM_SBCS_SBACCESS_OFFSET",          "kind": "define_int", "regex": "#define\\s+DM_SBCS_SBACCESS_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",          "expected": 17, "depends": "debug._sb_setup() sbaccess = size<<17"},
+            {"name": "DM_SBCS_SBAUTOINCREMENT_OFFSET",   "kind": "define_int", "regex": "#define\\s+DM_SBCS_SBAUTOINCREMENT_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",   "expected": 16, "depends": "debug._sb_setup() autoincrement = 1<<16"},
+            {"name": "DM_SBCS_SBREADONDATA_OFFSET",      "kind": "define_int", "regex": "#define\\s+DM_SBCS_SBREADONDATA_OFFSET\\s+(0x[0-9A-Fa-f]+|\\d+)",      "expected": 15, "depends": "debug._sb_setup() readondata = 1<<15"}
+          ]
+        }
+      }
+    }
+  }
+}
