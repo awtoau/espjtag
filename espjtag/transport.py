@@ -369,3 +369,68 @@ class EspUsbJtagTransport:
                 self.idle += 1
         return data, status
 
+    # === batched DMI: many DR scans, one IR select, FIFO-chunked OUT/IN =====
+    # The win behind read_mem bursts. Each DMI op today costs a full USB
+    # round-trip (reset_tap + IR-select + DR scan + _send + _recv). But the TAP
+    # may stay in IR=DMI across consecutive DR scans (OpenOCD's bitq queue never
+    # re-selects IR between DMI scans), so we can queue N DR scans behind ONE
+    # reset_tap + ONE _scan_ir(IR_DMI) and demux the concatenated capture.
+    #
+    # CONSTRAINT (esp_usb_jtag protocol doc + esp_usb_jtag.c): the device's IN
+    # endpoint has only a few small buffers; "the OUT endpoint will not accept
+    # any more commands (writes will time out) when the IN endpoint buffers are
+    # all filled up". OpenOCD drains IN mid-stream once pending capture exceeds
+    # (IN_BUF_SZ + hw_in_fifo_len - 1) * 8 bits. We do the same: flush+recv a
+    # chunk whenever the queued *captured* bits approach that limit, then keep
+    # queuing (IR is still DMI — no reset between chunks). So a big batch is a
+    # HANDFUL of OUT/IN exchanges, not one and not N.
+    #
+    # IN_BUF_SZ=64, hw_in_fifo_len=4 -> threshold 67 bytes = 536 bits. We chunk
+    # well under that (FIFO_CHUNK_BITS) for margin: each DMI DR scan captures
+    # (abits+34 + bypass) bits ~= 41 on the C6, so ~12 scans per chunk.
+    FIFO_CHUNK_BITS = 480       # < (IN_BUF_SZ + hw_in_fifo_len - 1)*8 = 536
+
+    def _dmi_batch(self, reqs):
+        """Issue a list of DMI accesses `[(address, data, op), ...]` with ONE
+        IR=DMI select for the whole batch, chunking the OUT/IN at the device's
+        IN-FIFO limit. Returns `[(data, op_status), ...]`, one per request, in
+        order. Each entry is the value CAPTURED during that scan — i.e. for a
+        RISC-V DTM read the data belongs to the PREVIOUS access (the 2-phase
+        read pipeline); the caller handles that shift."""
+        self._ensure_dtmcs()
+        width = self.abits + 34
+        self._drain_in()                                 # ONCE for the batch
+        self.reset_tap()                                 # ONCE
+        self._scan_ir(IR_DMI)                            # select DMI ONCE
+        results = [None] * len(reqs)
+        # (request_index, offset_within_current_chunk) for scans queued but not
+        # yet flushed; cap_bits = captured bits queued in the current chunk.
+        pending = []
+        cap_bits = 0
+
+        def flush():
+            nonlocal pending, cap_bits
+            if not pending:
+                return
+            self._send()
+            bits = self._recv(cap_bits)
+            for idx, off in pending:
+                out = self._dr_field(bits, off, width)
+                results[idx] = ((out >> 2) & 0xFFFFFFFF, out & 0x3)
+            pending = []
+            cap_bits = 0
+
+        for idx, (address, data, op) in enumerate(reqs):
+            word = (address << 34) | ((data & 0xFFFFFFFF) << 2) | (op & 0x3)
+            total = self._scan_dr(word, width, capture=True)   # queue DR only
+            self._idle(max(self.idle, 1))                       # settle (not captured)
+            pending.append((idx, cap_bits))
+            cap_bits += total
+            # Flush BEFORE the next scan would push captured bits over the limit,
+            # so the device's IN FIFO never back-pressures the OUT endpoint.
+            if cap_bits + width + self.taps_after + self.taps_before \
+                    > self.FIFO_CHUNK_BITS:
+                flush()
+        flush()
+        return results
+
