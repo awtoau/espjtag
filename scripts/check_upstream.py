@@ -188,7 +188,7 @@ def main():
                     ok_count += 1
                 else:
                     nogo.append((src_name, fname, sym["name"], detail,
-                                 sym.get("depends", "")))
+                                 sym.get("depends", ""), got, sym.get("expected")))
             print(f"  {fname}: {ok_count}/{len(syms)} tracked symbols match "
                   f"upstream {branch}")
 
@@ -207,13 +207,24 @@ def main():
     if nogo:
         print(f"RESULT: NO-GO -- {len(nogo)} depended-on upstream value(s) "
               f"changed. Review the port before trusting it.")
-        for src, fname, name, detail, depends in nogo:
+        for src, fname, name, detail, depends, got, expected in nogo:
             print(f"  x {src}/{fname}: {name}: {detail}")
             if depends:
-                print(f"      espjtag depends on this for: {depends}")
-        print("\nNext step: re-audit espjtag/constants.py against the new "
-              "upstream, fix any value, then bump pinned_sha + expected in "
-              "upstream.lock.")
+                print(f"      used by: {depends}")
+            # Turn the drift into a copy-pasteable action: show the NEW value and
+            # the two edits. We do NOT auto-apply — these are safety-critical
+            # (a wrong reset/ROM addr wedges the part), so a human bench-verifies.
+            if got is None:
+                print("      => symbol VANISHED upstream (renamed/removed) — "
+                      "re-audit the port by hand")
+            else:
+                gv = f"{got} (0x{got:x})" if isinstance(got, int) else repr(got)
+                print(f"      => upstream is now {gv} (was {expected!r}). To adopt:")
+                print(f"         1. bench-verify the new value is correct for the part")
+                print(f"         2. update the espjtag value in 'used by' above")
+                print(f"         3. set this symbol's expected={got!r} in upstream.lock")
+        print("\n(Then bump pinned_sha in upstream.lock and re-run "
+              "scripts/xcheck.py on hardware to confirm the live behaviour.)")
         return EXIT_NOGO
 
     print(f"RESULT: GO -- all {checked} tracked symbols match current upstream. "
