@@ -21,12 +21,11 @@ from .constants import (
     DM_ALLHALTED, DM_ALLRUNNING, DM_ALLHAVERESET,
     DM_ANYRUNNING, DM_ALLRESUMEACK, DM_ALLUNAVAIL,
     ABS_BUSY, ABS_CMDERR,
-    CMD_ACCESS_REGISTER, AC_TRANSFER, AC_WRITE, AC_AARSIZE32,
-    CSR_DCSR, CSR_DPC, REG_GPR_BASE,
-    C6_LP_AON_SYS_CFG, C6_LP_AON_SYS_CFG_HPSYS_SW_RESET,
-    C6_LP_AON_CPUCORE0_CFG, C6_LP_AON_CPUCORE0_SW_RESET,
-    DCSR_EBREAK_BITS,
+    CMD_ACCESS_REGISTER, AC_TRANSFER, AC_WRITE, AC_AARSIZE32, AC_POSTEXEC,
+    CSR_DCSR, CSR_DPC, REG_GPR_BASE, PROGBUF0,
+    DCSR_EBREAK_BITS, EBREAK,
 )
+from . import chips
 from .transport import EspUsbJtagTransport
 
 
@@ -252,13 +251,23 @@ class EspUsbJtag(EspUsbJtagTransport):
         then via System Bus Access poke the two LP_AON software-reset registers,
         clearing dmactive between them to drop SBA's sbbusy (or the DM wedges).
         Ends by re-asserting haltreq|ndmreset (0x80000003) to hold the hart in
-        reset — exactly the captured 12 writes, in order."""
+        reset — exactly the captured 12 writes, in order.
+
+        The two LP_AON register addresses come from the per-chip table
+        (espjtag.chips, #4), keyed by the live target IDCODE — not hardcoded here.
+        Raises if the connected part has no tabled reset regs (don't blindly poke
+        another chip's address space)."""
+        rst = chips.reset_for(self.read_idcode())
+        if not rst:
+            raise RuntimeError(
+                "_c6_soc_reset: no tabled SoC reset registers for this IDCODE "
+                f"0x{self.read_idcode():08x} — refusing to guess reset addresses")
         self.dmi_write(DMCONTROL, DM_HALTREQ | DM_DMACTIVE)              # 0x80000001
         # LP_AON_SYS_CFG = HPSYS_SW_RESET  (write 0x80000000 to 0x600b1034 via SBA)
-        self.write_mem32(C6_LP_AON_SYS_CFG, C6_LP_AON_SYS_CFG_HPSYS_SW_RESET)
+        self.write_mem32(rst["hpsys_cfg"], rst["hpsys_sw_reset"])
         self.dmi_write(DMCONTROL, 0)                                     # clear sbbusy
         # LP_AON_CPUCORE0_CFG = CPU_CORE0_SW_RESET (0x10000000 to 0x600b1038)
-        self.write_mem32(C6_LP_AON_CPUCORE0_CFG, C6_LP_AON_CPUCORE0_SW_RESET)
+        self.write_mem32(rst["cpucore0_cfg"], rst["cpucore0_sw_reset"])
         self.dmi_write(DMCONTROL, 0)                                     # clear sbbusy
         self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)            # 0x40000001
         time.sleep(0.01)                                                 # OpenOCD `sleep 10` (ms): let the SW reset propagate before re-asserting
@@ -389,34 +398,26 @@ def diag(usb_path=None, log=print):
     return EspUsbJtag(usb_path).diag(log=log)
 
 
-# Known-good per-chip TAP signatures: target-TAP IDCODE -> expected DTMCS abits.
-# The C5 daisy-chains two irlen-5 TAPs (the transport handles the BYPASS padding);
-# its target DTMCS has abits=10, while the single-TAP C6/C3 have abits=7.
-_CHIP_SIG = {
-    0x0000DC25: dict(name="C6", abits=7),
-    0x00017C25: dict(name="C5", abits=10),
-}
-
-
 def selftest(usb_path=None, rounds=3):
     """Verify the JTAG stack against a live ESP RISC-V part (C5/C6/...): IDCODE,
     DTMCS, and a dmstatus DMI read must read sane, deterministic values `rounds`
-    times. Chip-agnostic — recognises the target TAP from its IDCODE, then checks
-    DTMCS version==1 + the expected abits and a valid dmstatus (version 2/3, op 0).
-    Returns (passed, total). Read-only — safe against a board running the app."""
+    times. Chip-agnostic — recognises the target TAP from its IDCODE via the
+    per-chip table (espjtag.chips, #4), then checks DTMCS version==1 + the table's
+    expected abits and a valid dmstatus (version 2/3, op 0). Returns (passed,
+    total). Read-only — safe against a board running the app."""
     passed = 0
     for r in range(rounds):
         j = EspUsbJtag(usb_path)
         ic = j.read_idcode()
         dt = j.read_dtmcs()
         ds, st = j.dmi_read(DMSTATUS)
-        sig = _CHIP_SIG.get(ic)
+        exp_abits = chips.abits_for(ic)
         dmver = ds & 0xF
-        ok = (sig is not None and (dt & 0xF) == 1 and j.abits == sig["abits"]
+        ok = (exp_abits is not None and (dt & 0xF) == 1 and j.abits == exp_abits
               and st == 0 and dmver in (2, 3))
         passed += ok
         usb.util.dispose_resources(j.dev)
-        chip = sig["name"] if sig else "??"
+        chip = chips.name_for(ic) or "??"
         print(f"  round {r}: [{chip}] IDCODE=0x{ic:08x} DTMCS=0x{dt:08x} "
               f"dmstatus=0x{ds:08x}(st{st} v{dmver})  {'PASS' if ok else 'FAIL'}")
     print(f"  selftest: {passed}/{rounds} passed")
