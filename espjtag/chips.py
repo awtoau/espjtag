@@ -152,12 +152,20 @@ CHIPS = {
     ),
 
     # ---- Xtensa parts (#9 — same USB transport, DIFFERENT debug module) -------
-    # These are recognised (core="xtensa") so tools can say "not a RISC-V part,
-    # use the Xtensa path" instead of mis-reading them as RISC-V. The Xtensa OCD
-    # debug module (NAR/NDR, instruction injection) is the #9 port; abits/rom/reset
-    # are RISC-V concepts and don't apply. IDCODEs TODO-confirm on the bench.
-    # 0x120034e5: dict(name="S3", core="xtensa", chain=_SINGLE_TAP),  # TODO verify
-    # 0x120034e5: dict(name="S2", core="xtensa", chain=_SINGLE_TAP),  # TODO verify
+    # Recognised (core="xtensa") so tools say "not a RISC-V part, use the Xtensa
+    # path" instead of mis-reading them as RISC-V. The Xtensa OCD debug module
+    # (NAR/NDR, instruction injection) is the #9 port; abits/rom/reset are RISC-V
+    # concepts and don't apply — so espjtag can read the TAP IDCODE but NOT drive
+    # the debug module. scripts/xcheck.py uses this to fall back to an IDCODE-only
+    # espjtag probe + an OpenOCD<->probe-rs cross-check for the S3.
+    # ---- ESP32-S3 (single-TAP Xtensa LX7, dual-core) -------------------------
+    # VERIFIED on the bench: 3 distinct S3 units (xiao-s3-sense 1C:DB:D4:76:82:08,
+    # xiao-s3-plus E0:72:A1:F8:EB:94, ble_bridge_s3 3C:0F:02:C7:2B:34) all read
+    # IDCODE 0x120034e5 via espjtag read_idcode + OpenOCD scan + probe-rs info.
+    0x120034E5: dict(name="S3", core="xtensa", chain=_SINGLE_TAP),
+    # NOTE: the ESP32-S2 (also Xtensa LX7) may share this IDCODE — UNVERIFIED (no S2
+    # on the bench). If an S2 is ever read here, name_for() would mislabel it "S3";
+    # disambiguate by another means (USB descriptor / efuse) before relying on it.
 }
 
 
