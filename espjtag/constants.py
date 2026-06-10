@@ -87,17 +87,17 @@ CSR_DPC = 0x7B1
 # GPR register index in abstract-command regno space (0x1000 + gpr)
 REG_GPR_BASE = 0x1000
 
-# === ESP32-C6-specific reset-controller registers (LP_AON), from openocd-esp32
-# tcl/target/esp32c6.cfg esp32c6_soc_reset. Written via System Bus Access while
-# the hart is halted. These are the chip's software-reset registers the C6 needs
-# instead of (well, in addition to) ndmreset, because a bare ndmreset is a CORE
-# reset that does NOT re-sample the BOOT strap (esp-idf USB-Serial/JTAG console
-# guide). 0x600b1034 bit31 = LP_AON_HPSYS_SW_RESET (reset the whole HP system);
-# 0x600b1038 bit28 = LP_AON_CPU_CORE0_SW_RESET.
-C6_LP_AON_SYS_CFG = 0x600B1034          # write 0x80000000 = HPSYS_SW_RESET
-C6_LP_AON_SYS_CFG_HPSYS_SW_RESET = 0x80000000
-C6_LP_AON_CPUCORE0_CFG = 0x600B1038     # write 0x10000000 = CPU_CORE0_SW_RESET
-C6_LP_AON_CPUCORE0_SW_RESET = 0x10000000
+# NOTE: the ESP32-C6 LP_AON software-reset registers (used by esp32c6_soc_reset)
+# moved to the per-chip table — espjtag.chips CHIPS[0x0000dc25]["reset"] is now
+# the single source of truth (#4). 0x600b1034 bit31 = LP_AON_HPSYS_SW_RESET,
+# 0x600b1038 bit28 = LP_AON_CPU_CORE0_SW_RESET; source openocd-esp32
+# tcl/target/esp32c6.cfg esp32c6_soc_reset. debug.py reads them via chips.reset_for().
+
+# RISC-V `ebreak` instruction word. Used as a return-trap: point a halted hart's
+# return address (ra) at a scratch SRAM word holding this, so when a called
+# function returns it re-enters debug mode (the "call a function on the target"
+# mechanism, #3). Also what OpenOCD's progbuf-call recipe lands on.
+EBREAK = 0x00100073
 
 # dcsr value OpenOCD writes after a reset (set_dcsr_ebreak): ebreakm|ebreaku set
 # so an EBREAK in any privilege mode enters debug mode rather than trapping. Read

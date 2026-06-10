@@ -21,12 +21,11 @@ from .constants import (
     DM_ALLHALTED, DM_ALLRUNNING, DM_ALLHAVERESET,
     DM_ANYRUNNING, DM_ALLRESUMEACK, DM_ALLUNAVAIL,
     ABS_BUSY, ABS_CMDERR,
-    CMD_ACCESS_REGISTER, AC_TRANSFER, AC_WRITE, AC_AARSIZE32,
-    CSR_DCSR, CSR_DPC, REG_GPR_BASE,
-    C6_LP_AON_SYS_CFG, C6_LP_AON_SYS_CFG_HPSYS_SW_RESET,
-    C6_LP_AON_CPUCORE0_CFG, C6_LP_AON_CPUCORE0_SW_RESET,
-    DCSR_EBREAK_BITS,
+    CMD_ACCESS_REGISTER, AC_TRANSFER, AC_WRITE, AC_AARSIZE32, AC_POSTEXEC,
+    CSR_DCSR, CSR_DPC, REG_GPR_BASE, PROGBUF0,
+    DCSR_EBREAK_BITS, EBREAK,
 )
+from . import chips
 from .transport import EspUsbJtagTransport
 
 
@@ -166,6 +165,241 @@ class EspUsbJtag(EspUsbJtagTransport):
         self.dmi_write(SBCS, 0)
         return out
 
+    def write_mem(self, addr, words):
+        """Write a list of 32-bit `words` starting at `addr` via System Bus Access,
+        BATCHED. Mirror of read_mem: arm autoincrement, write SBADDRESS0 once, then
+        stream SBDATA0 writes — the hardware bumps the address per write. One handful
+        of USB exchanges for the whole block instead of N round-trips. This is the
+        data-staging primitive for the flash loader (#3): fill a RAM buffer fast.
+        Returns the number of words written. Raises on an SBA bus error (don't
+        silently half-write a flash buffer)."""
+        words = list(words)
+        if not words:
+            return 0
+        self._ensure_dtmcs()
+        self._sb_setup(autoincrement=True)               # sbaccess=32, autoincr
+        reqs = [(SBADDRESS0, addr & 0xFFFFFFFF, DMI_WRITE)]
+        reqs += [(SBDATA0, w & 0xFFFFFFFF, DMI_WRITE) for w in words]
+        res = self._dmi_batch(reqs)
+        # any DTM busy in the burst = a stalled write -> redo slowly, correctly.
+        if any(r is not None and r[1] == 3 for r in res):
+            self._sb_setup(autoincrement=True)
+            self.dmi_write(SBADDRESS0, addr & 0xFFFFFFFF)
+            for w in words:
+                self.dmi_write(SBDATA0, w & 0xFFFFFFFF)
+        sbcs = self.dm_read(SBCS)
+        if sbcs & (SB_SBERROR | SB_SBBUSYERROR):
+            self.dmi_write(SBCS, SB_SBERROR | SB_SBBUSYERROR)   # W1C clear
+            self.dmi_write(SBCS, 0)
+            raise RuntimeError(f"write_mem SBA bus error at 0x{addr:08x} "
+                               f"(sbcs=0x{sbcs:08x})")
+        self.dmi_write(SBCS, 0)
+        return len(words)
+
+    # === "call a function on the target" — the flash-loader call primitive (#3) ==
+    # A halted RISC-V hart can be made to run an arbitrary on-chip routine (a ROM
+    # entry point, or code we staged in RAM) by the standard debug recipe:
+    #   * stage args in a0..a7 (GPR x10..x17), sp in a scratch stack, ra at a
+    #     scratch SRAM word holding `ebreak` (the return trap);
+    #   * set dpc to the entry, make sure dcsr.ebreak* is set so the ebreak at `ra`
+    #     re-enters debug mode, resume, and poll for the halt;
+    #   * read a0 for the return value.
+    # We SAVE and RESTORE every register we clobber (a0..aN, sp=x2, ra=x1, dpc,
+    # dcsr) so the interrupted app is left byte-identical and can resume cleanly.
+    # The hart MUST already be halted (call halt() first).
+    _ABI_ARG_GPR = (10, 11, 12, 13, 14, 15, 16, 17)        # a0..a7 = x10..x17
+
+    def call_function(self, entry, args=(), stack=None, trap=None,
+                      timeout=4000, restore=True):
+        """Call on-target code at `entry` with up to 8 integer `args` (placed in
+        a0..a7), returning a0. `stack` = an SP value (a scratch SRAM top, grows
+        down); `trap` = address of an SRAM word we set to `ebreak` and point ra at,
+        so the callee's `ret` traps back into debug mode. The hart must be halted.
+
+        Saves/restores ra, sp, dpc, dcsr and the clobbered arg GPRs (restore=True)
+        so the live app is undisturbed. Returns (a0, halted) — halted=False means
+        the callee did not trap within `timeout` polls (left halted; inspect)."""
+        if len(args) > len(self._ABI_ARG_GPR):
+            raise ValueError("call_function: at most 8 integer args")
+        # --- save state we're about to clobber ---
+        saved = {}
+        if restore:
+            saved["dpc"] = self.read_register(CSR_DPC)
+            saved["dcsr"] = self.read_register(CSR_DCSR)
+            saved["ra"] = self.read_register(REG_GPR_BASE + 1)
+            saved["sp"] = self.read_register(REG_GPR_BASE + 2)
+            for i in range(len(args)):
+                g = self._ABI_ARG_GPR[i]
+                saved[g] = self.read_register(REG_GPR_BASE + g)
+        # --- ebreak return-trap: write `ebreak` to the trap word, ra -> it ---
+        self.write_mem32(trap, EBREAK)
+        self.write_register(REG_GPR_BASE + 1, trap)            # ra = trap
+        if stack is not None:
+            self.write_register(REG_GPR_BASE + 2, stack)       # sp = scratch top
+        for i, a in enumerate(args):
+            self.write_register(REG_GPR_BASE + self._ABI_ARG_GPR[i], a & 0xFFFFFFFF)
+        # --- ensure an ebreak in M/U mode enters debug (don't trap to the app) ---
+        dcsr = self.read_register(CSR_DCSR)
+        if (dcsr | DCSR_EBREAK_BITS) != dcsr:
+            self.write_register(CSR_DCSR, dcsr | DCSR_EBREAK_BITS)
+        # --- jump there: dpc = entry, resume, wait for the trap halt ---
+        self.write_register(CSR_DPC, entry)
+        # resume handshake (mirrors _resume_go): set resumereq, wait for the hart
+        # to ack it is running, THEN clear resumereq — otherwise the request can
+        # race and never take. Then poll for the ebreak re-halt.
+        self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)
+        for _ in range(256):
+            if self.dm_read(DMSTATUS) & (DM_ALLRESUMEACK | DM_ALLRUNNING):
+                break
+        self.dmi_write(DMCONTROL, DM_DMACTIVE)                 # resumereq <- 0
+        halted = False
+        for _ in range(timeout):
+            if self.dm_read(DMSTATUS) & DM_ALLHALTED:
+                halted = True
+                break
+        ret = self.read_register(REG_GPR_BASE + 10) if halted else None   # a0
+        # --- restore the app's registers so resume() continues it cleanly ---
+        if restore and halted:
+            for g, v in saved.items():
+                if g == "dpc":
+                    self.write_register(CSR_DPC, v)
+                elif g == "dcsr":
+                    self.write_register(CSR_DCSR, v)
+                elif g == "ra":
+                    self.write_register(REG_GPR_BASE + 1, v)
+                elif g == "sp":
+                    self.write_register(REG_GPR_BASE + 2, v)
+                else:
+                    self.write_register(REG_GPR_BASE + g, v)
+        return ret, halted
+
+    # === flash over JTAG — Option A: call the ROM esp_rom_spiflash_* (#3) ========
+    # Build on call_function + the per-chip ROM/SRAM table (chips.py). The whole
+    # path is GATED behind a read-back self-test (_rom_flash_ready): we will not
+    # erase or program unless a ROM read of a known region matches the XIP window,
+    # because the legacy ROM g_rom_spiflash_chip state is NOT guaranteed to be
+    # configured in a running app (measured: in the Zephyr app it is NOT — ROM
+    # reads return constant garbage), and on the C6 ECO0 the ROM read/write path
+    # needs revision-specific workarounds (see bootloader_flash.c rom_read_api_
+    # workaround). Erasing/programming through a misconfigured ROM state could
+    # corrupt the wrong flash region. So flash_write() refuses on a board that
+    # doesn't pass the gate rather than risk a brick.
+
+    def _chip(self):
+        return chips.lookup(self.read_idcode()) or {}
+
+    def call_rom(self, sym, args=(), restore=True):
+        """Call a named ROM function from this chip's chips.rom table (e.g.
+        'spiflash_erase_sector') with integer args. The hart must be halted and a
+        scratch SRAM window must be tabled. Returns (a0, halted)."""
+        c = self._chip()
+        rom, sram = c.get("rom"), c.get("sram")
+        if not rom or sym not in rom:
+            raise RuntimeError(f"call_rom: no ROM symbol {sym!r} tabled for "
+                               f"{c.get('name', '?')}")
+        if not sram:
+            raise RuntimeError("call_rom: no scratch SRAM window tabled")
+        return self.call_function(rom[sym], args=args, stack=sram["stack"],
+                                  trap=sram["trap"], restore=restore)
+
+    def flash_read_xip(self, off, nwords):
+        """Read nwords of flash via the cache-mapped XIP window (chips flash_xip +
+        off). This is the WORKING read path (verified on the bench); the ROM
+        esp_rom_spiflash_read needs init the running app may not have done. Note the
+        XIP window maps the app's active flash mapping, so `off` is an offset INTO
+        that mapping, not necessarily a raw flash byte address. Hart should be
+        halted with icache enabled."""
+        c = self._chip()
+        xip = c.get("flash_xip")
+        if xip is None:
+            raise RuntimeError("flash_read_xip: no flash_xip window tabled")
+        return self.read_mem(xip + off, nwords)
+
+    def _rom_flash_ready(self, probe_off=0x0, nwords=4):
+        """SAFETY GATE for any ROM erase/program. Call esp_rom_spiflash_read for a
+        small region into scratch SRAM and require it to match the XIP window read
+        of the same region. Returns (ready: bool, rom_words, xip_words). If this is
+        False the legacy ROM flash state is NOT correctly configured on this board
+        and erase/program MUST NOT proceed (it would target a misconfigured chip).
+        Read-only — performs no erase/write. icache is toggled around the ROM read."""
+        c = self._chip()
+        rom, sram = c.get("rom"), c.get("sram")
+        if not rom or not sram or "spiflash_read" not in rom:
+            return False, None, None
+        dest = sram["data"]
+        saved = self.read_mem(dest, nwords)
+        try:
+            self.call_rom("cache_disable_icache")
+            ret, halted = self.call_rom("spiflash_read",
+                                        args=(probe_off, dest, nwords * 4))
+            rom_words = self.read_mem(dest, nwords)
+            self.call_rom("cache_enable_icache")
+            xip_words = self.flash_read_xip(probe_off, nwords)
+            ready = bool(halted) and ret == 0 and rom_words == xip_words
+            return ready, rom_words, xip_words
+        finally:
+            self.write_mem(dest, saved)         # leave scratch byte-identical
+
+    def flash_write(self, addr, data, log=None, verify=True):
+        """Program `data` (bytes) to flash byte-offset `addr` via the C6 ROM
+        esp_rom_spiflash_* functions (Option A, #3): unlock, erase the covering
+        4 KiB sectors, stage each chunk into scratch SRAM (batched write_mem), and
+        esp_rom_spiflash_write it, then (verify) read back.
+
+        *** SAFETY: refuses to run unless _rom_flash_ready() passes. *** The legacy
+        ROM flash state is not guaranteed configured in a running app, so this gate
+        prevents erasing/programming a misconfigured chip (brick risk). On a board
+        that hasn't set up the ROM spiflash globals (e.g. the Zephyr app, measured),
+        this raises WITHOUT touching flash. The hart must be halted first.
+
+        NOTE: addr and len(data) must be 4-byte aligned (ROM write requirement);
+        erase is sector-granular so `addr` should be 4 KiB-aligned for a clean
+        program. UNVERIFIED end-to-end on the bench — see docs/JTAG-FLASH-WRITES.md.
+        """
+        def _log(m):
+            if log:
+                log(m)
+        if len(data) % 4 or addr % 4:
+            raise ValueError("flash_write: addr and len(data) must be 4-byte aligned")
+        ready, rw, xw = self._rom_flash_ready()
+        if not ready:
+            raise RuntimeError(
+                "flash_write: ROM spiflash read-back self-test FAILED — the legacy "
+                "ROM flash state is not configured on this target (ROM read "
+                f"{rw} vs XIP {xw}). Refusing to erase/program (brick risk). "
+                "Initialise the ROM spiflash state (esp_rom_spiflash_attach + "
+                "config_param, with the C6-ECO0 workarounds) and re-verify a "
+                "read-back match before enabling writes. See docs/JTAG-FLASH-WRITES.md.")
+        c = self._chip()
+        sram = c["sram"]
+        buf = sram["data"]
+        words = [int.from_bytes(data[i:i + 4], "little") for i in range(0, len(data), 4)]
+        _log(f"  flash_write: 0x{addr:08x} +{len(data)}B ({len(words)} words)")
+        # unlock once
+        self.call_rom("spiflash_unlock")
+        # erase covering sectors
+        first = addr & ~0xFFF
+        last = (addr + len(data) - 1) & ~0xFFF
+        for sa in range(first, last + 1, 0x1000):
+            r, _ = self.call_rom("spiflash_erase_sector", args=(sa >> 12,))
+            if r != 0:
+                raise RuntimeError(f"flash erase sector {sa >> 12} -> {r}")
+        # stage + program in chunks bounded by the scratch buffer headroom
+        chunk_words = 0x400                       # 4 KiB per call (well within scratch)
+        for w0 in range(0, len(words), chunk_words):
+            wchunk = words[w0:w0 + chunk_words]
+            self.write_mem(buf, wchunk)
+            dest = addr + w0 * 4
+            r, _ = self.call_rom("spiflash_write", args=(dest, buf, len(wchunk) * 4))
+            if r != 0:
+                raise RuntimeError(f"flash write @0x{dest:08x} -> {r}")
+        if verify:
+            got = self.flash_read_xip(addr, len(words))   # via XIP (working read)
+            if got != words:
+                raise RuntimeError("flash_write: verify mismatch")
+            _log("  flash_write: verify OK")
+        return True
+
     def diag(self, log=print):
         """Verbose read-only dump of the debug module — useful BEFORE resetting."""
         idcode = self.read_idcode()
@@ -252,13 +486,23 @@ class EspUsbJtag(EspUsbJtagTransport):
         then via System Bus Access poke the two LP_AON software-reset registers,
         clearing dmactive between them to drop SBA's sbbusy (or the DM wedges).
         Ends by re-asserting haltreq|ndmreset (0x80000003) to hold the hart in
-        reset — exactly the captured 12 writes, in order."""
+        reset — exactly the captured 12 writes, in order.
+
+        The two LP_AON register addresses come from the per-chip table
+        (espjtag.chips, #4), keyed by the live target IDCODE — not hardcoded here.
+        Raises if the connected part has no tabled reset regs (don't blindly poke
+        another chip's address space)."""
+        rst = chips.reset_for(self.read_idcode())
+        if not rst:
+            raise RuntimeError(
+                "_c6_soc_reset: no tabled SoC reset registers for this IDCODE "
+                f"0x{self.read_idcode():08x} — refusing to guess reset addresses")
         self.dmi_write(DMCONTROL, DM_HALTREQ | DM_DMACTIVE)              # 0x80000001
         # LP_AON_SYS_CFG = HPSYS_SW_RESET  (write 0x80000000 to 0x600b1034 via SBA)
-        self.write_mem32(C6_LP_AON_SYS_CFG, C6_LP_AON_SYS_CFG_HPSYS_SW_RESET)
+        self.write_mem32(rst["hpsys_cfg"], rst["hpsys_sw_reset"])
         self.dmi_write(DMCONTROL, 0)                                     # clear sbbusy
         # LP_AON_CPUCORE0_CFG = CPU_CORE0_SW_RESET (0x10000000 to 0x600b1038)
-        self.write_mem32(C6_LP_AON_CPUCORE0_CFG, C6_LP_AON_CPUCORE0_SW_RESET)
+        self.write_mem32(rst["cpucore0_cfg"], rst["cpucore0_sw_reset"])
         self.dmi_write(DMCONTROL, 0)                                     # clear sbbusy
         self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)            # 0x40000001
         time.sleep(0.01)                                                 # OpenOCD `sleep 10` (ms): let the SW reset propagate before re-asserting
@@ -389,34 +633,26 @@ def diag(usb_path=None, log=print):
     return EspUsbJtag(usb_path).diag(log=log)
 
 
-# Known-good per-chip TAP signatures: target-TAP IDCODE -> expected DTMCS abits.
-# The C5 daisy-chains two irlen-5 TAPs (the transport handles the BYPASS padding);
-# its target DTMCS has abits=10, while the single-TAP C6/C3 have abits=7.
-_CHIP_SIG = {
-    0x0000DC25: dict(name="C6", abits=7),
-    0x00017C25: dict(name="C5", abits=10),
-}
-
-
 def selftest(usb_path=None, rounds=3):
     """Verify the JTAG stack against a live ESP RISC-V part (C5/C6/...): IDCODE,
     DTMCS, and a dmstatus DMI read must read sane, deterministic values `rounds`
-    times. Chip-agnostic — recognises the target TAP from its IDCODE, then checks
-    DTMCS version==1 + the expected abits and a valid dmstatus (version 2/3, op 0).
-    Returns (passed, total). Read-only — safe against a board running the app."""
+    times. Chip-agnostic — recognises the target TAP from its IDCODE via the
+    per-chip table (espjtag.chips, #4), then checks DTMCS version==1 + the table's
+    expected abits and a valid dmstatus (version 2/3, op 0). Returns (passed,
+    total). Read-only — safe against a board running the app."""
     passed = 0
     for r in range(rounds):
         j = EspUsbJtag(usb_path)
         ic = j.read_idcode()
         dt = j.read_dtmcs()
         ds, st = j.dmi_read(DMSTATUS)
-        sig = _CHIP_SIG.get(ic)
+        exp_abits = chips.abits_for(ic)
         dmver = ds & 0xF
-        ok = (sig is not None and (dt & 0xF) == 1 and j.abits == sig["abits"]
+        ok = (exp_abits is not None and (dt & 0xF) == 1 and j.abits == exp_abits
               and st == 0 and dmver in (2, 3))
         passed += ok
         usb.util.dispose_resources(j.dev)
-        chip = sig["name"] if sig else "??"
+        chip = chips.name_for(ic) or "??"
         print(f"  round {r}: [{chip}] IDCODE=0x{ic:08x} DTMCS=0x{dt:08x} "
               f"dmstatus=0x{ds:08x}(st{st} v{dmver})  {'PASS' if ok else 'FAIL'}")
     print(f"  selftest: {passed}/{rounds} passed")

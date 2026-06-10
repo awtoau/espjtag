@@ -20,6 +20,7 @@ from .constants import (
     VID, PID, VENDOR_CLASS, CMD_FLUSH, _clk, _bits_to_int,
     IR_DTMCS, IR_DMI, IR_LEN, DMI_NOP, DMI_READ, DMI_WRITE,
 )
+from . import chips
 
 
 class EspUsbJtagTransport:
@@ -42,12 +43,12 @@ class EspUsbJtagTransport:
     taps_before = 0         # bypass TAPs between TDI and target
     idcode_index = 0        # which TAP's IDCODE to return (TDO-first order)
 
-    # Per-chip overrides keyed by the IDCODE read from the FIRST TAP (tap0).
+    # Per-chip chain overrides keyed by the IDCODE read from the FIRST TAP (tap0).
     # The C5 and C6 share the esp_usb_jtag USB protocol but differ in chain
-    # length, so we auto-detect once the IDCODE chain is known.
-    _CHAIN_BY_IDCODE = {
-        0x00017c25: dict(taps_after=1, taps_before=0, idcode_index=1),  # C5/C61
-    }
+    # length, so we auto-detect once the IDCODE chain is known. The data lives in
+    # espjtag.chips (the single per-chip table, #4) — only NON-single-TAP parts
+    # need listing (single-TAP is the class default above).
+    _CHAIN_BY_IDCODE = chips.chain_by_idcode()
 
     def __init__(self, usb_path=None):
         # Match the right unit when several 303a:1001 are on the bus, by the
