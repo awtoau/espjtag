@@ -322,24 +322,36 @@ def diag(usb_path=None, log=print):
     return EspUsbJtag(usb_path).diag(log=log)
 
 
+# Known-good per-chip TAP signatures: target-TAP IDCODE -> expected DTMCS abits.
+# The C5 daisy-chains two irlen-5 TAPs (the transport handles the BYPASS padding);
+# its target DTMCS has abits=10, while the single-TAP C6/C3 have abits=7.
+_CHIP_SIG = {
+    0x0000DC25: dict(name="C6", abits=7),
+    0x00017C25: dict(name="C5", abits=10),
+}
+
+
 def selftest(usb_path=None, rounds=3):
-    """Verify the JTAG stack against a live C6: IDCODE, DTMCS, and a dmstatus DMI
-    read must read their known values, deterministically, `rounds` times. Returns
-    (passed, total). Read-only — safe to run against a board running the app."""
-    C6_IDCODE = 0x0000DC25
-    DMSTATUS_C6 = 0x00030CA2
+    """Verify the JTAG stack against a live ESP RISC-V part (C5/C6/...): IDCODE,
+    DTMCS, and a dmstatus DMI read must read sane, deterministic values `rounds`
+    times. Chip-agnostic — recognises the target TAP from its IDCODE, then checks
+    DTMCS version==1 + the expected abits and a valid dmstatus (version 2/3, op 0).
+    Returns (passed, total). Read-only — safe against a board running the app."""
     passed = 0
     for r in range(rounds):
         j = EspUsbJtag(usb_path)
         ic = j.read_idcode()
         dt = j.read_dtmcs()
         ds, st = j.dmi_read(DMSTATUS)
-        ok = (ic == C6_IDCODE and (dt & 0xF) == 1 and j.abits == 7
-              and ds == DMSTATUS_C6 and st == 0)
+        sig = _CHIP_SIG.get(ic)
+        dmver = ds & 0xF
+        ok = (sig is not None and (dt & 0xF) == 1 and j.abits == sig["abits"]
+              and st == 0 and dmver in (2, 3))
         passed += ok
         usb.util.dispose_resources(j.dev)
-        print(f"  round {r}: IDCODE=0x{ic:08x} DTMCS=0x{dt:08x} "
-              f"dmstatus=0x{ds:08x}(st{st})  {'PASS' if ok else 'FAIL'}")
+        chip = sig["name"] if sig else "??"
+        print(f"  round {r}: [{chip}] IDCODE=0x{ic:08x} DTMCS=0x{dt:08x} "
+              f"dmstatus=0x{ds:08x}(st{st} v{dmver})  {'PASS' if ok else 'FAIL'}")
     print(f"  selftest: {passed}/{rounds} passed")
     return passed, rounds
 
