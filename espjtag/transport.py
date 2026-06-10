@@ -394,6 +394,18 @@ class EspUsbJtagTransport:
         if not hasattr(self, "abits") or not self.abits:
             self.read_dtmcs()
 
+    def _dtmcs_dmireset(self):
+        """Issue DTMCS.DMIRESET (bit 16) to clear sticky DMI op-status before a
+        busy retry. Keep capture/read accounting exact so drain_mode='validate'
+        stays green.
+        """
+        self._drain_in()
+        self.reset_tap()
+        self._scan_ir(IR_DTMCS)
+        total = self._scan_dr(1 << 16, 32, capture=True)
+        self._send()
+        self._recv(total)
+
     # --- DMI: scan = address<<34 | data<<2 | op, width = abits+34 -------------
     def _dmi(self, address, data, op):
         self._ensure_dtmcs()
@@ -421,6 +433,7 @@ class EspUsbJtagTransport:
             if status == 0:
                 return
             if status == 3:                                  # busy -> more idle
+                self._dtmcs_dmireset()
                 self.idle += 1
         raise RuntimeError(
             f"dmi_write 0x{address:x}=0x{data:08x} did not succeed "
@@ -457,6 +470,7 @@ class EspUsbJtagTransport:
             if status == 0:
                 return data, status
             if status == 3:                                   # busy -> more idle
+                self._dtmcs_dmireset()
                 self.idle += 1
         raise RuntimeError(
             f"dmi_read 0x{address:x} did not succeed (last op-status {status}) "
