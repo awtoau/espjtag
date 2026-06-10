@@ -129,8 +129,12 @@ class EspUsbJtagTransport:
     #   drain_mode = "off"      -> never drain (fast; relies on precise _recv)
     #              = "validate" -> drain-as-assertion at _validate_every intervals
     #              = "always"   -> the old always-drain (slow, for debugging)
+    # Default OFF: the precise _recv already leaves the endpoint empty (OpenOCD and
+    # probe-rs never drain either), and the audit measured "validate" at ~1875us/op
+    # vs ~333 for "off" — 5.5x slower for an assertion the byte-accounting already
+    # guarantees. Set drain_mode="validate" explicitly to spot-check.
     DRAIN_TIMEOUT_MS = 1
-    drain_mode = "validate"
+    drain_mode = "off"
     _validate_every = 1          # check every op at first; back off once it holds
     _validate_count = 0
     _validate_ok = 0
