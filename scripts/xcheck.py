@@ -90,7 +90,13 @@ def read_csr_checked(j, csr):
 
 # ---------------------------------------------------------------- espjtag ----
 def read_espjtag(usb_path, prof, mem_addr, nwords):
-    j = EspUsbJtag(usb_path)
+    try:
+        j = EspUsbJtag(usb_path)
+    except usb.core.USBError as e:
+        # A prior halt/resume can transiently wedge the unit's USB endpoint. Don't
+        # tank the whole run — flag it and let OpenOCD<->probe-rs still cross-check.
+        # (Recover the unit with `dev.py --target <name> usb-reset`.)
+        return {"_open_error": str(e)}
     out = {"idcode": j.read_idcode()}
     if prof["core"] != "riscv":
         # Xtensa: espjtag can read the TAP IDCODE but NOT the debug module (#9).
@@ -258,6 +264,10 @@ def main():
     esp = read_espjtag(args.usb, prof, mem_addr, nwords)
     ocd = read_openocd(args.usb, prof, mem_addr, nwords)
     prs = read_probers(args.serial, prof, mem_addr, nwords)
+
+    if esp.get("_open_error"):
+        print(f"!! espjtag failed to open ({esp['_open_error']}) — USB endpoint "
+              f"wedged; recover with `dev.py usb-reset`. OpenOCD<->probe-rs only.\n")
 
     all_ok = True
 
