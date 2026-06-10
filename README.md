@@ -1,6 +1,10 @@
+<img src="assets/awto-logo.svg" alt="awto.au" width="200">
+
 # espjtag
 
 **Pure-Python RISC-V JTAG debugger for the ESP32 built-in USB-JTAG — no OpenOCD.**
+
+An [awto.au](https://awto.au) project.
 
 The ESP32-C3/C5/C6/H2 expose a USB-Serial/**JTAG** peripheral on their native USB
 (`303a:1001`). `espjtag` speaks the Espressif `esp_usb_jtag` USB protocol directly

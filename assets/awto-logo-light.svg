@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 120" role="img" aria-labelledby="awtoLogoLightTitle awtoLogoLightDesc">
+  <title id="awtoLogoLightTitle">Awto</title>
+  <desc id="awtoLogoLightDesc">Awto logo with blue gears framed by pale rails and a pale wordmark.</desc>
+  <defs>
+    <style>
+      .gear { fill: #6ba6d8; }
+      .rail { stroke: #dfe8f1; stroke-width: 4; stroke-linecap: round; }
+      .word { fill: #f6fbff; font-family: 'Space Grotesk', 'Arial Black', sans-serif; font-weight: 700; }
+      .tag { fill: #6ba6d8; font-family: 'Manrope', Arial, sans-serif; font-weight: 700; letter-spacing: .18em; }
+    </style>
+    <g id="gear-shape-light">
+      <circle cx="0" cy="0" r="15"/>
+      <rect x="-3" y="-24" width="6" height="8" rx="2"/>
+      <rect x="-3" y="16" width="6" height="8" rx="2"/>
+      <rect x="16" y="-3" width="8" height="6" rx="2"/>
+      <rect x="-24" y="-3" width="8" height="6" rx="2"/>
+      <rect x="13.5" y="-20.5" width="6" height="8" rx="2" transform="rotate(45 16.5 -16.5)"/>
+      <rect x="13.5" y="12.5" width="6" height="8" rx="2" transform="rotate(135 16.5 16.5)"/>
+      <rect x="-19.5" y="12.5" width="6" height="8" rx="2" transform="rotate(45 -16.5 16.5)"/>
+      <rect x="-19.5" y="-20.5" width="6" height="8" rx="2" transform="rotate(135 -16.5 -16.5)"/>
+      <circle cx="0" cy="0" r="6.5" fill="#07111a"/>
+    </g>
+  </defs>
+  <g transform="translate(8 8)">
+    <line class="rail" x1="0" y1="15" x2="152" y2="2"/>
+    <line class="rail" x1="0" y1="89" x2="152" y2="102"/>
+    <g class="gear" transform="translate(28 52)"><use href="#gear-shape-light" transform="scale(1.18)"/></g>
+    <g class="gear" transform="translate(76 52)"><use href="#gear-shape-light" transform="scale(1.08)"/></g>
+    <g class="gear" transform="translate(122 52)"><use href="#gear-shape-light" transform="scale(.82)"/></g>
+  </g>
+  <text class="word" x="182" y="58" font-size="58">Awto</text>
+  <text class="tag" x="185" y="88" font-size="18">WORKSHOP SUPPLY</text>
+</svg>
