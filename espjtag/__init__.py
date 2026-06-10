@@ -28,4 +28,4 @@ from .usbreset import reset_device, platform_reset_note
 
 __all__ = ["EspUsbJtag", "EspUsbJtagTransport", "reset_run", "diag", "selftest",
            "reset_device", "platform_reset_note"]
-__version__ = "0.4.0"
+__version__ = "0.5.0"
