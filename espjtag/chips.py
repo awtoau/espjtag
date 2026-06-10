@@ -67,6 +67,10 @@ CHIPS = {
         # esp_rom_spiflash_read(a0=src_byte_addr, a1=dest_sram_ptr, a2=len) — used
         # to read flash back for verification WITHOUT touching the XIP cache window.
         # Result in a0: 0=OK, 1=ERR, 2=TIMEOUT (esp_rom_spiflash_result_t).
+        # *** These ROM helpers need the legacy ROM flash state initialised
+        # (esp_rom_spiflash_attach + esp_rom_spiflash_config_param) — a running
+        # Zephyr app does NOT set it up, so they return garbage until init.
+        # debug.flash_write() is GATED behind a ROM/XIP read-back match (#3). ***
         rom=dict(
             spiflash_unlock=0x40000154,
             spiflash_erase_sector=0x40000144,

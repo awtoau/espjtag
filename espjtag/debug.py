@@ -273,6 +273,133 @@ class EspUsbJtag(EspUsbJtagTransport):
                     self.write_register(REG_GPR_BASE + g, v)
         return ret, halted
 
+    # === flash over JTAG — Option A: call the ROM esp_rom_spiflash_* (#3) ========
+    # Build on call_function + the per-chip ROM/SRAM table (chips.py). The whole
+    # path is GATED behind a read-back self-test (_rom_flash_ready): we will not
+    # erase or program unless a ROM read of a known region matches the XIP window,
+    # because the legacy ROM g_rom_spiflash_chip state is NOT guaranteed to be
+    # configured in a running app (measured: in the Zephyr app it is NOT — ROM
+    # reads return constant garbage), and on the C6 ECO0 the ROM read/write path
+    # needs revision-specific workarounds (see bootloader_flash.c rom_read_api_
+    # workaround). Erasing/programming through a misconfigured ROM state could
+    # corrupt the wrong flash region. So flash_write() refuses on a board that
+    # doesn't pass the gate rather than risk a brick.
+
+    def _chip(self):
+        return chips.lookup(self.read_idcode()) or {}
+
+    def call_rom(self, sym, args=(), restore=True):
+        """Call a named ROM function from this chip's chips.rom table (e.g.
+        'spiflash_erase_sector') with integer args. The hart must be halted and a
+        scratch SRAM window must be tabled. Returns (a0, halted)."""
+        c = self._chip()
+        rom, sram = c.get("rom"), c.get("sram")
+        if not rom or sym not in rom:
+            raise RuntimeError(f"call_rom: no ROM symbol {sym!r} tabled for "
+                               f"{c.get('name', '?')}")
+        if not sram:
+            raise RuntimeError("call_rom: no scratch SRAM window tabled")
+        return self.call_function(rom[sym], args=args, stack=sram["stack"],
+                                  trap=sram["trap"], restore=restore)
+
+    def flash_read_xip(self, off, nwords):
+        """Read nwords of flash via the cache-mapped XIP window (chips flash_xip +
+        off). This is the WORKING read path (verified on the bench); the ROM
+        esp_rom_spiflash_read needs init the running app may not have done. Note the
+        XIP window maps the app's active flash mapping, so `off` is an offset INTO
+        that mapping, not necessarily a raw flash byte address. Hart should be
+        halted with icache enabled."""
+        c = self._chip()
+        xip = c.get("flash_xip")
+        if xip is None:
+            raise RuntimeError("flash_read_xip: no flash_xip window tabled")
+        return self.read_mem(xip + off, nwords)
+
+    def _rom_flash_ready(self, probe_off=0x0, nwords=4):
+        """SAFETY GATE for any ROM erase/program. Call esp_rom_spiflash_read for a
+        small region into scratch SRAM and require it to match the XIP window read
+        of the same region. Returns (ready: bool, rom_words, xip_words). If this is
+        False the legacy ROM flash state is NOT correctly configured on this board
+        and erase/program MUST NOT proceed (it would target a misconfigured chip).
+        Read-only — performs no erase/write. icache is toggled around the ROM read."""
+        c = self._chip()
+        rom, sram = c.get("rom"), c.get("sram")
+        if not rom or not sram or "spiflash_read" not in rom:
+            return False, None, None
+        dest = sram["data"]
+        saved = self.read_mem(dest, nwords)
+        try:
+            self.call_rom("cache_disable_icache")
+            ret, halted = self.call_rom("spiflash_read",
+                                        args=(probe_off, dest, nwords * 4))
+            rom_words = self.read_mem(dest, nwords)
+            self.call_rom("cache_enable_icache")
+            xip_words = self.flash_read_xip(probe_off, nwords)
+            ready = bool(halted) and ret == 0 and rom_words == xip_words
+            return ready, rom_words, xip_words
+        finally:
+            self.write_mem(dest, saved)         # leave scratch byte-identical
+
+    def flash_write(self, addr, data, log=None, verify=True):
+        """Program `data` (bytes) to flash byte-offset `addr` via the C6 ROM
+        esp_rom_spiflash_* functions (Option A, #3): unlock, erase the covering
+        4 KiB sectors, stage each chunk into scratch SRAM (batched write_mem), and
+        esp_rom_spiflash_write it, then (verify) read back.
+
+        *** SAFETY: refuses to run unless _rom_flash_ready() passes. *** The legacy
+        ROM flash state is not guaranteed configured in a running app, so this gate
+        prevents erasing/programming a misconfigured chip (brick risk). On a board
+        that hasn't set up the ROM spiflash globals (e.g. the Zephyr app, measured),
+        this raises WITHOUT touching flash. The hart must be halted first.
+
+        NOTE: addr and len(data) must be 4-byte aligned (ROM write requirement);
+        erase is sector-granular so `addr` should be 4 KiB-aligned for a clean
+        program. UNVERIFIED end-to-end on the bench — see docs/JTAG-FLASH-WRITES.md.
+        """
+        def _log(m):
+            if log:
+                log(m)
+        if len(data) % 4 or addr % 4:
+            raise ValueError("flash_write: addr and len(data) must be 4-byte aligned")
+        ready, rw, xw = self._rom_flash_ready()
+        if not ready:
+            raise RuntimeError(
+                "flash_write: ROM spiflash read-back self-test FAILED — the legacy "
+                "ROM flash state is not configured on this target (ROM read "
+                f"{rw} vs XIP {xw}). Refusing to erase/program (brick risk). "
+                "Initialise the ROM spiflash state (esp_rom_spiflash_attach + "
+                "config_param, with the C6-ECO0 workarounds) and re-verify a "
+                "read-back match before enabling writes. See docs/JTAG-FLASH-WRITES.md.")
+        c = self._chip()
+        sram = c["sram"]
+        buf = sram["data"]
+        words = [int.from_bytes(data[i:i + 4], "little") for i in range(0, len(data), 4)]
+        _log(f"  flash_write: 0x{addr:08x} +{len(data)}B ({len(words)} words)")
+        # unlock once
+        self.call_rom("spiflash_unlock")
+        # erase covering sectors
+        first = addr & ~0xFFF
+        last = (addr + len(data) - 1) & ~0xFFF
+        for sa in range(first, last + 1, 0x1000):
+            r, _ = self.call_rom("spiflash_erase_sector", args=(sa >> 12,))
+            if r != 0:
+                raise RuntimeError(f"flash erase sector {sa >> 12} -> {r}")
+        # stage + program in chunks bounded by the scratch buffer headroom
+        chunk_words = 0x400                       # 4 KiB per call (well within scratch)
+        for w0 in range(0, len(words), chunk_words):
+            wchunk = words[w0:w0 + chunk_words]
+            self.write_mem(buf, wchunk)
+            dest = addr + w0 * 4
+            r, _ = self.call_rom("spiflash_write", args=(dest, buf, len(wchunk) * 4))
+            if r != 0:
+                raise RuntimeError(f"flash write @0x{dest:08x} -> {r}")
+        if verify:
+            got = self.flash_read_xip(addr, len(words))   # via XIP (working read)
+            if got != words:
+                raise RuntimeError("flash_write: verify mismatch")
+            _log("  flash_write: verify OK")
+        return True
+
     def diag(self, log=print):
         """Verbose read-only dump of the debug module — useful BEFORE resetting."""
         idcode = self.read_idcode()
