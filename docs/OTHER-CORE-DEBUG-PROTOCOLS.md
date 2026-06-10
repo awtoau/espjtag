@@ -4,7 +4,7 @@ Strategy + protocol notes for extending our debug tooling beyond the RISC-V ESP3
 
 ## Where we are today
 
-this repo (`awtoau/espjtag`) (repo `awtoau/espjtag`) is a pure-Python,
+this repo (`awtoau/espjtag`) is a pure-Python,
 pyusb-only client that drives the **RISC-V Debug Module** over the ESP32's
 **built-in USB-Serial/JTAG** peripheral (`303a:1001`). The stack is:
 
@@ -18,7 +18,7 @@ USB (esp_usb_jtag vendor protocol, 4-bit TCK nibbles)
 
 It works on **C3 / C5 / C6 / H2** (all RISC-V): IDCODE, halt/resume, register
 read/write, memory read/write — ~500 lines, no OpenOCD binary. See
-`espjtag/transport.py` and `the repo README`.
+`espjtag/transport.py` and the repo README.
 
 The two architectures the user *also* has — **Xtensa** (S2/S3) and **Nordic
 nRF** (ARM Cortex-M) — need fundamentally different debug-module logic. This
@@ -392,6 +392,6 @@ CMSIS-DAP/J-Link for bare modules/dongles.
   <https://docs.espressif.com/projects/rust/book/getting-started/tooling/probe-rs.html>
 
 **Our existing RISC-V client (baseline):**
-- `espjtag/{transport,debug,reset}.py`, `the repo README`
+- `espjtag/{transport,debug,reset}.py`, the repo README
   (esp_usb_jtag transport + RISC-V DM);
   `docs/C6-USJ-RESET.md` (we already ship Espressif-patched OpenOCD).
