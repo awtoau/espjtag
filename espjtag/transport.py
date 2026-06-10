@@ -94,6 +94,7 @@ class EspUsbJtagTransport:
         self.dev.ctrl_transfer(0x40, 0, 20, 0, None)   # VEND_JTAG_SETDIV
         self._nibbles = []
         self.state = self.RESET            # TAP state unknown; reset_tap syncs it
+        self.timing = None                 # set to a timing.Timer() to instrument
 
     # --- low-level nibble stream ------------------------------------------
     def _emit(self, nib):
@@ -104,19 +105,71 @@ class EspUsbJtagTransport:
     # timeout each time (~20ms/op -> a single DMI read was ~22ms). 1ms is plenty to
     # detect "empty" — a USB microframe is 125us, so any genuinely-pending stale
     # byte arrives well within 1ms; correctness (draining real stale bytes) is
-    # unchanged, the wasted wait drops ~20x. See espjtag #8.
+    # MEASURED (not assumed): an "empty" ep_in.read does NOT honour a 1ms timeout —
+    # libusb/the kernel floors it at ~3ms on this USB Full-Speed device. So the
+    # pre-op drain cost ~3ms EVERY op (the dominant cost — found by instrumenting).
+    # BUT: _recv reads exactly the captured byte count, so the endpoint is already
+    # empty afterward — the drain was defending against a bug that the precise
+    # read already prevents. Verified on hardware: with drain OFF, 10x repeated
+    # reads + read_mem stay correct. So we don't drain — but we DON'T blindly trust
+    # it either: `validate` mode periodically asserts the endpoint really IS empty
+    # (often at first, backing off), so a byte-accounting bug surfaces LOUDLY
+    # without paying ~3ms/op. See espjtag #8 + the timing-audit tracker.
+    #   drain_mode = "off"      -> never drain (fast; relies on precise _recv)
+    #              = "validate" -> drain-as-assertion at _validate_every intervals
+    #              = "always"   -> the old always-drain (slow, for debugging)
     DRAIN_TIMEOUT_MS = 1
+    drain_mode = "validate"
+    _validate_every = 1          # check every op at first; back off once it holds
+    _validate_count = 0
+    _validate_ok = 0
+
+    def _t(self, bucket, start_ns):
+        """Record a span if timing is enabled (zero-overhead when off)."""
+        if self.timing is not None:
+            self.timing.add(bucket, time.perf_counter_ns() - start_ns)
+
+    def _read_empty(self):
+        """One ep_in.read that should return 0 bytes (endpoint empty). Returns the
+        bytes actually read (residue) — non-empty = a byte-accounting bug."""
+        try:
+            return bytes(self.ep_in.read(self.ep_in.wMaxPacketSize or 64,
+                                         timeout=self.DRAIN_TIMEOUT_MS))
+        except usb.core.USBError:
+            return b""              # timeout = empty (the expected case)
 
     def _drain_in(self):
-        """Discard any stale bytes sitting in the IN endpoint. Without this, a
-        previous scan's residual/padding bytes desync the NEXT read (the bug where
-        only the first access per session worked and the rest read 0/stale)."""
-        try:
-            while True:
-                self.ep_in.read(self.ep_in.wMaxPacketSize or 64,
-                                timeout=self.DRAIN_TIMEOUT_MS)
-        except usb.core.USBError:
-            pass                            # timeout = endpoint empty
+        """Keep the IN endpoint in sync. Mode-switched (see drain_mode):
+        - off:      no-op (fast — _recv already left it empty)
+        - validate: every _validate_every-th call, ASSERT the endpoint is empty;
+                    if it isn't, raise loudly (residue = our bookkeeping is wrong).
+                    Backs the interval off after a run of clean checks.
+        - always:   drain everything (old behaviour)."""
+        mode = self.drain_mode
+        if mode == "off":
+            return
+        if mode == "always":
+            t = time.perf_counter_ns() if self.timing is not None else 0
+            while self._read_empty():
+                pass
+            self._t("usb_drain_in", t)
+            return
+        # validate
+        self._validate_count += 1
+        if self._validate_count % self._validate_every:
+            return
+        t = time.perf_counter_ns() if self.timing is not None else 0
+        residue = self._read_empty()
+        self._t("usb_drain_validate", t)
+        if residue:
+            raise RuntimeError(
+                f"espjtag drain-validate: IN endpoint had {len(residue)} stale "
+                f"bytes (byte-accounting bug): {residue.hex()}")
+        # clean — back off the check interval (1 -> 4 -> 16 -> ... -> 256)
+        self._validate_ok += 1
+        if self._validate_ok >= 8 and self._validate_every < 256:
+            self._validate_every *= 4
+            self._validate_ok = 0
 
     def _send(self):
         """Append CMD_FLUSH, pad to a whole byte, and write the queued OUT nibble
@@ -127,7 +180,9 @@ class EspUsbJtagTransport:
         buf = bytes((self._nibbles[i] << 4) | self._nibbles[i + 1]
                     for i in range(0, len(self._nibbles), 2))
         self._nibbles = []
+        t = time.perf_counter_ns() if self.timing is not None else 0
         self.ep_out.write(buf)
+        self._t("usb_out_write", t)
 
     def _recv(self, want_tdo_bits):
         """Read want_tdo_bits captured TDO bits from the IN endpoint (LSB-first
@@ -138,7 +193,9 @@ class EspUsbJtagTransport:
         mps = self.ep_in.wMaxPacketSize or 64
         need = (want_tdo_bits + 7) // 8
         rdlen = ((need + mps - 1) // mps) * mps
+        t = time.perf_counter_ns() if self.timing is not None else 0
         data = self.ep_in.read(rdlen, timeout=1000)
+        self._t("usb_in_read", t)
         bits = []
         for byte in data:
             for b in range(8):
