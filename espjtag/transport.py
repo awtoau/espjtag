@@ -392,16 +392,34 @@ class EspUsbJtagTransport:
         out = self._dr_field(self._recv(total), 0, width)
         return (out >> 2) & 0xFFFFFFFF, out & 0x3    # data, op-status
 
-    def dmi_write(self, address, data):
-        self._dmi(address, data, DMI_WRITE)
+    def dmi_write(self, address, data, retries=8):
+        """Write a DMI register. A write can come back BUSY (op==3) — OpenOCD
+        retries writes on busy like reads; silently dropping a busy write (a
+        DMCONTROL/SBADDRESS during a reset or burst) wedges the bus or corrupts a
+        transfer. So we check op-status and retry on busy, raising if it never
+        succeeds. (audit: ESPJTAG-VS-OPENOCD-AUDIT.md — dmi_write dropped status.)"""
+        self._ensure_dtmcs()
+        status = -1
+        for _ in range(retries):
+            _, status = self._dmi(address, data, DMI_WRITE)
+            if status == 0:
+                return
+            if status == 3:                                  # busy -> more idle
+                self.idle += 1
+        raise RuntimeError(
+            f"dmi_write 0x{address:x}=0x{data:08x} did not succeed "
+            f"(last op-status {status}) after {retries} tries")
 
     def dmi_read(self, address, retries=8):
         """RISC-V DTM read: the data from a READ scan is the result of the PREVIOUS
         access, so you scan READ@addr then a NOP to collect addr's data — BOTH DR
         scans in ONE TAP session (one IR-select, no reset between) or the pending
-        read is lost. op-status 3 = busy -> add idle + retry."""
+        read is lost. op-status 3 = busy -> add idle + retry. On retry exhaustion
+        we RAISE — never return the busy read's garbage as if it were valid data.
+        (audit: ESPJTAG-VS-OPENOCD-AUDIT.md — old code returned the busy result.)"""
         self._ensure_dtmcs()
         width = self.abits + 34
+        data = status = -1
         for _ in range(retries):
             self._drain_in()
             self.reset_tap()
@@ -422,9 +440,11 @@ class EspUsbJtagTransport:
             data, status = (out >> 2) & 0xFFFFFFFF, out & 0x3
             if status == 0:
                 return data, status
-            if status == 3:
+            if status == 3:                                   # busy -> more idle
                 self.idle += 1
-        return data, status
+        raise RuntimeError(
+            f"dmi_read 0x{address:x} did not succeed (last op-status {status}) "
+            f"after {retries} tries")
 
     # === batched DMI: many DR scans, one IR select, FIFO-chunked OUT/IN =====
     # The win behind read_mem bursts. Each DMI op today costs a full USB
