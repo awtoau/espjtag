@@ -165,6 +165,114 @@ class EspUsbJtag(EspUsbJtagTransport):
         self.dmi_write(SBCS, 0)
         return out
 
+    def write_mem(self, addr, words):
+        """Write a list of 32-bit `words` starting at `addr` via System Bus Access,
+        BATCHED. Mirror of read_mem: arm autoincrement, write SBADDRESS0 once, then
+        stream SBDATA0 writes — the hardware bumps the address per write. One handful
+        of USB exchanges for the whole block instead of N round-trips. This is the
+        data-staging primitive for the flash loader (#3): fill a RAM buffer fast.
+        Returns the number of words written. Raises on an SBA bus error (don't
+        silently half-write a flash buffer)."""
+        words = list(words)
+        if not words:
+            return 0
+        self._ensure_dtmcs()
+        self._sb_setup(autoincrement=True)               # sbaccess=32, autoincr
+        reqs = [(SBADDRESS0, addr & 0xFFFFFFFF, DMI_WRITE)]
+        reqs += [(SBDATA0, w & 0xFFFFFFFF, DMI_WRITE) for w in words]
+        res = self._dmi_batch(reqs)
+        # any DTM busy in the burst = a stalled write -> redo slowly, correctly.
+        if any(r is not None and r[1] == 3 for r in res):
+            self._sb_setup(autoincrement=True)
+            self.dmi_write(SBADDRESS0, addr & 0xFFFFFFFF)
+            for w in words:
+                self.dmi_write(SBDATA0, w & 0xFFFFFFFF)
+        sbcs = self.dm_read(SBCS)
+        if sbcs & (SB_SBERROR | SB_SBBUSYERROR):
+            self.dmi_write(SBCS, SB_SBERROR | SB_SBBUSYERROR)   # W1C clear
+            self.dmi_write(SBCS, 0)
+            raise RuntimeError(f"write_mem SBA bus error at 0x{addr:08x} "
+                               f"(sbcs=0x{sbcs:08x})")
+        self.dmi_write(SBCS, 0)
+        return len(words)
+
+    # === "call a function on the target" — the flash-loader call primitive (#3) ==
+    # A halted RISC-V hart can be made to run an arbitrary on-chip routine (a ROM
+    # entry point, or code we staged in RAM) by the standard debug recipe:
+    #   * stage args in a0..a7 (GPR x10..x17), sp in a scratch stack, ra at a
+    #     scratch SRAM word holding `ebreak` (the return trap);
+    #   * set dpc to the entry, make sure dcsr.ebreak* is set so the ebreak at `ra`
+    #     re-enters debug mode, resume, and poll for the halt;
+    #   * read a0 for the return value.
+    # We SAVE and RESTORE every register we clobber (a0..aN, sp=x2, ra=x1, dpc,
+    # dcsr) so the interrupted app is left byte-identical and can resume cleanly.
+    # The hart MUST already be halted (call halt() first).
+    _ABI_ARG_GPR = (10, 11, 12, 13, 14, 15, 16, 17)        # a0..a7 = x10..x17
+
+    def call_function(self, entry, args=(), stack=None, trap=None,
+                      timeout=4000, restore=True):
+        """Call on-target code at `entry` with up to 8 integer `args` (placed in
+        a0..a7), returning a0. `stack` = an SP value (a scratch SRAM top, grows
+        down); `trap` = address of an SRAM word we set to `ebreak` and point ra at,
+        so the callee's `ret` traps back into debug mode. The hart must be halted.
+
+        Saves/restores ra, sp, dpc, dcsr and the clobbered arg GPRs (restore=True)
+        so the live app is undisturbed. Returns (a0, halted) — halted=False means
+        the callee did not trap within `timeout` polls (left halted; inspect)."""
+        if len(args) > len(self._ABI_ARG_GPR):
+            raise ValueError("call_function: at most 8 integer args")
+        # --- save state we're about to clobber ---
+        saved = {}
+        if restore:
+            saved["dpc"] = self.read_register(CSR_DPC)
+            saved["dcsr"] = self.read_register(CSR_DCSR)
+            saved["ra"] = self.read_register(REG_GPR_BASE + 1)
+            saved["sp"] = self.read_register(REG_GPR_BASE + 2)
+            for i in range(len(args)):
+                g = self._ABI_ARG_GPR[i]
+                saved[g] = self.read_register(REG_GPR_BASE + g)
+        # --- ebreak return-trap: write `ebreak` to the trap word, ra -> it ---
+        self.write_mem32(trap, EBREAK)
+        self.write_register(REG_GPR_BASE + 1, trap)            # ra = trap
+        if stack is not None:
+            self.write_register(REG_GPR_BASE + 2, stack)       # sp = scratch top
+        for i, a in enumerate(args):
+            self.write_register(REG_GPR_BASE + self._ABI_ARG_GPR[i], a & 0xFFFFFFFF)
+        # --- ensure an ebreak in M/U mode enters debug (don't trap to the app) ---
+        dcsr = self.read_register(CSR_DCSR)
+        if (dcsr | DCSR_EBREAK_BITS) != dcsr:
+            self.write_register(CSR_DCSR, dcsr | DCSR_EBREAK_BITS)
+        # --- jump there: dpc = entry, resume, wait for the trap halt ---
+        self.write_register(CSR_DPC, entry)
+        # resume handshake (mirrors _resume_go): set resumereq, wait for the hart
+        # to ack it is running, THEN clear resumereq — otherwise the request can
+        # race and never take. Then poll for the ebreak re-halt.
+        self.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)
+        for _ in range(256):
+            if self.dm_read(DMSTATUS) & (DM_ALLRESUMEACK | DM_ALLRUNNING):
+                break
+        self.dmi_write(DMCONTROL, DM_DMACTIVE)                 # resumereq <- 0
+        halted = False
+        for _ in range(timeout):
+            if self.dm_read(DMSTATUS) & DM_ALLHALTED:
+                halted = True
+                break
+        ret = self.read_register(REG_GPR_BASE + 10) if halted else None   # a0
+        # --- restore the app's registers so resume() continues it cleanly ---
+        if restore and halted:
+            for g, v in saved.items():
+                if g == "dpc":
+                    self.write_register(CSR_DPC, v)
+                elif g == "dcsr":
+                    self.write_register(CSR_DCSR, v)
+                elif g == "ra":
+                    self.write_register(REG_GPR_BASE + 1, v)
+                elif g == "sp":
+                    self.write_register(REG_GPR_BASE + 2, v)
+                else:
+                    self.write_register(REG_GPR_BASE + g, v)
+        return ret, halted
+
     def diag(self, log=print):
         """Verbose read-only dump of the debug module — useful BEFORE resetting."""
         idcode = self.read_idcode()
