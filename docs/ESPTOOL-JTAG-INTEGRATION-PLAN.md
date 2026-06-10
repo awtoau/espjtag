@@ -315,7 +315,7 @@ the same physical unit esptool flashed, exactly like OpenOCD's
 `adapter usb location` pin (`flash.py:400`, `C6-USJ-RESET.md:44-46`).
 
 For our internal `dev.py`, the simplest correct integration is: keep using the
-vendored `espjtag` directly for the reset (we already have `vendor/espjtag`,
+vendored `espjtag` directly for the reset (we already have this repo,
 `flash.py:376`) and only switch the *flash* to the in-process esptool API — i.e.
 we don't strictly need esptool to own the JTAG reset for our own tooling. The
 esptool-owned `JTAGSystemReset` matters for the **upstream PR** and for anyone

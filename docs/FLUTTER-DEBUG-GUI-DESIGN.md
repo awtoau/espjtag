@@ -41,7 +41,7 @@ reliably, which is what this doc nails down.
   - **B (cleaner long-term):** a thin **adapter** on the host (Dart `dart:io` or a
     small Python shim) exposes a stable **JSON-over-WebSocket** "board state" feed and
     hides whether the backend is OpenOCD *or* our pure-Python `espjtag`
-    (`vendor/espjtag/`). The Flutter app only ever sees board-state JSON.
+    (this repo (`awtoau/espjtag`)). The Flutter app only ever sees board-state JSON.
 - **Recommendation:** **build A first** (Flutter → OpenOCD Tcl RPC directly) to prove
   data flow, then **introduce B** when we want backend choice, multi-client fan-out,
   and to decouple the GUI's data model from OpenOCD's text output. A and B share the
@@ -58,7 +58,7 @@ is just memory reads of the GPIO peripheral registers (§4).
 | Asset | Path | What it gives us |
 | --- | --- | --- |
 | Espressif OpenOCD | `~/.espressif/tools/openocd-esp32/v0.12.0-esp32-20251215/.../bin/openocd` (see `scripts/dev/flash.py`) | Full RISC-V + Xtensa debug: halt/resume, regs, memory, over the **built-in USB-JTAG**. PROVEN on C6 (flash + reset-run 3/3). Speaks Tcl RPC, GDB RSP, telnet. |
-| `espjtag` (pure Python) | `vendor/espjtag/` (repo `awtoau/espjtag`) | From-scratch pyusb RISC-V Debug-Module client. **Today:** IDCODE, DTMCS, DMI read/write, **halt/resume/examine, GPR+CSR read/write, memory read/write (System Bus Access)**, `reset_run()`, batched bulk reads, `diag()`. So espjtag already serves the three primitives this GUI needs (halt/resume + read-register + read-memory) — it is a **viable Shape-B backend today**, not just OpenOCD. **Not yet:** flash-over-JTAG, batched *writes*. RISC-V only (C3/C5/C6/H2); S2/S3 use a different debug module. (Capability table: espjtag `README.md` "What works".) |
+| `espjtag` (pure Python) | this repo (`awtoau/espjtag`) (repo `awtoau/espjtag`) | From-scratch pyusb RISC-V Debug-Module client. **Today:** IDCODE, DTMCS, DMI read/write, **halt/resume/examine, GPR+CSR read/write, memory read/write (System Bus Access)**, `reset_run()`, batched bulk reads, `diag()`. So espjtag already serves the three primitives this GUI needs (halt/resume + read-register + read-memory) — it is a **viable Shape-B backend today**, not just OpenOCD. **Not yet:** flash-over-JTAG, batched *writes*. RISC-V only (C3/C5/C6/H2); S2/S3 use a different debug module. (Capability table: espjtag `README.md` "What works".) |
 | Bench inventory | `scripts/esp32-devices.json`, `docs/XIAO-PINOUT.md` | Per-chip `Dn → GPIO` maps (authoritative, from each board's Zephyr DT) and per-board wiring — the static half of the pin data model (§6). |
 | Board geometry (KiCad) | `docs/hardware/**/*.kicad_pcb`, `*.step`, `~/git/awto-kicad` | PCB/3D source for the phase-3 physical view (cross-ref the separate KiCad-geometry research). |
 
@@ -463,7 +463,7 @@ changes between 1→2→3; the transport and `BoardState` are stable from phase 
   [pyOCD](https://pyocd.io/),
   [ChameleonUltraGUI](https://github.com/GameTec-live/ChameleonUltraGUI).
 - In-repo —
-  `vendor/espjtag/` (espjtag repo `awtoau/espjtag`; capability table in
+  this repo (`awtoau/espjtag`) (espjtag repo `awtoau/espjtag`; capability table in
   its `README.md`), `scripts/dev/flash.py`,
   `docs/C6-USJ-RESET.md`, `docs/XIAO-PINOUT.md`, `scripts/esp32-devices.json`,
   `docs/hardware/**` (KiCad/STEP); Flutter house style —

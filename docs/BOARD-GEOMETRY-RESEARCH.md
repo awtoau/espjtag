@@ -285,7 +285,7 @@ on the stable channel (it's the cleanest native path for our own hit-testing).
 - EasyEDA / JLCPCB web viewers (closed, but confirm the "outline + pads + 3D body"
   model is the standard one).
 - Our own precedent for vendoring a small pure-Python parser instead of a heavy
-  dependency: `vendor/espjtag` (the pure-Python JTAG client). Same pattern fits a
+  dependency: this repo (the pure-Python JTAG client). Same pattern fits a
   tiny `.kicad_pcb` reader if `kiutils` ever proves too heavy.
 
 ---
@@ -375,4 +375,4 @@ the correct physical location) with the least machinery and produces the
   https://rbts.co/Blog/kicad-to-webgl-the-road-so-far/
 - Internal: `docs/XIAO-PINOUT.md`, `scripts/gen-xiao-pinout.py`,
   `awto-esp-base/boards/seeed/xiao_esp32s3_plus/seeed_xiao_connector.dtsi`,
-  `docs/hardware/` (vendored KiCad), `vendor/espjtag` (pure-Python parser precedent).
+  `docs/hardware/` (vendored KiCad), this repo (pure-Python parser precedent).

@@ -165,7 +165,7 @@ the built-in USB-JTAG with `espjtag`:
 
 ### Why it's that slow — [FACT] (from our own transport code)
 
-It is **not** TCK speed. Reading `vendor/espjtag/espjtag/transport.py`, a single
+It is **not** TCK speed. Reading `espjtag/transport.py`, a single
 `dmi_read` does: drain IN → reset TAP → IR-select DMI → scan READ → idle → scan NOP →
 idle → **one `ep_out.write()` (one bulk OUT) then one `ep_in.read()` (one bulk IN)**. So
 each DMI op = **exactly one USB request/response round-trip**. ~22 ms is dominated by
@@ -323,5 +323,5 @@ Speed / adapter behaviour:
 Our own measurements & code:
 - `tmp/jtag-tests.db` via `scripts/jtag_testdb.py` — C6: dmiread ~22.4 ms, memread
   ~24.5 ms/word, examine ~26 ms.
-- `vendor/espjtag/espjtag/transport.py` — one USB OUT + one IN per DMI op (latency-bound);
+- `espjtag/transport.py` — one USB OUT + one IN per DMI op (latency-bound);
   the `_drain_in()` 20 ms timeout per op.
