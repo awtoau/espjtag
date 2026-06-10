@@ -99,13 +99,22 @@ class EspUsbJtagTransport:
     def _emit(self, nib):
         self._nibbles.append(nib & 0xF)
 
+    # The drain's read timeout dominated per-op latency: it's called before every
+    # op and the endpoint is almost always EMPTY, so the read waited the FULL
+    # timeout each time (~20ms/op -> a single DMI read was ~22ms). 1ms is plenty to
+    # detect "empty" — a USB microframe is 125us, so any genuinely-pending stale
+    # byte arrives well within 1ms; correctness (draining real stale bytes) is
+    # unchanged, the wasted wait drops ~20x. See espjtag #8.
+    DRAIN_TIMEOUT_MS = 1
+
     def _drain_in(self):
         """Discard any stale bytes sitting in the IN endpoint. Without this, a
         previous scan's residual/padding bytes desync the NEXT read (the bug where
         only the first access per session worked and the rest read 0/stale)."""
         try:
             while True:
-                self.ep_in.read(self.ep_in.wMaxPacketSize or 64, timeout=20)
+                self.ep_in.read(self.ep_in.wMaxPacketSize or 64,
+                                timeout=self.DRAIN_TIMEOUT_MS)
         except usb.core.USBError:
             pass                            # timeout = endpoint empty
 
