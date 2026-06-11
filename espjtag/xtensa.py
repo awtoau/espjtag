@@ -30,7 +30,16 @@ INS_WSR_DDR_A3 = 0x136830     # WSR  a3, DDR   (a3 -> DDR)
 INS_LDDR32P_A3 = 0x0073E0     # LDDR32.P a3    (mem[a3] -> DDR, a3 += 4)
 INS_SDDR32P_A3 = 0x0073F0     # SDDR32.P a3    (DDR -> mem[a3], a3 += 4)
 IDLE = 16                     # run-test-idle settle clocks (the XDM tdi_idle)
-READ_LATENCY = 2              # espjtag NAR read result lag vs OpenOCD's driver
+# READ_LATENCY = espjtag's NAR read-result pipeline depth over this transport: the
+# captured data for a NAR read lags its address scan by this many *accesses*. We
+# issue address+data as two separate DR scans (split _send()s) and capture TDO a
+# scan late, while OpenOCD's driver pipelines the pair, so over the bit-banged
+# transport the word that comes back belongs to the access TWO earlier. Hence every
+# read does READ_LATENCY+1 priming reads (nar_read) or over-reads nwords+READ_LATENCY
+# and slices off the leading READ_LATENCY (read_mem). 2 is empirical — it is the
+# value that makes the golden ROM read @0x40000000 land correctly on the bench; it
+# is NOT a guess but is transport-specific, so leave it unless re-validated on HW.
+READ_LATENCY = 2
 
 
 class XtensaXDM:
@@ -90,13 +99,34 @@ class XtensaXDM:
     def resume(self):
         self.nar_write(DCRCLR, OCDDCR_DEBUGINTERRUPT)
 
+    # --- a3 save/restore around instruction injection (core must be HALTED) -------
+    # read_mem/write_mem stage the target address in a3 and stream LDDR32.P/SDDR32.P
+    # off it, which CLOBBERS a3. If the app was merely halted (not reset) we must
+    # hand a3 back unchanged on resume, so each access brackets itself with these.
+    # Both are built only from the already-validated nar_read/nar_write primitives
+    # (each does its own IR=NARSEL select), so they are correct by reuse and need no
+    # new latency bookkeeping — nar_read primes the READ_LATENCY pipeline itself.
+    def _save_a3(self):
+        """Return the live a3. WSR a3,DDR copies a3 into DDR (the inverse of the
+        RSR DDR,a3 the streaming uses); then read DDR back, latency-primed."""
+        self.nar_write(DIR0EXEC, INS_WSR_DDR_A3)   # DDR = a3   (exec WSR a3, DDR)
+        return self.nar_read(DDR)                   # a3 value, READ_LATENCY-primed
+
+    def _restore_a3(self, saved):
+        """Put `saved` back into a3. DDR = saved, then RSR DDR,a3 moves it to a3 —
+        the same two-step staging read_mem/write_mem use for the address."""
+        self.nar_write(DDR, saved)                  # DDR = saved a3
+        self.nar_write(DIR0EXEC, INS_RSR_DDR_A3)    # a3 = DDR = saved (exec RSR)
+
     # --- memory via DIR0EXEC instruction injection (core must be HALTED) ----------
     def read_mem(self, addr, nwords):
         """Read nwords 32-bit words from `addr`. Stage addr in a3 (RSR DDR,a3), exec
         LDDR32.P a3 once (DDR=mem[a3], a3+=4), then stream: read DDREXEC (returns the
         word AND re-triggers the load) for all but the last, plain DDR for the last.
-        Clobbers a3. (One IR=NARSEL; single addr+data per access; latency primed.)"""
+        Saves+restores a3 so a halted app resumes intact. (One IR=NARSEL; single
+        addr+data per access; latency primed.)"""
         j = self.j
+        saved_a3 = self._save_a3()                # preserve the app's a3
         j._drain_in()
         j._scan_ir(IR_NARSEL); j._send()
 
@@ -111,13 +141,16 @@ class XtensaXDM:
         total = nwords + READ_LATENCY
         out = [acc(DDR if k == total - 1 else DDREXEC, 0, 0, cap=True)
                for k in range(total)]
+        self._restore_a3(saved_a3)                # hand a3 back to the app
         return out[READ_LATENCY:READ_LATENCY + nwords]
 
     def write_mem(self, addr, words):
         """Write `words` from `addr`. Stage addr in a3, then per word: DDR=word, exec
-        SDDR32.P a3 (mem[a3]=DDR, a3+=4). Clobbers a3."""
+        SDDR32.P a3 (mem[a3]=DDR, a3+=4). Saves+restores a3 so a halted app resumes
+        intact."""
         j = self.j
         words = list(words)
+        saved_a3 = self._save_a3()                # preserve the app's a3
         j._drain_in()
         j._scan_ir(IR_NARSEL); j._send()
 
@@ -130,6 +163,7 @@ class XtensaXDM:
         for w in words:
             acc(DDR, 1, w)                        # DDR = word
             acc(DIR0EXEC, 1, INS_SDDR32P_A3)      # mem[a3] = DDR; a3 += 4
+        self._restore_a3(saved_a3)                # hand a3 back to the app
         return len(words)
 
     def read_mem32(self, addr):
