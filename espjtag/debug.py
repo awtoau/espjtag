@@ -564,6 +564,12 @@ class EspUsbJtag(EspUsbJtagTransport):
                    != host(data[s * 0x1000:(s + 1) * 0x1000])]
         _log(f"  flash_incremental: {nsec} sectors, {len(changed)} differ "
              f"(digest {self._crc_host_name}) -> programming")
+        # INVARIANT: every byte of every erased unit must be re-written. Today diff =
+        # erase = write = 4 KiB so this holds by construction; if the erase unit ever
+        # grows (e.g. 64 KiB spiflash_erase_block for speed), the whole block must be
+        # programmed, not just the changed sectors — skipping "unchanged" data inside
+        # an erased unit is pyOCD's fast_program data-loss bug
+        # (docs/PYOCD-INCREMENTAL-PROOF.md §3; scripts/incremental_invariant_test.py).
         for s in changed:
             sa = addr + s * 0x1000
             img = data[s * 0x1000:(s + 1) * 0x1000]
