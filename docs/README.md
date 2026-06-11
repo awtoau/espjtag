@@ -65,7 +65,7 @@ that align to them.
 | [MCP-SERVER.md](MCP-SERVER.md) | The espjtag MCP server (tools, pinning, safety tiers) + capability table | [#14](https://github.com/awtoau/espjtag/issues/14) |
 | [INCREMENTAL-FLASH-DESIGN.md](INCREMENTAL-FLASH-DESIGN.md) | Incremental-flash engine design + prior-art survey (esptool/probe-rs/ST/pyOCD/SEGGER) | [#3](https://github.com/awtoau/espjtag/issues/3) |
 | [CUBEPROGRAMMER-BUGS.md](CUBEPROGRAMMER-BUGS.md) | Two CubeProgrammer `incremental` bugs found on bench (additive-sum skip; two-probe SIGSEGV) | — |
-| [PYOCD-INCREMENTAL-PROOF.md](PYOCD-INCREMENTAL-PROOF.md) | Silicon proof: pyOCD default incremental is correct on ST-Link (catches ST's sum-collision); its `fast_program` CRC path has a sector/page data-loss bug — incl. root cause, patch, and paste-ready upstream issue (**handoff: pursued outside this repo**) | — |
+| [PYOCD-INCREMENTAL-PROOF.md](PYOCD-INCREMENTAL-PROOF.md) | Silicon proof: pyOCD default incremental is correct on ST-Link (catches ST's sum-collision). Its `fast_program` data-loss bug: stub only — pursued outside this repo (full analysis in git history @ bcd8a2d) | — |
 
 > The firmware/bench side of this story — the fleet, per-chip flashing, and *why*
 > the C6 reset mess pulled in JTAG/OpenOCD — is summarized in
