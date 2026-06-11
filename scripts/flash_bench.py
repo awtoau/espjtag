@@ -43,6 +43,93 @@ SEC = 0x1000
 ADDR = 0x300000
 ESPTOOL_CHIP = {"C6": "esp32c6", "C5": "esp32c5"}
 OOCD = "/home/dan/.espressif/tools/openocd-esp32/v0.12.0-esp32-20251215/openocd-esp32"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB = os.path.join(ROOT, "tmp", "flash-bench.db")
+GRAPH = os.path.join(ROOT, "docs", "images", "flash-progression.png")
+
+
+# --- speed-progression DB: every --record'ed run is keyed by git sha + note, so
+# --- the per-fix speed history graphs straight out of `--graph` (#22/#36 etc.)
+def db_open():
+    import sqlite3
+    os.makedirs(os.path.dirname(DB), exist_ok=True)
+    c = sqlite3.connect(DB)
+    c.execute("CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY, ts TEXT, "
+              "sha TEXT, dirty INT, note TEXT, kb INT, changed INT, entropy TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS results(run_id INT, board TEXT, chip TEXT, "
+              "flasher TEXT, round INT, ms REAL, ok INT)")
+    return c
+
+
+def db_record(rows, note, kb, changed, entropy):
+    import datetime
+    sha = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"],
+                         capture_output=True, text=True).stdout.strip()
+    dirty = bool(subprocess.run(["git", "-C", ROOT, "status", "--porcelain"],
+                                capture_output=True, text=True).stdout.strip())
+    c = db_open()
+    cur = c.execute("INSERT INTO runs(ts, sha, dirty, note, kb, changed, entropy) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (datetime.datetime.now().isoformat(timespec="seconds"),
+                     sha, int(dirty), note, kb, changed, entropy))
+    rid = cur.lastrowid
+    c.executemany("INSERT INTO results VALUES(?,?,?,?,?,?,?)",
+                  [(rid, *r) for r in rows])
+    c.commit()
+    c.close()
+    print(f"recorded run {rid} (sha {sha}{'+dirty' if dirty else ''}, note '{note}') -> {DB}")
+
+
+def _run_medians(c):
+    """[(run-label, {flasher: median-ms})] in chronological order, ok rows only."""
+    out = []
+    for rid, sha, dirty, note in c.execute("SELECT id, sha, dirty, note FROM runs ORDER BY id"):
+        med = {}
+        for (f,) in c.execute("SELECT DISTINCT flasher FROM results WHERE run_id=?", (rid,)):
+            ts = sorted(ms for (ms,) in c.execute(
+                "SELECT ms FROM results WHERE run_id=? AND flasher=? AND ok=1", (rid, f)))
+            if ts:
+                med[f] = ts[len(ts) // 2]
+        out.append((f"{rid}:{sha}{'*' if dirty else ''} {note}", med))
+    return out
+
+
+def cmd_report():
+    c = db_open()
+    runs = _run_medians(c)
+    flashers = sorted({f for _, med in runs for f in med})
+    print(f"{'run (sha note)':40s} " + " ".join(f"{f:>16s}" for f in flashers))
+    for label, med in runs:
+        print(f"{label[:40]:40s} " + " ".join(
+            f"{med[f]:14.0f}ms" if f in med else f"{'—':>16s}" for f in flashers))
+    c.close()
+
+
+def cmd_graph():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    c = db_open()
+    runs = _run_medians(c)
+    c.close()
+    if not runs:
+        print("no recorded runs"); return
+    flashers = sorted({f for _, med in runs for f in med})
+    fig, ax = plt.subplots(figsize=(11, 6))
+    xs = range(len(runs))
+    for f in flashers:
+        ys = [med.get(f) for _, med in runs]
+        ax.plot(xs, ys, marker="o", label=f)
+    ax.set_xticks(list(xs))
+    ax.set_xticklabels([lab for lab, _ in runs], rotation=30, ha="right", fontsize=7)
+    ax.set_ylabel("median ms (lower = faster)")
+    ax.set_title("flash speed progression per fix (64 KiB A->B, see runs table)")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(GRAPH), exist_ok=True)
+    fig.savefig(GRAPH, dpi=110)
+    print(f"wrote {GRAPH}")
 
 
 def make_ab(kb, nchanged, entropy="random"):
@@ -221,6 +308,7 @@ def bench_board(name, chip, usb, tty, flashers, addr, kb, changed, rounds, log,
         f"changed, {rounds} rounds ===")
     agg = {f: [] for f in flashers}
     fails = 0
+    rows = []                                  # (board, chip, flasher, round, ms, ok)
     for rnd in range(rounds):
         for f in flashers:
             try:
@@ -232,6 +320,8 @@ def bench_board(name, chip, usb, tty, flashers, addr, kb, changed, rounds, log,
                 fails += 1
             if el is not None and ok:
                 agg[f].append(el)
+            if el is not None:
+                rows.append((name, chip, f, rnd, el * 1000, int(bool(ok))))
             log(f"  r{rnd} {f:14s} {tag}  "
                 f"{f'{el*1000:7.0f} ms' if el is not None else '   —   '}"
                 f"{('  ' + note) if note else ''}")
@@ -244,7 +334,7 @@ def bench_board(name, chip, usb, tty, flashers, addr, kb, changed, rounds, log,
         ff = sorted(agg["espjtag-full"])[len(agg["espjtag-full"]) // 2]
         fi = sorted(agg["espjtag-incr"])[len(agg["espjtag-incr"]) // 2]
         log(f"     -> incremental speedup vs full: {ff/fi:.2f}x")
-    return fails
+    return fails, rows
 
 
 def main():
@@ -258,7 +348,16 @@ def main():
     ap.add_argument("--addr", type=lambda x: int(x, 0), default=ADDR)
     ap.add_argument("--flashers", default="espjtag-full,espjtag-incr")
     ap.add_argument("--entropy", choices=("random", "firmware"), default="random")
+    ap.add_argument("--record", action="store_true",
+                    help="record results into tmp/flash-bench.db keyed by git sha")
+    ap.add_argument("--note", default="")
+    ap.add_argument("--report", action="store_true", help="print speed progression table")
+    ap.add_argument("--graph", action="store_true", help="write docs/images/flash-progression.png")
     args = ap.parse_args()
+    if args.report:
+        cmd_report(); return 0
+    if args.graph:
+        cmd_graph(); return 0
     flashers = [f.strip() for f in args.flashers.split(",") if f.strip()]
 
     if args.fleet:
@@ -276,12 +375,17 @@ def main():
         print("need --usb or --fleet"); return 2
 
     total_fail = 0
+    all_rows = []
     for name, chip, usb_path, tty in boards:
-        total_fail += bench_board(name, chip, usb_path, tty, flashers, args.addr,
+        fails, rows = bench_board(name, chip, usb_path, tty, flashers, args.addr,
                                   args.kb, args.changed, args.rounds, print,
                                   args.entropy)
+        total_fail += fails
+        all_rows += rows
     print(f"\n=== fleet bench done: {total_fail} failure(s) across "
           f"{len(boards)} board(s) x {args.rounds} round(s) ===")
+    if args.record and all_rows:
+        db_record(all_rows, args.note, args.kb, args.changed, args.entropy)
     return 1 if total_fail else 0
 
 
