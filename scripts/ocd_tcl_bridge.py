@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """ocd_tcl_bridge.py — run OpenOCD's verbatim config Tcl, backed entirely by espjtag.
 
-Design (locked in): pure-Python mini_jimtcl interpreter + OpenOCD's leaf hardware
-commands (mww/mdw/riscv dmi_read|write/poll) implemented HERE on espjtag's own
-transport. No OpenOCD process, no RPC — anything espjtag lacks, we write ourselves.
+Design (locked in): mini_jimtcl (pure Python, zero dependencies) as the sole Tcl
+engine + OpenOCD's leaf hardware commands (mww/mdw/riscv dmi_read|write/poll)
+implemented HERE on espjtag's own transport. No OpenOCD process, no RPC — anything
+espjtag lacks, we write ourselves.
 
-So OpenOCD's esp32c6_wdt_disable / esp32c6_soc_reset procs (copied verbatim from
-openocd-esp32 tcl/target/esp32c6.cfg) run UNMODIFIED on real silicon through
-espjtag — no hand-transcription into chips.py, and no upstream drift.
+CHIP-AWARE: the SAME Tcl runs on either core. mww/mdw use the RISC-V System Bus on a
+C6, or the Xtensa XDM (espjtag.xtensa — instruction injection) on an S3. So:
+  * C6: OpenOCD's esp32c6_wdt_disable / esp32c6_soc_reset procs (verbatim from
+    tcl/target/esp32c6.cfg) run UNMODIFIED — no transcription into chips.py, no drift.
+  * S3: `mdw`/`mww` reach memory over the Xtensa XDM, so an S3 OpenOCD config runs the
+    same way (demonstrated below: `mdw 0x40000000 4` -> the OpenOCD/probe-rs golden).
 
 SPEED — and this matters: espjtag is ALREADY faster than OpenOCD/probe-rs. Its
 _dmi_batch issues a whole burst behind ONE IR=DMI select, FIFO-chunked at the
@@ -32,8 +36,9 @@ sys.path.insert(0, HERE)
 
 import usb.util
 
-from espjtag import EspUsbJtag
+from espjtag import EspUsbJtag, chips
 from espjtag.constants import DMCONTROL, DMSTATUS, SBCS, SBADDRESS0, SBDATA0
+from espjtag.xtensa import XtensaXDM
 from mini_jimtcl import MiniJimTcl
 
 # verbatim from openocd-esp32 tcl/target/esp32c6.cfg
@@ -82,6 +87,10 @@ class OcdTclBridge:
     def __init__(self, j):
         self.j = j
         self.trace = []                     # (op, addr, val) — for -d3 comparison
+        # On a RISC-V part mww/mdw use System Bus Access; on Xtensa (S3) they route
+        # to the XDM (instruction injection) — same Tcl, the right hardware path.
+        self.core = (chips.lookup(j.read_idcode()) or {}).get("core", "riscv")
+        self.xdm = XtensaXDM(j) if self.core == "xtensa" else None
         self.tcl = MiniJimTcl()
         t = self.tcl
         t.register("mww", self._mww)
@@ -91,28 +100,30 @@ class OcdTclBridge:
         t.register("poll", self._poll)
         t.register("sleep", self._sleep)
         t.register("echo", lambda a: (print(*a), "")[1])
-        # the DMI-register globals esp32c6_soc_reset reads (OpenOCD sets these in
-        # its riscv setup; they're just the DMI addresses espjtag already knows).
-        t.vars.update({
-            "_RISCV_DMCONTROL": str(DMCONTROL),
-            "_RISCV_SB_CS": str(SBCS),
-            "_RISCV_SB_ADDR0": str(SBADDRESS0),
-            "_RISCV_SB_DATA0": str(SBDATA0),
-        })
-        t.eval(ESP32C6_WDT_DISABLE)
-        t.eval(ESP32C6_SOC_RESET)
+        if self.core == "riscv":
+            # the DMI-register globals esp32c6_soc_reset reads (just the DMI
+            # addresses espjtag already knows), and the verbatim C6 procs.
+            t.vars.update({
+                "_RISCV_DMCONTROL": str(DMCONTROL), "_RISCV_SB_CS": str(SBCS),
+                "_RISCV_SB_ADDR0": str(SBADDRESS0), "_RISCV_SB_DATA0": str(SBDATA0),
+            })
+            t.eval(ESP32C6_WDT_DISABLE)
+            t.eval(ESP32C6_SOC_RESET)
 
-    # --- OpenOCD leaf commands, on espjtag's transport ---
+    # --- OpenOCD leaf commands, on espjtag's transport (RISC-V SBA or Xtensa XDM) -
     def _mww(self, args):
         addr, val = int(args[0], 0), int(args[1], 0)
         self.trace.append(("mww", addr, val))
-        self.j.write_mem32(addr, val)
+        (self.xdm.write_mem32 if self.xdm else self.j.write_mem32)(addr, val)
         return ""
 
     def _mdw(self, args):
         addr = int(args[0], 0)
         n = int(args[1]) if len(args) > 1 else 1
-        vals = self.j.read_mem(addr, n) if n > 1 else [self.j.read_mem32(addr)]
+        if self.xdm:
+            vals = self.xdm.read_mem(addr, n)
+        else:
+            vals = self.j.read_mem(addr, n) if n > 1 else [self.j.read_mem32(addr)]
         return " ".join(f"0x{v:08x}" for v in vals)
 
     def _riscv(self, args):
@@ -149,25 +160,38 @@ def main():
     args = ap.parse_args()
 
     j = EspUsbJtag(args.usb)
-    print(f"IDCODE=0x{j.read_idcode():08x}")
+    ic = j.read_idcode()
+    br = OcdTclBridge(j)
+    print(f"IDCODE=0x{ic:08x} [{chips.name_for(ic) or '??'}]  core={br.core}")
+
+    if br.core == "xtensa":
+        # S3: leaf commands run on the Xtensa XDM. Demonstrate a Tcl `mdw` end-to-end.
+        br.xdm.powerup()
+        if not br.xdm.halt():
+            print("FAILED to halt"); return 1
+        print("halted via XDM. Running 'mdw 0x40000000 4' through mini_jimtcl:")
+        out = br.run("mdw 0x40000000 4")
+        golden = "0x1049c500 0xe52049d5 0x49f53049 0x00003400"
+        print(f"  mdw -> {out}")
+        print(f"  golden {golden}  {'MATCH' if out == golden else 'MISMATCH'}")
+        br.xdm.resume()
+        usb.util.dispose_resources(j.dev)
+        return 0 if out == golden else 1
+
+    # RISC-V (C6): run OpenOCD's verbatim wdt_disable, read back, optional soc_reset.
     j.examine()
     if not j.halt(disable_wdt=False):       # halt WITHOUT espjtag's native WDT disable
         print("FAILED to halt"); return 1
     print("halted (native WDT-disable skipped — the bridge will do it)")
-
-    br = OcdTclBridge(j)
     print("\nrunning OpenOCD's VERBATIM esp32c6_wdt_disable via espjtag...")
     br.run("esp32c6_wdt_disable")
     for op, a, v in br.trace:
         print(f"  {op} 0x{a:08x} 0x{v:08x}")
-
-    # read-back proof: the WDT config registers are now disabled.
     print("\nread-back (proves the writes landed on real silicon):")
     for name, reg, want in (("TG0 cfg", 0x60008048, 0), ("TG1 cfg", 0x60009048, 0),
                             ("LP_WDT_SWD cfg", 0x600B1C1C, 0x40000000)):
         got = j.read_mem32(reg)
         print(f"  {name:14} 0x{reg:08x} = 0x{got:08x}  {'ok' if got == want else 'MISMATCH'}")
-
     if args.reset:
         print("\nrunning esp32c6_soc_reset (verbatim)...")
         br.run("esp32c6_soc_reset")
@@ -175,7 +199,6 @@ def main():
     else:
         j.resume()
         print("\nresumed (pass --reset to also run the verbatim soc_reset)")
-
     usb.util.dispose_resources(j.dev)
     return 0
 
