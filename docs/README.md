@@ -63,6 +63,9 @@ that align to them.
 | [JTAG-FLASH-WRITES.md](JTAG-FLASH-WRITES.md) | Design for high-speed flash-over-JTAG (RAM loader / ROM calls) | [#3](https://github.com/awtoau/espjtag/issues/3), [#4](https://github.com/awtoau/espjtag/issues/4) |
 | [CROSS-PLATFORM-USB.md](CROSS-PLATFORM-USB.md) | Portable USB reset (pyusb `dev.reset()`); Win/Linux/mac | [#13](https://github.com/awtoau/espjtag/issues/13) |
 | [MCP-SERVER.md](MCP-SERVER.md) | The espjtag MCP server (tools, pinning, safety tiers) + capability table | [#14](https://github.com/awtoau/espjtag/issues/14) |
+| [INCREMENTAL-FLASH-DESIGN.md](INCREMENTAL-FLASH-DESIGN.md) | Incremental-flash engine design + prior-art survey (esptool/probe-rs/ST/pyOCD/SEGGER) | [#3](https://github.com/awtoau/espjtag/issues/3) |
+| [CUBEPROGRAMMER-BUGS.md](CUBEPROGRAMMER-BUGS.md) | Two CubeProgrammer `incremental` bugs found on bench (additive-sum skip; two-probe SIGSEGV) | — |
+| [PYOCD-INCREMENTAL-PROOF.md](PYOCD-INCREMENTAL-PROOF.md) | Silicon proof: pyOCD default incremental is correct on ST-Link (catches ST's sum-collision); its `fast_program` CRC path has a sector/page data-loss bug — incl. root cause, patch, and paste-ready upstream issue (**handoff: pursued outside this repo**) | — |
 
 > The firmware/bench side of this story — the fleet, per-chip flashing, and *why*
 > the C6 reset mess pulled in JTAG/OpenOCD — is summarized in
