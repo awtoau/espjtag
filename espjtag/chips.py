@@ -74,9 +74,9 @@ CHIPS = {
         # to read flash back for verification WITHOUT touching the XIP cache window.
         # Result in a0: 0=OK, 1=ERR, 2=TIMEOUT (esp_rom_spiflash_result_t).
         # *** These ROM helpers need the legacy ROM flash state initialised
-        # (esp_rom_spiflash_attach + esp_rom_spiflash_config_param) — a running
-        # Zephyr app does NOT set it up, so they return garbage until init.
-        # debug.flash_write() is GATED behind a ROM/XIP read-back match (#3). ***
+        # (spi_flash_attach + esp_rom_spiflash_config_param, below) — a running
+        # Zephyr app leaves it unset, so they return garbage until flash_init().
+        # debug.flash_write() is GATED behind a ROM-read 0xE9 image-magic check. ***
         rom=dict(
             spiflash_unlock=0x40000154,
             spiflash_erase_sector=0x40000144,
@@ -88,6 +88,13 @@ CHIPS = {
             # repopulates the legacy g_rom_spiflash_chip geometry the running app
             # left unset, so the helpers above work (flash_init / un-gate, #30).
             spiflash_config_param=0x40000160,
+            # spi_flash_attach(ishspi, legacy) sets up the SPI for the LEGACY funcs —
+            # dummy cycles + read mode — without which esp_rom_spiflash_read returns
+            # garbage on a running app (it left the controller in fast-XIP mode).
+            # NOTE the ROM name is spi_flash_attach, NOT esp_rom_spiflash_attach.
+            spi_flash_attach=0x400001DC,
+            spiflash_config_clk=0x40000178,
+            spiflash_config_readmode=0x4000017C,
             cache_disable_icache=0x40000690,
             cache_enable_icache=0x40000694,
         ),

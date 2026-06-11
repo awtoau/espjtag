@@ -35,8 +35,16 @@ def main():
         print("FAILED to halt"); return 1
     print("halted.")
 
-    # save the covering 4 KiB sector so we can put it back afterwards
-    saved = j.flash_read_xip(addr, 0x1000 // 4)
+    # bring up the ROM flash read path, then confirm the safety gate (0xE9 magic)
+    j.flash_init()
+    ready, rw, magic = j._rom_flash_ready()
+    print(f"flash_init -> gate ready={ready} (flash[0] magic 0x{(magic or 0):02x}, want 0xE9)")
+    if not ready:
+        print("ROM flash read path not ready — aborting (mine the init, see #33)")
+        j.resume(); usb.util.dispose_resources(j.dev); return 1
+
+    # save the covering 4 KiB sector (raw ROM read) so we can restore it
+    saved = j.flash_read_rom(addr, 0x1000 // 4)
     print(f"saved sector @0x{addr:08x} (first word 0x{saved[0]:08x})")
 
     test = [(0xC0FFEE00 + i) & 0xFFFFFFFF for i in range(64)]    # 256 B pattern
@@ -48,9 +56,9 @@ def main():
         print("flash_write RAISED:", e)
         j.resume(); usb.util.dispose_resources(j.dev); return 1
 
-    back = j.flash_read_xip(addr, len(test))
+    back = j.flash_read_rom(addr, len(test))
     ok = back == test
-    print(f"read-back via XIP: {'MATCH' if ok else 'MISMATCH'} "
+    print(f"read-back via ROM: {'MATCH' if ok else 'MISMATCH'} "
           f"(first 0x{back[0]:08x}, want 0x{test[0]:08x})")
 
     # restore the original sector (erase + write the saved 4 KiB back)

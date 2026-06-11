@@ -336,6 +336,20 @@ class EspUsbJtag(EspUsbJtagTransport):
             raise RuntimeError("flash_read_xip: no flash_xip window tabled")
         return self.read_mem(xip + off, nwords)
 
+    def flash_read_rom(self, addr, nwords):
+        """Read nwords from RAW flash byte-offset `addr` via the ROM
+        esp_rom_spiflash_read (needs flash_init done / the gate passing). Unlike
+        flash_read_xip this is a TRUE raw flash offset (XIP maps the app's mapping,
+        not raw flash), so it's the correct read for verify + inspection. Hart
+        halted; icache toggled. Reuses the scratch staging buffer."""
+        sram = self._chip()["sram"]
+        buf = sram["data"]
+        self.call_rom("cache_disable_icache")
+        self.call_rom("spiflash_read", args=(addr, buf, nwords * 4))
+        words = self.read_mem(buf, nwords)
+        self.call_rom("cache_enable_icache")
+        return words
+
     def flash_init(self, chip_size=0x1000000):
         """Repopulate the legacy ROM spiflash geometry (g_rom_spiflash_chip) so the
         esp_rom_spiflash_* helpers work on a board whose running app left it unset.
@@ -343,19 +357,27 @@ class EspUsbJtag(EspUsbJtagTransport):
         geometry — esp_rom_spiflash_config_param(devid=0, chip_size, 64 KiB block,
         4 KiB sector, 256 B page, 0xFFFF status mask). Hart must be halted. Returns
         the ROM result (0 = OK). This is the un-gate for flash_write (#30)."""
-        if "spiflash_config_param" not in self._chip().get("rom", {}):
+        rom = self._chip().get("rom", {})
+        if "spiflash_config_param" not in rom:
             raise RuntimeError("flash_init: spiflash_config_param not tabled for this chip")
+        # attach first — sets the legacy funcs' dummy cycles/read mode (without it the
+        # ROM read returns garbage on a running app). ishspi=0 (default GPIO), legacy=0.
+        if "spi_flash_attach" in rom:
+            self.call_rom("spi_flash_attach", args=(0, 0))
         r, _ = self.call_rom("spiflash_config_param",
                              args=(0, chip_size, 0x10000, 0x1000, 0x100, 0xFFFF))
         return r
 
-    def _rom_flash_ready(self, probe_off=0x0, nwords=4):
-        """SAFETY GATE for any ROM erase/program. Call esp_rom_spiflash_read for a
-        small region into scratch SRAM and require it to match the XIP window read
-        of the same region. Returns (ready: bool, rom_words, xip_words). If this is
-        False the legacy ROM flash state is NOT correctly configured on this board
-        and erase/program MUST NOT proceed (it would target a misconfigured chip).
-        Read-only — performs no erase/write. icache is toggled around the ROM read."""
+    def _rom_flash_ready(self, nwords=4):
+        """SAFETY GATE for any ROM erase/program. Read flash offset 0 via the ROM
+        esp_rom_spiflash_read and require the first byte to be the ESP image magic
+        0xE9 — the 2nd-stage bootloader header sits at flash 0 on every ESP target.
+        A correct 0xE9 proves the ROM read path is configured (attach dummy cycles +
+        config_param geometry); garbage (the running app left the controller in
+        fast-XIP mode) means erase/program would target a misconfigured chip, so we
+        refuse (brick risk). (Earlier this compared against flash_read_xip, but the
+        XIP window maps the app's region, not raw flash 0 — never a valid reference.)
+        Read-only; icache toggled around the ROM read. Returns (ready, rom_words, magic)."""
         c = self._chip()
         rom, sram = c.get("rom"), c.get("sram")
         if not rom or not sram or "spiflash_read" not in rom:
@@ -364,13 +386,12 @@ class EspUsbJtag(EspUsbJtagTransport):
         saved = self.read_mem(dest, nwords)
         try:
             self.call_rom("cache_disable_icache")
-            ret, halted = self.call_rom("spiflash_read",
-                                        args=(probe_off, dest, nwords * 4))
+            ret, halted = self.call_rom("spiflash_read", args=(0x0, dest, nwords * 4))
             rom_words = self.read_mem(dest, nwords)
             self.call_rom("cache_enable_icache")
-            xip_words = self.flash_read_xip(probe_off, nwords)
-            ready = bool(halted) and ret == 0 and rom_words == xip_words
-            return ready, rom_words, xip_words
+            magic = (rom_words[0] & 0xFF) if rom_words else None
+            ready = bool(halted) and ret == 0 and magic == 0xE9
+            return ready, rom_words, magic
         finally:
             self.write_mem(dest, saved)         # leave scratch byte-identical
 
@@ -403,11 +424,11 @@ class EspUsbJtag(EspUsbJtagTransport):
         if not ready:
             raise RuntimeError(
                 "flash_write: ROM spiflash read-back self-test FAILED — the legacy "
-                "ROM flash state is not configured on this target (ROM read "
-                f"{rw} vs XIP {xw}). Refusing to erase/program (brick risk). "
-                "Initialise the ROM spiflash state (esp_rom_spiflash_attach + "
-                "config_param, with the C6-ECO0 workarounds) and re-verify a "
-                "read-back match before enabling writes. See docs/JTAG-FLASH-WRITES.md.")
+                "ROM flash read path is not configured on this target (ROM read "
+                f"{rw}, first-byte magic {xw}, want 0xE9). Refusing to erase/program "
+                "(brick risk). flash_init runs spi_flash_attach + config_param; if "
+                "the magic is still wrong this chip/revision needs more (config_clk/"
+                "readmode or an ECO workaround — see #33), or flash it with esptool.")
         c = self._chip()
         sram = c["sram"]
         buf = sram["data"]
@@ -432,9 +453,9 @@ class EspUsbJtag(EspUsbJtagTransport):
             if r != 0:
                 raise RuntimeError(f"flash write @0x{dest:08x} -> {r}")
         if verify:
-            got = self.flash_read_xip(addr, len(words))   # via XIP (working read)
+            got = self.flash_read_rom(addr, len(words))   # raw ROM read (true offset)
             if got != words:
-                raise RuntimeError("flash_write: verify mismatch")
+                raise RuntimeError(f"flash_write: verify mismatch @0x{addr:08x}")
             _log("  flash_write: verify OK")
         return True
 
