@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """xcall_test.py — validate XtensaXDM.call_function on the S3 (#29).
 
-Test 1: call an entry that is itself a BREAK — proves the set-PC / RFDO-resume /
-BREAK-trap / poll-STOPPED mechanism (the xtensa_start_algorithm port), with no
-function and no windowed-ABI question.
-Test 2: call spi_flash_attach (a real, windowed ROM func) — tells us whether a
-call0-style entry works or we need a call0 bridge.
+Test 1: call a bare BREAK call0-style (windowed=False) — proves the set-PC /
+RFDO-resume / BREAK-trap / poll-STOPPED mechanism.
+Test 2: WINDOWED call (default) of esp_rom_spiflash_config_param via the CALL0 bridge.
+config_param writes the chip geometry into *rom_spiflash_legacy_data; we point that
+(NULL on this app) at a scratch buffer, call config_param windowed, and require the
+buffer to hold the geometry we passed AND ret==0. That proves the bridge drives a real
+(leaf) windowed ROM function correctly. (Full ROM flash read — the 0xE9 gate — also
+needs rom_spiflash_legacy_funcs + the deep-nesting attach; see scripts/flash_test.py.)
 
 Usage: python3 scripts/xcall_test.py --usb 1-1.3.1.3.3.3
 """
@@ -19,6 +22,8 @@ import usb.util
 
 from espjtag import EspUsbJtag, chips
 from espjtag.xtensa import XtensaXDM
+
+ROM_LEGACY_DATA = 0x3FCEFFE4
 
 
 def main():
@@ -36,34 +41,34 @@ def main():
     print("halted.")
     sram, rom = c["sram"], c["rom"]
 
-    # Test 1 — call a BREAK: validates set-PC/resume/trap (no function involved)
+    # Test 1 — call a BREAK call0-style: validates set-PC/resume/trap (no function)
     brk = sram["trap"]
-    ret, halted = x.call_function(brk, args=(), stack=sram["stack"], trap=brk)
-    print(f"test1 call BREAK@0x{brk:08x}: halted={halted} ret={ret}  "
+    ret, halted = x.call_function(brk, args=(), stack=sram["stack"], trap=brk,
+                                  windowed=False)
+    print(f"test1 call0 BREAK@0x{brk:08x}: halted={halted} ret={ret}  "
           f"{'MECHANISM OK' if halted else 'mechanism FAILED'}")
 
-    # Test 2 — call spi_flash_attach(0,0): a real (windowed) ROM function
-    ret, halted = x.call_function(rom["spi_flash_attach"], args=(0, 0),
+    # Test 2 — windowed config_param via the bridge populates the geometry struct.
+    chip_buf = sram["data"] + 0x1400
+    x.write_mem(chip_buf, [0] * 8)
+    saved_ptr = x.read_mem32(ROM_LEGACY_DATA)
+    x.write_mem32(ROM_LEGACY_DATA, chip_buf)
+    want = [0, 0x1000000, 0x10000, 0x1000, 0x100, 0xFFFF]
+    # warmup: the first resume after halt is occasionally swallowed; one throwaway call
+    x.call_function(rom["spiflash_config_param"], args=tuple(want),
+                    stack=sram["stack"], trap=sram["trap"])
+    ret, halted = x.call_function(rom["spiflash_config_param"], args=tuple(want),
                                   stack=sram["stack"], trap=sram["trap"])
-    print(f"test2 call spi_flash_attach: halted={halted} ret={ret}  "
-          f"{'ROM CALL OK' if halted else 'did NOT trap (windowed ABI? need bridge)'}")
-
-    # Test 3 — the BETTER WAY: call the ROM's CALL0 entry (_esp_rom_spiflash_read,
-    # 0x400009cc) directly — no windowed wrapper, no shim. Pre-poison the buffer so
-    # we can tell a real read from stale scratch.
-    CALL0_READ = 0x400009CC
-    x.write_mem(sram["data"], [0xCCCCCCCC] * 4)
-    ret, halted = x.call_function(CALL0_READ, args=(0x0, sram["data"], 16),
-                                  stack=sram["stack"], trap=sram["trap"])
-    words = x.read_mem(sram["data"], 4)
-    magic = words[0] & 0xFF
-    print(f"test3 _spiflash_read ret={ret} halted={halted} buf[0]=0x{words[0]:08x} "
-          f"magic=0x{magic:02x}  "
-          f"{'GATE OK (0xE9) — call0 ROM entry, no shim!' if magic == 0xE9 else '(see below)'}")
+    struct = x.read_mem(chip_buf, 6)
+    x.write_mem32(ROM_LEGACY_DATA, saved_ptr)              # restore
+    ok = halted and ret == 0 and struct == want
+    print(f"test2 windowed config_param: halted={halted} ret={ret} "
+          f"struct={[hex(w) for w in struct]}  "
+          f"{'WINDOWED ROM CALL OK (bridge drives a real ROM fn)' if ok else 'FAILED'}")
 
     x.resume()
     usb.util.dispose_resources(j.dev)
-    return 0
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
