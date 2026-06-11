@@ -194,7 +194,28 @@ CHIPS = {
     # VERIFIED on the bench: 3 distinct S3 units (xiao-s3-sense 1C:DB:D4:76:82:08,
     # xiao-s3-plus E0:72:A1:F8:EB:94, ble_bridge_s3 3C:0F:02:C7:2B:34) all read
     # IDCODE 0x120034e5 via espjtag read_idcode + OpenOCD scan + probe-rs info.
-    0x120034E5: dict(name="S3", core="xtensa", chain=_S3_TWO_TAP),
+    0x120034E5: dict(
+        name="S3", core="xtensa", chain=_S3_TWO_TAP,
+        flash_xip=0x42000000,
+        # ROM SPI-flash helpers (esp32s3.rom.ld) + IRAM scratch — STAGED for S3
+        # flash (#29) but NOT yet usable: flash_write reaches these via call_function,
+        # and Xtensa needs a different one than the RISC-V dpc/ebreak path — set the
+        # a-regs (a2..a7=args, a0=BREAK-trap, a1=sp), write entry to EPC[6] (S3 debug
+        # level = 6, sr 0xb6: WSR a3,EPC6=0x13b630), resume via RFDO (0xf1e000), poll
+        # DSR STOPPED, read a2. Plus the ROM's windowed ABI. That primitive is the
+        # remaining work (XtensaXDM.call_function); the addresses below are ready.
+        rom=dict(
+            spiflash_wait_idle=0x40000960,
+            spiflash_erase_sector=0x400009FC,
+            spiflash_write=0x40000A14,
+            spiflash_read=0x40000A20,
+            spiflash_unlock=0x40000A2C,
+            spiflash_config_param=0x40000A50,
+            spi_flash_attach=0x40000AEC,
+        ),
+        # scratch at the top of S3 IRAM (SOC_IRAM 0x40370000..0x403E0000, soc.h).
+        sram=dict(data=0x403DC000, trap=0x403DBF00, stack=0x403DF000, top=0x403E0000),
+    ),
     # NOTE: the ESP32-S2 (also Xtensa LX7) may share this IDCODE — UNVERIFIED (no S2
     # on the bench). If an S2 is ever read here, name_for() would mislabel it "S3";
     # disambiguate by another means (USB descriptor / efuse) before relying on it.
