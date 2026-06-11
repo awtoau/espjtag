@@ -145,11 +145,26 @@ CHIPS = {
         abits=10,
         chain=_C5_TWO_TAP,
         flash_xip=0x42000000,
-        # rom/reset/sram TODO from esp32c5.rom.ld / esp32c5.cfg / esp32c5 soc.h.
-        # Left UNSET deliberately: reset_run_from_rom and the flash loader on C5
-        # are NOT yet verified, and a wrong ROM/reset address would wedge the part.
-        # (esp32c5.rom.ld exists at components/esp_rom/esp32c5/ld/ — fill + bench-
-        #  verify before enabling flash on C5.)
+        # ROM SPI-flash helpers (esp32c5.rom.ld). The C5's cache uses a NEWER API
+        # (no simple Cache_Disable_ICache), so no icache toggle is tabled — the ROM
+        # read runs with the hart halted, so there's no prefetch racing it (the
+        # cache calls in debug.py are skipped when not tabled). #30 flash path.
+        rom=dict(
+            spiflash_wait_idle=0x40000120,
+            spiflash_erase_sector=0x40000154,
+            spiflash_write=0x4000015C,
+            spiflash_read=0x40000160,
+            spiflash_unlock=0x40000164,
+            spiflash_config_param=0x40000170,
+            spi_flash_attach=0x400001F0,
+        ),
+        # scratch at the top of C5 IRAM (SOC_IRAM 0x40800000..0x40860000, soc.h).
+        sram=dict(
+            data=0x4085C000,     # staging buffer (grows up; < trap)
+            trap=0x4085BF00,     # ebreak return-trap word
+            stack=0x4085F000,    # SP top (grows down; headroom to data)
+            top=0x40860000,      # SOC_IRAM_HIGH (bound)
+        ),
     ),
 
     # ---- ESP32-C3 (single-TAP RISC-V) ----------------------------------------

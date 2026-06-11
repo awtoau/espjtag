@@ -342,12 +342,15 @@ class EspUsbJtag(EspUsbJtagTransport):
         flash_read_xip this is a TRUE raw flash offset (XIP maps the app's mapping,
         not raw flash), so it's the correct read for verify + inspection. Hart
         halted; icache toggled. Reuses the scratch staging buffer."""
-        sram = self._chip()["sram"]
-        buf = sram["data"]
-        self.call_rom("cache_disable_icache")
+        c = self._chip()
+        buf = c["sram"]["data"]
+        has_cache = "cache_disable_icache" in c.get("rom", {})
+        if has_cache:                                   # newer chips (C5) lack the
+            self.call_rom("cache_disable_icache")       # simple icache toggle; when
         self.call_rom("spiflash_read", args=(addr, buf, nwords * 4))
         words = self.read_mem(buf, nwords)
-        self.call_rom("cache_enable_icache")
+        if has_cache:                                   # halted there's no prefetch
+            self.call_rom("cache_enable_icache")        # racing the ROM read anyway
         return words
 
     def flash_init(self, chip_size=0x1000000):
@@ -384,11 +387,14 @@ class EspUsbJtag(EspUsbJtagTransport):
             return False, None, None
         dest = sram["data"]
         saved = self.read_mem(dest, nwords)
+        has_cache = "cache_disable_icache" in rom
         try:
-            self.call_rom("cache_disable_icache")
+            if has_cache:
+                self.call_rom("cache_disable_icache")
             ret, halted = self.call_rom("spiflash_read", args=(0x0, dest, nwords * 4))
             rom_words = self.read_mem(dest, nwords)
-            self.call_rom("cache_enable_icache")
+            if has_cache:
+                self.call_rom("cache_enable_icache")
             magic = (rom_words[0] & 0xFF) if rom_words else None
             ready = bool(halted) and ret == 0 and magic == 0xE9
             return ready, rom_words, magic
