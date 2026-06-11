@@ -48,17 +48,18 @@ def main():
     print(f"test2 call spi_flash_attach: halted={halted} ret={ret}  "
           f"{'ROM CALL OK' if halted else 'did NOT trap (windowed ABI? need bridge)'}")
 
-    # Test 3 — flash bring-up via call_function: attach + config_param, then read
-    # flash offset 0 and expect the 0xE9 ESP image magic (the gate).
-    def call_rom(sym, a=()):
-        return x.call_function(rom[sym], args=a, stack=sram["stack"], trap=sram["trap"])
-    call_rom("spi_flash_attach", (0, 0))
-    call_rom("spiflash_config_param", (0, 0x1000000, 0x10000, 0x1000, 0x100, 0xFFFF))
-    call_rom("spiflash_read", (0x0, sram["data"], 16))
+    # Test 3 — the BETTER WAY: call the ROM's CALL0 entry (_esp_rom_spiflash_read,
+    # 0x400009cc) directly — no windowed wrapper, no shim. Pre-poison the buffer so
+    # we can tell a real read from stale scratch.
+    CALL0_READ = 0x400009CC
+    x.write_mem(sram["data"], [0xCCCCCCCC] * 4)
+    ret, halted = x.call_function(CALL0_READ, args=(0x0, sram["data"], 16),
+                                  stack=sram["stack"], trap=sram["trap"])
     words = x.read_mem(sram["data"], 4)
     magic = words[0] & 0xFF
-    print(f"test3 flash[0]=0x{words[0]:08x} magic=0x{magic:02x}  "
-          f"{'GATE OK (0xE9) — S3 ROM flash read works!' if magic == 0xE9 else 'not 0xE9'}")
+    print(f"test3 _spiflash_read ret={ret} halted={halted} buf[0]=0x{words[0]:08x} "
+          f"magic=0x{magic:02x}  "
+          f"{'GATE OK (0xE9) — call0 ROM entry, no shim!' if magic == 0xE9 else '(see below)'}")
 
     x.resume()
     usb.util.dispose_resources(j.dev)
