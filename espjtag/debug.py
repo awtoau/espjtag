@@ -9,6 +9,7 @@ CC-BY-4.0); the reset_run() DMI sequence was captured from OpenOCD's `reset run`
 """
 
 import time
+import zlib
 
 import usb.util
 
@@ -27,6 +28,18 @@ from .constants import (
 )
 from . import chips
 from .transport import EspUsbJtagTransport
+
+
+def _crc32_le_raw(data, crc=0):
+    """Reflected CRC-32 (poly 0xEDB88320), raw accumulation, no pre/post inversion — a
+    host mirror of the ESP ROM crc32_le primitive, used to calibrate the host digest
+    convention against the live ROM (see EspUsbJtag._crc_host)."""
+    crc &= 0xFFFFFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0xEDB88320 if (crc & 1) else 0)
+    return crc & 0xFFFFFFFF
 
 
 class EspUsbJtag(EspUsbJtagTransport):
@@ -464,6 +477,114 @@ class EspUsbJtag(EspUsbJtagTransport):
                 raise RuntimeError(f"flash_write: verify mismatch @0x{addr:08x}")
             _log("  flash_write: verify OK")
         return True
+
+    # === incremental flash — on-chip CRC-32 diff + write-only-changed + verify (#34) ===
+    # The digest is a REAL CRC-32 (poly 0xEDB88320) computed ON-CHIP via the ROM
+    # esp_rom_crc32_le over a scratch-staged sector read — only the 4-byte digest crosses
+    # JTAG, never the sector data. This is the digest pyOCD/J-Flash and everyone who does
+    # incremental RIGHT uses; STM32CubeProgrammer's 32-bit ADDITIVE sum (proven on silicon
+    # to silently drop sum-preserving sector changes — docs/CUBEPROGRAMMER-BUGS.md) is the
+    # anti-pattern we deliberately avoid.
+    _CRC_INIT = 0xFFFFFFFF        # init passed to ROM crc32_le; host digest calibrated to match
+
+    def _crc_host(self):
+        """Return host_crc(bytes)->u32 reproducing the on-chip ROM crc32_le(_CRC_INIT, ·),
+        CALIBRATED against the live ROM. The host and on-chip digest MUST agree bit-for-bit
+        (the #1 incremental correctness trap, §9) — so we MEASURE the ROM's CRC convention
+        from a known pattern rather than assume it. Cached per object."""
+        if getattr(self, "_crc_host_fn", None):
+            return self._crc_host_fn
+        if "crc32_le" not in self._chip().get("rom", {}):
+            raise RuntimeError("_crc_host: no crc32_le ROM symbol tabled for this chip")
+        buf = self._chip()["sram"]["data"]
+        pat = bytes((i * 73 + 19) & 0xFF for i in range(256))
+        saved = self.read_mem(buf, 64)
+        self.write_mem(buf, [int.from_bytes(pat[i:i + 4], "little") for i in range(0, 256, 4)])
+        onchip, _ = self.call_rom("crc32_le", args=(self._CRC_INIT, buf, 256))
+        self.write_mem(buf, saved)                              # leave scratch byte-identical
+        onchip &= 0xFFFFFFFF
+        cands = {
+            "zlib^": lambda d: zlib.crc32(d) ^ 0xFFFFFFFF,
+            "zlib": lambda d: zlib.crc32(d) & 0xFFFFFFFF,
+            "raw(init)": lambda d: _crc32_le_raw(d, self._CRC_INIT),
+            "raw(0)": lambda d: _crc32_le_raw(d, 0),
+            "raw(0)^": lambda d: _crc32_le_raw(d, 0) ^ 0xFFFFFFFF,
+        }
+        for name, fn in cands.items():
+            if fn(pat) == onchip:
+                self._crc_host_fn, self._crc_host_name = fn, name
+                return fn
+        raise RuntimeError(f"_crc_host: no host candidate matched ROM crc32_le "
+                           f"(onchip=0x{onchip:08x}) — convention unknown, refusing to diff")
+
+    def flash_crc_region(self, addr, size):
+        """On-chip CRC-32 of `size` bytes of RAW flash at byte-offset `addr`: ROM-read the
+        region into scratch (stays on-chip) then ROM crc32_le over scratch — only the
+        4-byte digest crosses JTAG. `size` must fit the scratch headroom (a 4 KiB sector
+        does). Matches _crc_host() (same ROM, same _CRC_INIT). Hart halted; the ROM flash
+        read path must be ready (flash_init / the gate, as flash_read_rom)."""
+        rom = self._chip().get("rom", {})
+        buf = self._chip()["sram"]["data"]
+        has_cache = "cache_disable_icache" in rom
+        if has_cache:
+            self.call_rom("cache_disable_icache")
+        self.call_rom("spiflash_read", args=(addr, buf, size))
+        if has_cache:
+            self.call_rom("cache_enable_icache")
+        crc, _ = self.call_rom("crc32_le", args=(self._CRC_INIT, buf, size))
+        return crc & 0xFFFFFFFF
+
+    def flash_incremental(self, addr, data, log=None, verify=True):
+        """Incrementally program `data` (bytes) to flash byte-offset `addr`: CRC each 4 KiB
+        sector ON-CHIP, erase+program ONLY the sectors whose CRC differs from the image,
+        then verify-after-write by re-CRC. Same brick-safety gate + ROM path as flash_write.
+        `addr` 4 KiB-aligned; `data` 0xFF-padded to a sector multiple. An all-identical
+        image writes nothing (the root early-out falls out of the loop). Returns
+        dict(sectors, changed, written, verified). Hart halted."""
+        def _log(m):
+            if log:
+                log(m)
+        if addr % 0x1000:
+            raise ValueError("flash_incremental: addr must be 4 KiB-aligned")
+        if len(data) % 0x1000:
+            data = data + b"\xFF" * (0x1000 - len(data) % 0x1000)
+        ready, rw, xw = self._rom_flash_ready()
+        if not ready and "spiflash_config_param" in self._chip().get("rom", {}):
+            _log("  flash_incremental: gate cold — flash_init()")
+            self.flash_init()
+            ready, rw, xw = self._rom_flash_ready()
+        if not ready:
+            raise RuntimeError("flash_incremental: ROM flash read self-test FAILED — "
+                               "refusing to erase/program (brick risk)")
+        host = self._crc_host()
+        buf = self._chip()["sram"]["data"]
+        nsec = len(data) // 0x1000
+        changed = [s for s in range(nsec)
+                   if self.flash_crc_region(addr + s * 0x1000, 0x1000)
+                   != host(data[s * 0x1000:(s + 1) * 0x1000])]
+        _log(f"  flash_incremental: {nsec} sectors, {len(changed)} differ "
+             f"(digest {self._crc_host_name}) -> programming")
+        for s in changed:
+            sa = addr + s * 0x1000
+            img = data[s * 0x1000:(s + 1) * 0x1000]
+            self.call_rom("spiflash_unlock")
+            r, _ = self.call_rom("spiflash_erase_sector", args=(sa >> 12,))
+            if r:
+                raise RuntimeError(f"flash_incremental: erase sector {sa >> 12} -> {r}")
+            self.write_mem(buf, [int.from_bytes(img[i:i + 4], "little")
+                                 for i in range(0, 0x1000, 4)])
+            r, _ = self.call_rom("spiflash_write", args=(sa, buf, 0x1000))
+            if r:
+                raise RuntimeError(f"flash_incremental: write @0x{sa:08x} -> {r}")
+        verified = 0
+        if verify:
+            for s in changed:
+                sa = addr + s * 0x1000
+                if self.flash_crc_region(sa, 0x1000) != host(data[s * 0x1000:(s + 1) * 0x1000]):
+                    raise RuntimeError(f"flash_incremental: verify FAILED @0x{sa:08x}")
+                verified += 1
+        _log(f"  flash_incremental: programmed {len(changed)}/{nsec}, verified {verified}")
+        return dict(sectors=nsec, changed=len(changed), written=len(changed), verified=verified)
 
     def diag(self, log=print):
         """Verbose read-only dump of the debug module — useful BEFORE resetting."""

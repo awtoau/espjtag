@@ -97,6 +97,11 @@ CHIPS = {
             spiflash_config_readmode=0x4000017C,
             cache_disable_icache=0x40000690,
             cache_enable_icache=0x40000694,
+            # esp_rom_crc32_le(crc, buf, len) — on-chip CRC-32 (poly 0xEDB88320) for
+            # the incremental flash diff/verify (#34): CRC a flash sector staged in
+            # scratch so only the 4-byte digest crosses JTAG, not the sector data.
+            # The REAL CRC the field uses (pyOCD/J-Flash) — never ST's additive sum.
+            crc32_le=0x40000758,
         ),
         # Watchdogs to disable while the hart is HALTED, so a WDT can't reset the
         # chip out from under the debugger (the C6 halt-flakiness fix — probe-rs and
@@ -157,6 +162,7 @@ CHIPS = {
             spiflash_unlock=0x40000164,
             spiflash_config_param=0x40000170,
             spi_flash_attach=0x400001F0,
+            crc32_le=0x40000778,                 # on-chip CRC-32 for incremental (#34)
         ),
         # scratch at the top of C5 IRAM (SOC_IRAM 0x40800000..0x40860000, soc.h).
         sram=dict(
