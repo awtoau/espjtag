@@ -122,6 +122,16 @@ loaders in `~/git/gihdra/tmp/flashloader_bins`, disasm via `scripts/disasm_stldr
 > sector can be silently skipped. This is the **anti-pattern**, not the recipe. We use
 > a real per-sector CRC (floor) / wide digest (fleet) + verify-after-write. ST proves
 > the *per-sector skip architecture*; it proves what NOT to use for the digest.
+>
+> **✅ CONFIRMED ON SILICON** (black-box, cites no decompilation —
+> `scripts/st_incremental_proof.py`, run on a real STM32F427): flashed image A, then
+> `incremental`-flashed a B whose sector 1 swapped two bytes (`0x11`↔`0x22`, **additive
+> sum unchanged**) and whose sector 2 flipped one byte (sum changed). After the
+> incremental download, sector 1 **still read back as A** (the `0x22` change silently
+> dropped) while sector 2 **was written** — a genuine content change skipped purely
+> because it preserved the byte-sum, a sum-changing one caught. Three independent
+> confirmations now: host `Utility::getCheckSum` disasm, internal+external `.stldr`
+> disasm (0 CRC ops), and this live differential flash.
 
 ### 3d. ARM / Nordic  (TODO — suspected, not yet surveyed)
 Both almost certainly use the same CMSIS-style loader shape:
