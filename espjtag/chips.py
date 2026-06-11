@@ -38,6 +38,12 @@ _SINGLE_TAP = dict(taps_after=0, taps_before=0, idcode_index=0)
 # esp32c5-builtin.cfg (_HP_TAPNUM=1,_LP_TAPNUM=1) + a live -d3 chain interrogation,
 # and re-confirmed on the bench: read_idcode returns the index-1 IDCODE 0x17c25.
 _C5_TWO_TAP = dict(taps_after=1, taps_before=0, idcode_index=1)
+# ESP32-S3: dual-core Xtensa = TWO TAPs (esp32s3.tap0 + tap1), both IDCODE
+# 0x120034e5, IrLen 5 — VERIFIED via OpenOCD scan_chain. Each core is its own TAP;
+# we target one with the other in BYPASS (one BYPASS bit toward TDO), so the scan
+# layout matches the C5's two-TAP shape. (A single-TAP layout here misaligns every
+# IR/DR scan by one bit — read_idcode only looked OK because both IDCODEs match.)
+_S3_TWO_TAP = dict(taps_after=1, taps_before=0, idcode_index=1)
 
 
 CHIPS = {
@@ -162,7 +168,7 @@ CHIPS = {
     # VERIFIED on the bench: 3 distinct S3 units (xiao-s3-sense 1C:DB:D4:76:82:08,
     # xiao-s3-plus E0:72:A1:F8:EB:94, ble_bridge_s3 3C:0F:02:C7:2B:34) all read
     # IDCODE 0x120034e5 via espjtag read_idcode + OpenOCD scan + probe-rs info.
-    0x120034E5: dict(name="S3", core="xtensa", chain=_SINGLE_TAP),
+    0x120034E5: dict(name="S3", core="xtensa", chain=_S3_TWO_TAP),
     # NOTE: the ESP32-S2 (also Xtensa LX7) may share this IDCODE — UNVERIFIED (no S2
     # on the bench). If an S2 is ever read here, name_for() would mislabel it "S3";
     # disambiguate by another means (USB descriptor / efuse) before relying on it.
