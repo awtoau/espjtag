@@ -336,6 +336,19 @@ class EspUsbJtag(EspUsbJtagTransport):
             raise RuntimeError("flash_read_xip: no flash_xip window tabled")
         return self.read_mem(xip + off, nwords)
 
+    def flash_init(self, chip_size=0x1000000):
+        """Repopulate the legacy ROM spiflash geometry (g_rom_spiflash_chip) so the
+        esp_rom_spiflash_* helpers work on a board whose running app left it unset.
+        The flash is already pin/mode-attached (XIP is live), so we only restore the
+        geometry — esp_rom_spiflash_config_param(devid=0, chip_size, 64 KiB block,
+        4 KiB sector, 256 B page, 0xFFFF status mask). Hart must be halted. Returns
+        the ROM result (0 = OK). This is the un-gate for flash_write (#30)."""
+        if "spiflash_config_param" not in self._chip().get("rom", {}):
+            raise RuntimeError("flash_init: spiflash_config_param not tabled for this chip")
+        r, _ = self.call_rom("spiflash_config_param",
+                             args=(0, chip_size, 0x10000, 0x1000, 0x100, 0xFFFF))
+        return r
+
     def _rom_flash_ready(self, probe_off=0x0, nwords=4):
         """SAFETY GATE for any ROM erase/program. Call esp_rom_spiflash_read for a
         small region into scratch SRAM and require it to match the XIP window read
@@ -383,6 +396,10 @@ class EspUsbJtag(EspUsbJtagTransport):
         if len(data) % 4 or addr % 4:
             raise ValueError("flash_write: addr and len(data) must be 4-byte aligned")
         ready, rw, xw = self._rom_flash_ready()
+        if not ready and "spiflash_config_param" in self._chip().get("rom", {}):
+            _log("  flash_write: gate failed cold — running flash_init (config_param)")
+            self.flash_init()                       # repopulate ROM geometry, retry
+            ready, rw, xw = self._rom_flash_ready()
         if not ready:
             raise RuntimeError(
                 "flash_write: ROM spiflash read-back self-test FAILED — the legacy "

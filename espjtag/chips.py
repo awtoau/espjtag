@@ -84,6 +84,10 @@ CHIPS = {
             spiflash_read=0x40000150,
             spiflash_wait_idle=0x40000110,
             spiflash_read_status=0x40000180,
+            # esp_rom_spiflash_config_param(devid, chip_size, blk, sect, page, mask)
+            # repopulates the legacy g_rom_spiflash_chip geometry the running app
+            # left unset, so the helpers above work (flash_init / un-gate, #30).
+            spiflash_config_param=0x40000160,
             cache_disable_icache=0x40000690,
             cache_enable_icache=0x40000694,
         ),
