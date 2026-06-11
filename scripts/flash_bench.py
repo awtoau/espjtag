@@ -205,7 +205,7 @@ def fleet_riscv():
     for line in out.splitlines():
         if "●" not in line:                               # ● connected only
             continue
-        m = re.search(r"(\S+)\s+esp32(c[56])\s+(\d[\d.]+)", line)
+        m = re.search(r"(\S+)\s+esp32(c[56])\s+(\d[\d.-]+)", line)  # path = bus-port.port...
         if not m:
             continue
         tty = re.search(r"/dev/ttyACM\d+", line)
