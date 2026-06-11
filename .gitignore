@@ -6,3 +6,5 @@ dist/
 .venv/
 tmp/
 .claude/
+
+.claude/settings.local.json
