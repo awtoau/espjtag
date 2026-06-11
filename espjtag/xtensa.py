@@ -29,6 +29,16 @@ INS_RSR_DDR_A3 = 0x036830     # RSR  a3, DDR   (DDR special reg -> a3)
 INS_WSR_DDR_A3 = 0x136830     # WSR  a3, DDR   (a3 -> DDR)
 INS_LDDR32P_A3 = 0x0073E0     # LDDR32.P a3    (mem[a3] -> DDR, a3 += 4)
 INS_SDDR32P_A3 = 0x0073F0     # SDDR32.P a3    (DDR -> mem[a3], a3 += 4)
+# call_function — ported from OpenOCD xtensa_start_algorithm (xtensa.c:2810). The S3
+# (LX7) debug level is 6: the debug-mode PC/PS live in EPC6 (sr 0xb6) / EPS6 (sr
+# 0xc6). RFDO returns-from-debug (resumes execution at EPC6). a-regs set/read via DDR.
+DEBUGLEVEL = 6
+INS_WSR_EPC6_A3 = 0x13B630     # WSR a3, EPC6   (a3 -> debug PC)
+INS_RSR_EPC6_A3 = 0x03B630     # RSR a3, EPC6
+INS_WSR_EPS6_A3 = 0x13C630     # WSR a3, EPS6   (a3 -> debug PS)
+INS_RSR_EPS6_A3 = 0x03C630     # RSR a3, EPS6
+INS_RFDO = 0xF1E000            # return-from-debug-operation (resume at EPC6)
+INS_BREAK = 0x004000           # BREAK 0,0 — the return trap (callee RETs into this)
 IDLE = 16                     # run-test-idle settle clocks (the XDM tdi_idle)
 # READ_LATENCY = espjtag's NAR read-result pipeline depth over this transport: the
 # captured data for a NAR read lags its address scan by this many *accesses*. We
@@ -98,6 +108,62 @@ class XtensaXDM:
 
     def resume(self):
         self.nar_write(DCRCLR, OCDDCR_DEBUGINTERRUPT)
+
+    # --- call a function on the halted core (ported from xtensa_start_algorithm) --
+    def _set_ar(self, n, val):
+        """a<n> = val (RSR a<n>, DDR; doesn't touch a3 unless n==3)."""
+        self.nar_write(DDR, val & 0xFFFFFFFF)
+        self.nar_write(DIR0EXEC, 0x036800 | (n << 4))
+
+    def _get_ar(self, n):
+        """read a<n> (WSR a<n>, DDR; then read DDR)."""
+        self.nar_write(DIR0EXEC, 0x136800 | (n << 4))
+        return self.nar_read(DDR)
+
+    def _set_sr_a3(self, wsr_ins, val):
+        """special-reg <- val, using a3 as scratch (a3=val via DDR, then WSR a3,sr)."""
+        self.nar_write(DDR, val & 0xFFFFFFFF)
+        self.nar_write(DIR0EXEC, INS_RSR_DDR_A3)     # a3 = val
+        self.nar_write(DIR0EXEC, wsr_ins)            # sr = a3
+
+    def _get_sr_a3(self, rsr_ins):
+        """read special-reg, using a3 as scratch (RSR a3,sr; WSR a3,DDR; read DDR)."""
+        self.nar_write(DIR0EXEC, rsr_ins)            # a3 = sr
+        self.nar_write(DIR0EXEC, INS_WSR_DDR_A3)     # DDR = a3
+        return self.nar_read(DDR)
+
+    def call_function(self, entry, args=(), stack=None, trap=None, timeout=2000):
+        """Call on-target code at `entry` with up to 6 int args (a2..a7); returns
+        (a2, halted). Verbatim port of OpenOCD xtensa_start_algorithm/wait_algorithm
+        (xtensa.c:2810): save the clobbered a0..a7 + EPC6/EPS6; set run PS = (debug
+        PS & ~0xf) | (DEBUGLEVEL-1); set EPC6=entry; load a0=BREAK-trap, a1=sp,
+        a2..=args; RFDO to resume; poll DSR STOPPED; read a2; restore. Core MUST be
+        halted. Calls a call0 entry — a WINDOWED ROM entry needs a call0 bridge."""
+        saved_ar = {n: self._get_ar(n) for n in range(8)}
+        saved_epc = self._get_sr_a3(INS_RSR_EPC6_A3)
+        saved_eps = self._get_sr_a3(INS_RSR_EPS6_A3)
+        self.write_mem(trap, [INS_BREAK])                       # return trap
+        # special regs first (they use a3 as scratch), then the arg regs LAST so a3
+        # (which may hold an arg) isn't clobbered before the resume.
+        self._set_sr_a3(INS_WSR_EPS6_A3, (saved_eps & ~0xF) | (DEBUGLEVEL - 1))
+        self._set_sr_a3(INS_WSR_EPC6_A3, entry)                 # PC = entry
+        self._set_ar(0, trap)                                   # a0 = return trap
+        if stack is not None:
+            self._set_ar(1, stack)                              # a1 = sp
+        for i, a in enumerate(args):
+            self._set_ar(2 + i, a)                              # a2.. = args
+        self.nar_write(DIR0EXEC, INS_RFDO)                      # resume at EPC6
+        halted = False
+        for _ in range(timeout):
+            if self.nar_read(DSR) & OCDDSR_STOPPED:
+                halted = True
+                break
+        ret = self._get_ar(2) if halted else None               # a2 = return value
+        self._set_sr_a3(INS_WSR_EPC6_A3, saved_epc)             # restore
+        self._set_sr_a3(INS_WSR_EPS6_A3, saved_eps)
+        for n, v in saved_ar.items():
+            self._set_ar(n, v)
+        return ret, halted
 
     # --- a3 save/restore around instruction injection (core must be HALTED) -------
     # read_mem/write_mem stage the target address in a3 and stream LDDR32.P/SDDR32.P
