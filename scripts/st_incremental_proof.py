@@ -3,22 +3,21 @@
 `incremental` download decides "sector unchanged?" with a WEAK 32-bit additive
 byte-sum, by a sum-preserving differential flash on an STM32F427.
 
-Method (black-box — cites nothing decompiled), NO backup (test boards):
-  1. Flash base image A (first 64 KB = four 16 KB sectors).
-  2. `incremental`-flash B, which differs from A in two sectors:
-       - sector 1: an adjacent-byte SWAP  -> content changes, additive sum does NOT.
-       - sector 2: a single-byte FLIP     -> sum changes (the control).
-  3. Read back and analyze.
+INDEPENDENT VERIFICATION: all setup (write A) and every read-back use the OPEN
+texane `st-flash` (BSD) — NOT ST's software. The ONLY ST-software action is the
+`incremental` / normal `-d` itself (CubeProgrammer), so the result is never
+self-certified by the tool under test. NO backup (test boards).
 
-Verdict:
-  sector-1 reads back as A (swap dropped) AND sector-2 as B (control written)
-     -> the diff-checksum is ADDITIVE: a sum-preserving change was silently skipped.
-  sector-1 reads back as B -> it caught the swap -> real CRC/compare (finding wrong).
-  sector-2 reads back as A -> `incremental` never engaged -> inconclusive (see log).
+  1. (st-flash) write base image A (first 64 KB = four 16 KB sectors).
+  2. (CubeProgrammer) `incremental`-flash B: sector 1 = adjacent-byte SWAP
+     (content differs, additive sum identical); sector 2 = single-byte FLIP (control).
+  3. (st-flash) read back & analyze.
+  4. (st-flash write A; CubeProgrammer NORMAL -d B; st-flash read) — control: normal
+     mode must WRITE sector 1, proving the skip is incremental-specific.
 
-A sector-1 == A result cannot be explained by a full/legacy write (writes everything
--> sector-1 == B) nor by a CRC (detects the change -> sector-1 == B). Only an
-additive-sum collision yields a skip. The control proves incremental actually ran.
+Verdict: sector 1 reads back as A (swap dropped) AND sector 2 as B (control written)
+-> additive sum. A full/legacy write would write sector 1 (==B); a CRC would catch it
+(==B). Only an additive collision yields the skip.
 
 Usage: python3 scripts/st_incremental_proof.py --sn 004D00373033510135393935
 """
@@ -39,6 +38,7 @@ TMP = os.path.join(ROOT, "tmp")
 
 
 def cube(sn, *args, log=None):
+    """STM32CubeProgrammer — used ONLY for the incremental/normal `-d` (tool under test)."""
     cmd = [CLI, "-c", "port=SWD", f"sn={sn}", "freq=8000", "mode=UR"] + list(args)
     r = subprocess.run(cmd, capture_output=True, text=True)
     out = r.stdout + r.stderr
@@ -46,6 +46,21 @@ def cube(sn, *args, log=None):
         with open(log, "w") as f:
             f.write("$ " + " ".join(cmd) + "\n\n" + out)
     return r.returncode, out
+
+
+def st(sn, *args):
+    """texane st-flash (open/BSD) — independent setup + verification reader/writer."""
+    r = subprocess.run(["st-flash", "--serial", sn] + list(args),
+                       capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr
+
+
+def st_write(sn, path):
+    return st(sn, "--reset", "write", path, hex(BASE))
+
+
+def st_read(sn, path, size=SIZE):
+    return st(sn, "read", path, hex(BASE), hex(size))
 
 
 def ssum(buf, sec):
@@ -81,28 +96,26 @@ def main():
           f"-> {'EQUAL (sum-preserving)' if ssum(A,1)==ssum(B,1) else 'DIFFER'}")
     print(f"sector-2 sum  A=0x{ssum(A,2):08x}  B=0x{ssum(B,2):08x}  "
           f"-> {'DIFFER (control)' if ssum(A,2)!=ssum(B,2) else 'EQUAL'}")
-    assert ssum(A, 1) == ssum(B, 1), "sector-1 must be sum-preserving"
-    assert ssum(A, 2) != ssum(B, 2), "sector-2 sum must differ"
-    assert A[SEC:2 * SEC] != B[SEC:2 * SEC], "sector-1 content must differ"
+    assert ssum(A, 1) == ssum(B, 1) and ssum(A, 2) != ssum(B, 2)
+    assert A[SEC:2 * SEC] != B[SEC:2 * SEC]
 
-    print(f"\n[1] flashing base image A (full/legacy) to {sn} ...")
-    rc, out = cube(sn, "-d", lp("stp_A.bin"), hex(BASE), log=lp("stp_flashA.log"))
+    print(f"\n[1] (st-flash, independent) writing base image A to {sn} ...")
+    rc, out = st_write(sn, lp("stp_A.bin"))
     if rc != 0:
-        print(f"  flash A FAILED rc={rc}"); sys.stdout.write(out[-500:]); return 1
-    cube(sn, "-u", hex(BASE), hex(SIZE), lp("stp_rd.bin"))
+        print(f"  st-flash write A FAILED rc={rc}"); sys.stdout.write(out[-500:]); return 1
+    st_read(sn, lp("stp_rd.bin"))
     if open(lp("stp_rd.bin"), "rb").read() != A:
-        print("  A did NOT verify on-chip — aborting (premise broken).")
-        return 1
-    print("  A verified on-chip.")
+        print("  A did NOT verify (st-flash read) — aborting (premise broken)."); return 1
+    print("  A written + verified by st-flash (no ST software involved).")
 
-    print("[2] INCREMENTAL-flashing B ...")
+    print("[2] (CubeProgrammer) INCREMENTAL-flashing B ...")
     rc, out = cube(sn, "-d", lp("stp_B.bin"), hex(BASE), "incremental", log=lp("stp_incr.log"))
     low = out.lower()
-    engaged = any(k in low for k in ("modified sector", "checksum verify"))
-    fellback = "legacy" in low and ("not" in low or "instead" in low)
-    print(f"  rc={rc}  incremental-engaged~{engaged}  legacy-fallback~{fellback}")
+    print(f"  rc={rc}  incremental-engaged~{('modified sector' in low) or ('checksum verify' in low)}"
+          f"  legacy-fallback~{'legacy' in low and ('not' in low or 'instead' in low)}")
 
-    cube(sn, "-u", hex(BASE), hex(SIZE), lp("stp_rd.bin"))
+    print("    (st-flash, independent) reading back ...")
+    st_read(sn, lp("stp_rd.bin"))
     R = open(lp("stp_rd.bin"), "rb").read()
 
     s1A, s1B, s1R = A[SEC:2*SEC], B[SEC:2*SEC], R[SEC:2*SEC]
@@ -110,27 +123,36 @@ def main():
     sec1_skipped = s1R == s1A and s1R != s1B
     sec1_written = s1R == s1B
     sec2_written = s2R == s2B
-    print("\n--- RESULT ---------------------------------------------------")
-    print(f"  sector-1 (sum-preserving swap): "
-          f"byte@0x{SUMPRES_OFF:x} = 0x{R[SUMPRES_OFF]:02x} "
+    print("\n--- RESULT (read back by st-flash, not CubeProgrammer) -------")
+    print(f"  sector-1 (sum-preserving swap): byte@0x{SUMPRES_OFF:x} = 0x{R[SUMPRES_OFF]:02x} "
           f"(A=0x{A[SUMPRES_OFF]:02x} B=0x{B[SUMPRES_OFF]:02x})  "
           f"-> {'SKIPPED (==A)' if sec1_skipped else 'written (==B)' if sec1_written else 'OTHER'}")
-    print(f"  sector-2 (control flip):        "
-          f"byte@0x{CTRL_OFF:x} = 0x{R[CTRL_OFF]:02x} "
+    print(f"  sector-2 (control flip):        byte@0x{CTRL_OFF:x} = 0x{R[CTRL_OFF]:02x} "
           f"(A=0x{A[CTRL_OFF]:02x} B=0x{B[CTRL_OFF]:02x})  "
           f"-> {'WRITTEN (==B)' if sec2_written else 'not written (==A)'}")
     if sec2_written and sec1_skipped:
-        print("  VERDICT: ADDITIVE SUM CONFIRMED — a sum-preserving change was")
-        print("           silently SKIPPED while a real change was written.")
+        print("  VERDICT: ADDITIVE SUM CONFIRMED — sum-preserving change silently SKIPPED.")
         verdict = 0
     elif sec2_written and sec1_written:
         print("  VERDICT: NOT additive — it caught the sum-preserving change (real CRC).")
         verdict = 1
     else:
-        print("  VERDICT: INCONCLUSIVE — control not written / incremental didn't engage.")
-        print("           (check tmp/stp_incr.log)")
-        verdict = 2
+        print("  VERDICT: INCONCLUSIVE — control not written (check tmp/stp_incr.log)."); verdict = 2
     print("--------------------------------------------------------------")
+
+    # CONTROL: same B, NORMAL (legacy) mode — must WRITE sector 1.
+    print("\n[3] CONTROL — (st-flash) re-write A, (CubeProgrammer) NORMAL flash B ...")
+    st_write(sn, lp("stp_A.bin"))
+    cube(sn, "-d", lp("stp_B.bin"), hex(BASE), log=lp("stp_ctrlB.log"))
+    st_read(sn, lp("stp_rd2.bin"))
+    R2 = open(lp("stp_rd2.bin"), "rb").read()
+    norm_s1 = R2[SEC:2 * SEC] == B[SEC:2 * SEC]
+    print(f"  normal-mode sector-1 byte@0x{SUMPRES_OFF:x} = 0x{R2[SUMPRES_OFF]:02x} "
+          f"(A=0x{A[SUMPRES_OFF]:02x} B=0x{B[SUMPRES_OFF]:02x})  "
+          f"-> {'WRITTEN (==B)' if norm_s1 else 'NOT written'}")
+    if sec1_skipped and norm_s1:
+        print("  => SAME B: incremental SKIPPED the sum-preserving sector, normal WROTE it.")
+        print("     Skip is incremental-specific; verified entirely by st-flash. AIRTIGHT.")
     return verdict
 
 

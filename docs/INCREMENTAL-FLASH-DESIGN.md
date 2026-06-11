@@ -52,9 +52,12 @@ matters for huge flash (descend only into differing subtrees, `log n` digests).
 
 ## 3. Prior art (the hard-to-find survey)
 
-All three real-world tools converge on the **same loader interface** — a small
-routine in target RAM, exporting fixed functions, called over the debug link with
-register args. Only the licence and the transport differ.
+Every real-world tool surveyed (esptool, probe-rs, ST, ARM/pyOCD, SEGGER/Nordic)
+converges on the **same loader interface** — a small routine in target RAM, exporting
+fixed functions, called over the debug link with register args. Only the licence, the
+transport, and the **digest** differ — and on the digest the field splits cleanly:
+**ST alone uses a weak additive byte-sum (§3c); everyone else who digests at all uses a
+real CRC-32 computed on-target (§3d).**
 
 ### 3a. esptool (Espressif)
 - **Tool licence: GPL-2.0+** (don't copy esptool code). **Stub licence: split** —
@@ -133,15 +136,109 @@ loaders in `~/git/gihdra/tmp/flashloader_bins`, disasm via `scripts/disasm_stldr
 > confirmations now: host `Utility::getCheckSum` disasm, internal+external `.stldr`
 > disasm (0 CRC ops), and this live differential flash.
 
-### 3d. ARM / Nordic  (TODO — suspected, not yet surveyed)
-Both almost certainly use the same CMSIS-style loader shape:
-- **ARM**: CMSIS-Pack **Flash Algorithms** (`FlashOS.h`: `Init/UnInit/EraseSector/
-  ProgramPage/Verify/BlankCheck`) — the literal origin of the `pc_*` names above;
-  Keil/pyOCD drive them. Almost identical interface. Likely **reusable licence**
-  (CMSIS is Apache-2.0).
-- **Nordic**: `nrfjprog`/`nrfutil` + the J-Link flash loaders; nRF has a UICR/NVMC
-  flash controller. Worth checking whether they do CRC-skip / partial program.
-- **Action:** survey both, fold into §3, confirm licences.
+### 3d. ARM / Keil / pyOCD  &  Nordic / SEGGER  (surveyed — vs ST's weak sum)
+
+> **Headline:** unlike ST's additive byte-sum (§3c), **everyone else who does a
+> digest does it RIGHT — a real CRC-32 (reversed poly `0xEDB88320`)**: pyOCD
+> (on-target CRC32 blob), SEGGER/J-Flash (on-target SFL CRC), Nordic `VERIFY_HASH`.
+> The CMSIS **algorithm layer itself** carries no content-diff — `Verify` there is a
+> byte-compare and the *host* decides what to skip. So the recipe is: borrow the
+> per-sector-skip **architecture** from ST, but take the **digest** from pyOCD/SEGGER
+> (real CRC32), never from ST.
+
+#### (A) ARM CMSIS-Pack / Keil µVision / pyOCD
+
+1. **Incremental at all?** **The FLM algorithm: no. pyOCD (the host driver): yes.**
+   The CMSIS-Pack *flash algorithm* (`.FLM`) is a dumb command executor — Init / Erase
+   / Program / Verify — it has *no* skip-unchanged logic; "the host controller decides
+   optimization (skip unchanged sectors)" (`FlashAlgo/source/template/FlashPrg.c`).
+   Keil µVision adds only a coarse early-out: "The download is processed only when the
+   binary was updated since the last Flash programming step" (whole-image timestamp,
+   not per-sector content) — Keil µVision User's Guide, *Flash Download Configuration*.
+   **pyOCD**, which drives the same `.FLM` blobs, *does* do real per-page skip (below).
+2. **Granularity** — **pyOCD: per-page/per-sector.** `smart_flash` (default **True**):
+   "attempt to **not program pages whose contents are not going to change** by scanning
+   target flash memory" (`pyOCD/docs/options.md`). `chip_erase` = `auto|sector|chip`
+   (default `sector`). Keil's own early-out is whole-image only.
+3. **Compare mechanism** — **pyOCD = REAL CRC-32, on-target** (the key result, the
+   anti-ST). Two modes in `pyocd/flash/builder.py`:
+   `_analyze_pages_with_crc32()` (fast) vs `_analyze_pages_with_partial_read()`
+   (fallback, host read-back memcmp). The fast path runs an **embedded CRC32 routine on
+   the chip**: `pyocd/flash/flash.py` ships `_ANALYZER_CODE` — a Thumb blob, comment
+   *"200 bytes of executable data below + 1024 byte crc table = 1224 bytes"*, ending in
+   the word **`0xedb88320`** (the reversed CRC-32 polynomial). `compute_crcs()` does
+   `write_memory_block32(analyzer_address, _ANALYZER_CODE)`, writes `(addr,size)` pairs,
+   `_call_function_and_wait(analyzer_address, …)`, then reads back one CRC per page. Host
+   side computes the expected with `binascii.crc32` → `page.crc = crc32(bytearray(data))
+   & 0xFFFFFFFF`, compares `page.crc == crc`. The user-facing switch is option
+   **`fast_program`** (default False): "use **CRC checks of existing flash sector
+   contents** to determine whether pages need to be programmed". CMSIS `Verify` (the FLM
+   function) is, by contrast, just a **byte compare** — *"Given an adr and sz compare
+   this against the content of buf"* (`FlashPrg.c`), `BlankCheck` checks erased/pattern;
+   neither is a CRC and both are optional.
+4. **Where it runs** — pyOCD's CRC32: **on-target** (blob in target RAM, run via the
+   debug link — exactly espjtag's `call_function` shape). Its fallback compare: host
+   read-back. CMSIS `Verify`/`BlankCheck`: on-target (but byte-level, host-orchestrated).
+5. **Licence** — **CMSIS `FlashOS.h` / FlashPrg template: Apache-2.0** (`SPDX-License-
+   Identifier: Apache-2.0`, "Copyright (c) 2010–2018 Arm Limited"). **pyOCD: Apache-2.0**
+   (incl. `_ANALYZER_CODE`). → **fully reusable**; the FlashOS interface is the literal
+   origin of probe-rs's `pc_*` names; pyOCD's on-target CRC32 analyzer is a drop-in
+   pattern for our leaf digest (just widen the digest per §9).
+
+> **Verdict (A): does-it-RIGHT.** pyOCD = real on-target **CRC-32** per page, Apache-2.0
+> — the clean reference, the opposite of ST. (CMSIS-FLM by itself does no diff; Keil's
+> own skip is a whole-image timestamp.)
+
+#### (B) Nordic nrfjprog/nrfutil  &  SEGGER J-Link / J-Flash
+
+1. **Incremental at all?** **SEGGER J-Flash: yes** — "The data to be programmed is
+   compared with the actual data in flash, and **sectors that already match the data are
+   skipped** and will not be modified" (SEGGER KB, *J-Link flash programming*). J-Link
+   Commander: "the comparison in the beginning is a Checksum (CRC) comparison. In case
+   everything is identical, there is no erase, program, verify stage" (whole-image
+   early-out). **Nordic nrfjprog: not a content-diff** — its erase is *region-scoped*
+   only: `--sectorerase` "will only erase the flash ranges **targeted by the hex file**"
+   (Nordic docs) — i.e. erase the sectors the image *occupies*, not the sectors that
+   *changed*. No skip-unchanged mode exists (the `EraseAction` enum is
+   `ERASE_NONE|ERASE_ALL|ERASE_SECTOR|ERASE_SECTOR_AND_UICR|ERASE_CTRL_AP` — all
+   region-scoped, `pynrfjprog/Parameters.py`).
+2. **Granularity** — SEGGER: **per-sector** skip (above) + a whole-image CRC early-out
+   in Commander. Nordic: per-region erase, no per-sector content skip.
+3. **Compare mechanism** — **SEGGER = REAL CRC, on-target** (the anti-ST again): "A CRC
+   over the data in flash is **calculated by the flash algo** and sent back to the PC
+   software to compare it against the CRC of the data to be programmed … much faster
+   than read-back" — via the SEGGER Flash Loader entry **`SEGGER_FL_CalcCRC()`**
+   (vs `SEGGER_FL_Read()` for the read-back path); `BlankCheck` separately lets J-Link
+   skip `SEGGER_FL_Erase()` on already-erased sectors (SEGGER KB, *J-Link flash
+   programming* / *SEGGER Flash Loader*). Polynomial: **CRC-32, reversed `0xEDB88320`**
+   ("CRC32-CCITT polynomial … reversed form 0xEDB88320", SEGGER forum). **Nordic** rides
+   the same J-Link DLL; its *verify* exposes the choice directly —
+   `VerifyAction = {VERIFY_NONE=0, VERIFY_READ=1, VERIFY_HASH=2}` (`Parameters.py`), and
+   `nrfjprog --fast` "increases the speed of `--verify` by **calculating the hash of the
+   on-chip flash instead of reading it**" (Nordic docs). So Nordic's *verify* is a real
+   on-target hash/CRC — but it's a verify, not a skip-unchanged diff.
+4. **Where it runs** — **on-target** for both: SEGGER's CRC is computed by the flash
+   loader on the MCU and only the 32-bit CRC crosses the wire; Nordic's `VERIFY_HASH`
+   likewise hashes on-chip. **Not in the probe** (J-Link recomputes via the loaded SFL).
+5. **Licence** — **SEGGER J-Link DLL / SFL: proprietary** (free for eval/non-commercial,
+   restricted redistribution); Nordic nrfjprog/`pynrfjprog` wraps the closed J-Link DLL.
+   `pynrfjprog` Python wrapper is permissive but the engine is the binary J-Link DLL. →
+   **model the interface (it matches CMSIS/probe-rs), never ship the binary** — same rule
+   as ST's `.stldr`.
+
+> **Verdict (B): does-it-RIGHT, but proprietary.** SEGGER = real on-target **CRC-32**
+> per-sector skip; Nordic = real on-target hash *verify* (no content-diff skip, just
+> region-scoped erase). Mechanism is the model to copy; the code is closed → reuse
+> nothing, mirror probe-rs/pyOCD's Apache implementations instead.
+
+**What we reuse:** code from **pyOCD** (Apache-2.0) — its on-target **CRC32 analyzer**
+(`_ANALYZER_CODE` + `compute_crcs`) is the closest existing thing to our leaf-digest
+routine, and confirms the recipe: *real CRC-32, computed on the chip, digests-only on the
+wire* — then widen the digest (§9). The **CMSIS `FlashOS.h`** interface (Apache-2.0)
+formalises the loader shape probe-rs already gives us. From **SEGGER/Nordic**: interface
+confirmation only (closed binaries — model, don't ship). Net: **four independent tools now
+agree the digest should be a real CRC computed on-target; ST's additive sum is the lone
+outlier and the one anti-pattern.**
 
 ---
 
@@ -169,7 +266,10 @@ v2 stub is Apache if we ever want it).
 | espjtag | Apache-2.0 | — |
 | probe-rs flash algo | MIT/Apache | **REUSE the code** |
 | esp-flasher-stub v2 / espflash stubs | Apache/MIT | reuse / reference |
-| ARM CMSIS FlashOS | Apache-2.0 (confirm) | reuse iface |
+| ARM CMSIS FlashOS | Apache-2.0 (confirmed, §3d) | reuse iface |
+| pyOCD (CRC32 analyzer) | Apache-2.0 (§3d) | **REUSE the code** |
+| SEGGER J-Link DLL / SFL | proprietary | model iface, never ship |
+| Nordic nrfjprog / pynrfjprog | wraps closed J-Link DLL | model iface, never ship |
 | esptool **tool** | GPL-2.0+ | **read for protocol only, never copy code** |
 | esptool stub **v1** | GPL-2.0 | **don't use** (use v2) |
 | ST `.stldr` loaders | SLA0048 restricted | **model interface, never ship binary** |
@@ -248,7 +348,11 @@ table without a lock** (the ST UAF lesson).
 ## 10. Open questions / TODO
 - Resolve ST's actual `incremental` diff mechanism from `programBufferFlashLoader`
   disasm (§3c box) — read-back vs CRC vs probe-side CRC.
-- Survey ARM CMSIS FlashOS + Nordic nrfjprog (§3d); confirm licences.
+- ~~Survey ARM CMSIS FlashOS + Nordic nrfjprog (§3d); confirm licences.~~ **Done (§3d):
+  pyOCD = real on-target CRC-32 (Apache, reusable); SEGGER = real on-target CRC-32
+  (proprietary); Nordic = region-scoped erase + on-target hash *verify* (closed DLL);
+  CMSIS-FLM itself carries no diff (byte-compare `Verify`, host decides skip). ST's
+  additive sum is the lone weak outlier.**
 - Pick the digest (CRC32+len+salt vs truncated SHA-256) — collision vs on-chip cost.
 - Extract probe-rs's ESP flash-algo blobs + entry offsets; confirm they're call0.
 
