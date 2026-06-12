@@ -8,6 +8,7 @@ CC-BY-4.0); the reset_run() DMI sequence was captured from OpenOCD's `reset run`
 -d3 log. Pinned upstream: ../upstream.lock. Provenance: ../ACKNOWLEDGEMENTS.md.
 """
 
+import os
 import time
 import zlib
 
@@ -774,6 +775,128 @@ class EspUsbJtag(EspUsbJtagTransport):
                 self.call_rom("cache_enable_icache")
         return out
 
+    # === #27: resident RAM flasher stub — a mailbox loop fed over SBA =========
+    # Each ROM call costs ~5 ms of halt/resume/register traffic; the stub runs
+    # continuously and takes commands via memory writes (µs). Scratch layout:
+    #   data+0x0000  buf A (4 KiB)      staging, double-buffered
+    #   data+0x1000  buf B (4 KiB)
+    #   data+0x2000  mailbox (16 words) cmd/status/args + per-chip ROM fn table
+    #   data+0x2040  crc_out (64 words) CRC_RANGE results, 64 sectors per cmd
+    #   data+0x2200  stub code (~230 B position-independent blob, ships built)
+    #   sram[stack]  stub SP            sram[trap] ebreak word (QUIT returns here)
+    _STUB_SYMS = ("spiflash_read", "crc32_le", "spiflash_unlock",
+                  "spiflash_erase_sector", "spiflash_write")
+    _STUB_CRC_MAX = 64                 # crc_out capacity per CRC_RANGE command
+    _stub_blob_cache = None
+
+    @classmethod
+    def _stub_blob(cls):
+        if cls._stub_blob_cache is None:
+            p = os.path.join(os.path.dirname(__file__), "blobs", "stub_rv32.bin")
+            cls._stub_blob_cache = open(p, "rb").read() if os.path.exists(p) else b""
+        return cls._stub_blob_cache
+
+    def _stub_layout(self):
+        sram = self._chip()["sram"]
+        d = sram["data"]
+        return dict(bufA=d, bufB=d + 0x1000, mail=d + 0x2000, crc=d + 0x2040,
+                    code=d + 0x2200, sp=sram["stack"], trap=sram["trap"])
+
+    def stub_begin(self):
+        """Upload the stub + ROM fn table and start it. Returns (ctx, layout).
+        While the stub runs only SBA ops are legal (it IS the running hart)."""
+        lay = self._stub_layout()
+        rom = self._chip()["rom"]
+        blob = self._stub_blob()
+        bw = blob + b"\x00" * (-len(blob) % 4)
+        self.write_mem(lay["code"], [int.from_bytes(bw[i:i + 4], "little")
+                                     for i in range(0, len(bw), 4)])
+        mail = [0] * 16
+        for i, sym in enumerate(self._STUB_SYMS):
+            mail[7 + i] = rom[sym]
+        self.write_mem(lay["mail"], mail)
+        ctx = self.call_function(lay["code"], args=(lay["mail"],),
+                                 stack=lay["sp"], trap=lay["trap"], wait=False)
+        return ctx, lay
+
+    def _stub_post(self, lay, cmd, m2=0, m3=0, m4=0, m5=0, m6=0):
+        """Queue one command: args first (mail+4..), the cmd word LAST (the stub
+        triggers on m[0], so ordering is the correctness here)."""
+        self.write_mem(lay["mail"] + 4, [0, m2, m3, m4, m5, m6])  # status=0, args
+        self.write_mem32(lay["mail"], cmd)
+
+    def _stub_wait(self, lay, polls=20000):
+        """Poll the status word until the stub reports done/error. 20k polls
+        ≈ 5 s — far beyond the slowest single command (a ~60 ms sector erase);
+        expiry means the stub wedged and raising beats spinning forever."""
+        for _ in range(polls):
+            st = self.read_mem32(lay["mail"] + 4)
+            if st:
+                if st != 1:
+                    err = self.read_mem32(lay["mail"] + 8)
+                    raise RuntimeError(f"flash stub error: status={st} err={err}")
+                return
+        raise RuntimeError("flash stub: command never completed")
+
+    def stub_end(self, ctx, lay):
+        """QUIT the stub (it returns into the ebreak trap) and restore the app."""
+        self._stub_post(lay, 3)
+        ret, halted = self._call_finish(ctx)
+        if not halted:
+            raise RuntimeError("flash stub: QUIT did not trap back to debug mode")
+
+    def _flash_incremental_stub(self, addr, data, _log, verify):
+        """flash_incremental's fast path: one resident stub, commands over SBA.
+        The CRC diff is ONE command per 64 sectors (vs 2 ROM calls per sector),
+        and programming pipelines: sector k+1 stages into the spare buffer over
+        SBA while the stub erases+writes sector k."""
+        host = self._crc_host()
+        lay = self._stub_layout()
+        nsec = len(data) // 0x1000
+        ctx, lay = self.stub_begin()
+        try:
+            def crc_range(base, cnt):
+                self._stub_post(lay, 1, m2=self._CRC_INIT, m3=addr + base * 0x1000,
+                                m4=cnt, m5=lay["bufA"], m6=lay["crc"])
+                self._stub_wait(lay)
+                return self.read_mem(lay["crc"], cnt)
+
+            crcs = []
+            for base in range(0, nsec, self._STUB_CRC_MAX):
+                crcs += crc_range(base, min(self._STUB_CRC_MAX, nsec - base))
+            changed = [s for s in range(nsec)
+                       if crcs[s] != host(data[s * 0x1000:(s + 1) * 0x1000])]
+            _log(f"  flash_incremental[stub]: {nsec} sectors, {len(changed)} differ")
+            busy = False
+            for i, s in enumerate(changed):
+                buf = lay["bufA"] if i % 2 == 0 else lay["bufB"]
+                img = data[s * 0x1000:(s + 1) * 0x1000]
+                self.write_mem(buf, [int.from_bytes(img[k:k + 4], "little")
+                                     for k in range(0, 0x1000, 4)])
+                if busy:
+                    self._stub_wait(lay)             # finish sector i-1
+                self._stub_post(lay, 2, m3=addr + s * 0x1000, m5=buf)
+                busy = True
+            if busy:
+                self._stub_wait(lay)
+            verified = 0
+            if verify and changed:
+                vcrcs = []
+                for base in range(0, nsec, self._STUB_CRC_MAX):
+                    vcrcs += crc_range(base, min(self._STUB_CRC_MAX, nsec - base))
+                for s in changed:
+                    if vcrcs[s] != host(data[s * 0x1000:(s + 1) * 0x1000]):
+                        raise RuntimeError(
+                            f"flash_incremental[stub]: verify FAILED "
+                            f"@0x{addr + s * 0x1000:08x}")
+                    verified += 1
+        finally:
+            self.stub_end(ctx, lay)
+        _log(f"  flash_incremental[stub]: programmed {len(changed)}/{nsec}, "
+             f"verified {verified}")
+        return dict(sectors=nsec, changed=len(changed), written=len(changed),
+                    overwritten=0, verified=verified)
+
     def _stage_sector(self, buf, img):
         """Stage a 4 KiB sector into scratch `buf`. (ROM-tinfl compressed
         staging was tried for #36 and is UNUSABLE: tinfl_decompress_mem_to_mem
@@ -810,6 +933,13 @@ class EspUsbJtag(EspUsbJtagTransport):
         if not ready:
             raise RuntimeError("flash_incremental: ROM flash read self-test FAILED — "
                                "refusing to erase/program (brick risk)")
+        # #27 fast path: resident RAM stub (one mailbox command per 64-sector CRC
+        # pass, pipelined erase+program). erase='auto' keeps the ROM-call path
+        # (its read-back/overwrite logic lives host-side).
+        rom = self._chip().get("rom", {})
+        if (erase == "always" and self._stub_blob()
+                and all(s in rom for s in self._STUB_SYMS)):
+            return self._flash_incremental_stub(addr, data, _log, verify)
         host = self._crc_host()
         buf = self._chip()["sram"]["data"]
         nsec = len(data) // 0x1000
