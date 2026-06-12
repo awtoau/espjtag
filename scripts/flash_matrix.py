@@ -127,13 +127,20 @@ def main():
             for f in flashers:
                 times, fails = [], 0
                 for _ in range(args.rounds):
-                    try:
-                        if chip == "S3":
-                            el, ok, note = esptool_s3(name, tty, chip, args.addr, A, B)
-                        else:
-                            el, ok, note = run_flasher(f, usb, tty, chip, args.addr, A, B)
-                    except Exception as e:                 # noqa: BLE001
-                        el, ok, note = None, False, f"EXC {e}"
+                    # retry transient glitches (USB/reset contention with 7 boards
+                    # on the bus, the C5 #33 post-reset gate, etc.) before scoring
+                    # a FAIL — a real failure fails all RETRIES consistently.
+                    el = ok = note = None
+                    for _retry in range(3):
+                        try:
+                            if chip == "S3":
+                                el, ok, note = esptool_s3(name, tty, chip, args.addr, A, B)
+                            else:
+                                el, ok, note = run_flasher(f, usb, tty, chip, args.addr, A, B)
+                        except Exception as e:             # noqa: BLE001
+                            el, ok, note = None, False, f"EXC {e}"
+                        if ok or ok is None:
+                            break                          # success or genuine skip
                     if el is not None and ok:
                         times.append(el * 1000)
                     elif ok is None:
@@ -144,9 +151,12 @@ def main():
                     med = statistics.median(times)
                     cells[f] = f"{med:6.0f} ms (n={len(times)})"
                     csv.append(f"{name},{chip},{kb},{f},{med:.0f},{len(times)},ok")
+                elif fails < 0:
+                    cells[f] = "skip (no tty / unsupported)"
+                    csv.append(f"{name},{chip},{kb},{f},,,skip")
                 else:
-                    cells[f] = "skip" if fails < 0 else f"FAIL x{fails}"
-                    csv.append(f"{name},{chip},{kb},{f},,,{'skip' if fails<0 else 'fail'}")
+                    cells[f] = f"FAIL x{fails} — {(note or '?')[:70]}"   # show WHY
+                    csv.append(f"{name},{chip},{kb},{f},,,fail:{(note or '?')[:60]}")
             print(f"  {kb:5d} KiB:")
             for f in flashers:
                 print(f"      {f:24s} {cells.get(f, '-')}")

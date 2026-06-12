@@ -170,13 +170,35 @@ def connect(usb_path):
 
 def verify_crc(j, addr, B):
     """INDEPENDENT correctness check: on-chip CRC-32 each sector of flash vs B.
-    Re-arm the ROM flash gate first — it is cold after a reset (e.g. esptool's
-    --after hard_reset), and reading through a cold gate returns garbage CRCs."""
-    if not j._rom_flash_ready()[0]:
-        j.flash_init()
+    Re-arm the ROM flash gate first via the #33 RECOVERY LADDER — the gate is
+    cold after a reset (esptool/openocd both reset), and on the C5 a single
+    flash_init isn't always enough (clk+attach+config_param retried), so the old
+    one-shot init flaked the verify intermittently (the 'openocd-full FAIL x2'
+    matrix artifact)."""
+    j._ensure_flash_ready(lambda m: None, "verify")
     host = j._crc_host()
     return all(j.flash_crc_region(addr + s * SEC, SEC) == host(B[s * SEC:(s + 1) * SEC])
                for s in range(len(B) // SEC))
+
+
+def verify_after_external(usb_path, addr, B, tries=3):
+    """Reconnect + verify after an external flasher's reset, retrying the whole
+    connect/halt/verify on transient post-reset failures (the app is rebooting;
+    halt can catch it mid-boot). Returns (ok, note)."""
+    last = ""
+    for _ in range(tries):
+        try:
+            j = connect(usb_path)
+            try:
+                return verify_crc(j, addr, B), ""
+            finally:
+                try:
+                    j.resume()
+                finally:
+                    usb.util.dispose_resources(j.dev)
+        except Exception as e:                                 # noqa: BLE001
+            last = f"verify-reconnect: {e}"
+    return None, last
 
 
 def setup_a(usb_path, addr, A):
@@ -238,18 +260,8 @@ def run_flasher(name, usb_path, tty, chip, addr, A, B):
         os.unlink(p)
     if r.returncode != 0:
         return elapsed, False, f"rc={r.returncode}: {(r.stderr or r.stdout)[-120:].strip()}"
-    try:                                                       # reconnect to verify
-        j = connect(usb_path)
-        try:
-            ok = verify_crc(j, addr, B)
-        finally:
-            try:
-                j.resume()
-            finally:
-                usb.util.dispose_resources(j.dev)
-        return elapsed, ok, ""
-    except Exception as e:                                     # noqa: BLE001
-        return elapsed, None, f"verify-reconnect: {e}"
+    ok, note = verify_after_external(usb_path, addr, B)         # retries post-reset
+    return elapsed, ok, note
 
 
 def external_cmd(name, usb_path, tty, chip, addr):
