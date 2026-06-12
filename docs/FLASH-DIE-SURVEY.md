@@ -39,6 +39,18 @@ the Chinese NOR market. We therefore report it by evidence, not name:
 `espjtag --info` labels it `unregistered-0x46`. If a name ever surfaces, the
 SFDP fingerprint above is the match key.
 
+**"Is the fast die lying?" — tested, no.** 300 erase+program cycles with full
+verify every cycle (`tmp/die46_endurance_spot.log`): 0 failures; erase drifted
+*up* +1.6 ms (genuine oxide-stress physics — a shallow-erase cheat trends fast
+and constant, then fails verify); erase floor of 8.4 ms on mostly-erased
+content reveals **adaptive verify-based erase** — the die pulses until cells
+verify, the opposite of faking completion. Like-for-like it's 2× faster than
+the same-capacity XMC die; our "slow" Winbond is an older-gen 64 Mbit part.
+Unverifiable on a bench and therefore the honest residual risk: long-term
+retention and full endurance (300 cycles ≈ 0.3% of spec) — exactly where cheap
+dies cut corners invisibly. Fine for test boards; qualify the vendor for a
+product BOM.
+
 ## How much the timing varies (and what it explains)
 
 - **Erase: 2.6× spread** (24–62 ms/sector) — the dominant variable.
