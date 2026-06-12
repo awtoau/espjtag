@@ -251,6 +251,24 @@ CHIPS = {
             spiflash_unlock=0x40000A2C,
             spiflash_config_param=0x40000A50,
             spi_flash_attach=0x40000AEC,
+            spiflash_config_clk=0x40000A98,        # esp32s3.rom.ld (#29 attach-less init)
+            spiflash_config_readmode=0x40000AA4,
+        ),
+        # Watchdogs to disable while HALTED (XtensaXDM.halt calls _wdt_disable).
+        # VERBATIM from openocd-esp32 src/target/espressif/esp32s3.c
+        # esp32s3_disable_wdts: TIMG0/TIMG1 (key 0x50D83AA1 to WPROTECT, 0 to CFG0)
+        # + RTC WDT. The super-WDT (SWD) auto-feed is a read-modify-write handled
+        # specially in _wdt_disable (doesn't fit the (wkey,cfg,val) table).
+        wdt=dict(
+            key=0x50D83AA1,
+            disable=[
+                (0x6001F064, 0x6001F048, 0x00000000),   # TIMG0 WDT
+                (0x60020064, 0x60020048, 0x00000000),   # TIMG1 WDT
+                (0x600080B0, 0x60008098, 0x00000000),   # RTC WDT
+            ],
+            int_clear=[],
+            swd=dict(wprotect=0x600080B4, key=0x8F1D312A,
+                     conf=0x600080B0, auto_feed=1 << 31),
         ),
         # scratch at the top of S3 IRAM (SOC_IRAM 0x40370000..0x403E0000, soc.h).
         sram=dict(data=0x403DC000, trap=0x403DBF00, stack=0x403DF000, top=0x403E0000),

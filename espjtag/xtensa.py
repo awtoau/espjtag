@@ -146,12 +146,32 @@ class XtensaXDM:
         j._scan_dr(OCDDCR_ENABLEOCD, 32); j._idle(IDLE)
         j._send()
 
-    def halt(self, tries=200):
+    def halt(self, tries=200, disable_wdt=True):
         self.nar_write(DCRSET, OCDDCR_ENABLEOCD | OCDDCR_DEBUGINTERRUPT)
         for _ in range(tries):
             if self.nar_read(DSR) & OCDDSR_STOPPED:
+                if disable_wdt:
+                    self._wdt_disable()
                 return True
         return False
+
+    def _wdt_disable(self):
+        """Disable the S3 watchdogs so none resets the chip while halted — the
+        same protection OpenOCD's esp32s3_on_halt applies on every halt (and the
+        C5 #33 lesson). Data-driven from chips.py `wdt`; the super-WDT auto-feed
+        is a read-modify-write. No-op on a chip without a wdt table. Core halted;
+        all writes are uncached MMIO (now reliable, see write_mem fix)."""
+        w = self._chip().get("wdt")
+        if not w:
+            return
+        for wkey_reg, cfg_reg, cfg_val in w["disable"]:
+            self.write_mem32(wkey_reg, w["key"])      # unlock
+            self.write_mem32(cfg_reg, cfg_val)        # zero the config
+        swd = w.get("swd")
+        if swd:                                       # super-WDT: enable auto-feed
+            self.write_mem32(swd["wprotect"], swd["key"])
+            conf = self.read_mem32(swd["conf"]) | swd["auto_feed"]
+            self.write_mem32(swd["conf"], conf)
 
     def resume(self):
         self.nar_write(DCRCLR, OCDDCR_DEBUGINTERRUPT)
@@ -395,19 +415,20 @@ class XtensaXDM:
     # test so we never erase/program a misconfigured chip. The Xtensa difference is the
     # WINDOWED ABI — call_function(windowed=True) handles it via the CALL0 bridge.
     #
-    # *** STATUS on the S3 (#29): config_param works through the bridge (validated:
-    # populates the geometry struct). But the full read/erase/program path is NOT yet
-    # functional on a running app for two reasons measured on the bench:
-    #   1. rom_spiflash_legacy_data/funcs (0x3fceffe4/0x3fceffe8) are NULL on the app —
-    #      the legacy ROM SPI-flash layer the 2nd-stage bootloader sets up was torn
-    #      down, so esp_rom_spiflash_read/config_param deref NULL and fault. flash_init
-    #      points _data at a scratch struct, but _funcs needs the real ROM table and the
-    #      data struct needs fields (dummy bits) only spi_flash_attach sets up.
-    #   2. spi_flash_attach NESTS several call8 levels (boot_attach -> SPI_init -> ...),
-    #      which faults during window-overflow spill under JTAG-resumed execution (only
-    #      LEAF ROM functions work through the bridge so far).
-    # So _rom_flash_ready() returns False here and flash_write() refuses — by design,
-    # exactly like the RISC-V gate. ***
+    # *** STATUS on the S3 (#29), corrected 2026-06-12 after the read-latency fix:
+    # The old note here ("legacy_data/funcs are NULL; needs spi_flash_attach") was a
+    # READ-BUG ARTIFACT — the stale READ_LATENCY=2 made every memory read return
+    # shifted garbage, so the legacy pointers LOOKED null. With reads fixed, the
+    # running awto-esp-base app has the legacy ROM flash state FULLY INTACT:
+    #   legacy_data  (0x3FCEFFE4) -> 0x3fcef6a4 = {devid 0x852018, size 16MB, 64K
+    #                blk, 4K sect, 256 page, 0xffff mask} — geometry already set
+    #   legacy_funcs (0x3FCEFFE8) -> 0x3fcef670 = the funcs table
+    # So NO flash_init / spi_flash_attach is needed on this app. The remaining
+    # blocker is NOT the legacy state — it's the resume-and-trap EXECUTION path:
+    # after RFDO the core does not re-halt at the BREAK trap (call_function returns
+    # halted=False). That needs an OpenOCD-verbatim port of xtensa_start_algorithm/
+    # wait_algorithm (debug-exception-on-return setup), which is the next #29 step.
+    # Until then _rom_flash_ready() returns False and flash_write() refuses. ***
     LEGACY_DATA_PTR = 0x3FCEFFE4    # &rom_spiflash_legacy_data (esp32s3.rom.ld)
     LEGACY_FUNCS_PTR = 0x3FCEFFE8   # &rom_spiflash_legacy_funcs
 
