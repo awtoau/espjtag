@@ -12,8 +12,8 @@ accounting (non-capture DTMCS scan + send). This proves the landed fix
       here; values must also stay deterministic.
 
 Run per chip (C6 single-TAP, C5 two-TAP):
-  python3 scripts/validate_dmireset.py --usb-path 1-1.3.3.3   # c6-maker
-  python3 scripts/validate_dmireset.py --usb-path 1-1.2       # xiao-c5
+  python3 scripts/validate_dmireset.py --usb-path 1-1.3.3.3   # c6-maker-a
+  python3 scripts/validate_dmireset.py --usb-path 1-1.2       # c5-xiao-a
 """
 import argparse
 import sys

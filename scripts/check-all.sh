@@ -21,10 +21,10 @@ mkdir -p tmp
 PY=.venv/bin/python
 LOG=tmp/check-all.log
 NOTE="${NOTE:-check-all}"
-C6_USB="${C6_USB:-1-1.3.1.3.1}"          # xiao-c6
+C6_USB="${C6_USB:-1-1.3.1.3.1}"          # c6-xiao-a
 C6_MAC="${C6_MAC:-E4:B0:63:41:C1:44}"
 C6_TTY="${C6_TTY:-/dev/ttyACM2}"
-C5_USB="${C5_USB:-1-1.2}"                # xiao-c5
+C5_USB="${C5_USB:-1-1.2}"                # c5-xiao-a
 FLASHERS="${FLASHERS:-espjtag-full,espjtag-incr,esptool-incr}"
 
 : > "$LOG"
