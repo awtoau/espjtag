@@ -13,8 +13,8 @@ An [awto.au](https://awto.au) project.
 
 | bulk memory (µs/word) | **espjtag** | probe-rs | OpenOCD |
 |---|---|---|---|
-| read, 1024-word burst | **30** | 46 | 97 |
-| write, 1024-word burst | **33** | ~37 | 27 |
+| read, 1024-word burst | **21** | 46 | 97 |
+| write, 1024-word burst | **30** | ~37 | 27 |
 
 | flash a 64 KiB A→B update (2 sectors changed) | wall clock |
 |---|---|
