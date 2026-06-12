@@ -218,7 +218,7 @@ def run_flasher(name, usb_path, tty, chip, addr, A, B):
         finally:
             j.resume()
             usb.util.dispose_resources(j.dev)
-    cmd, note = external_cmd(name, usb_path, tty, chip, addr)
+    cmd, note, env_extra = external_cmd(name, usb_path, tty, chip, addr)
     if cmd is None:
         return None, None, note
     setup_a(usb_path, addr, A)
@@ -231,7 +231,8 @@ def run_flasher(name, usb_path, tty, chip, addr, A, B):
     t = time.perf_counter()
     # timeout: guards a hung external tool (USB wedge) — generous ceiling, a
     # 64 KiB flash is seconds for every tool here; expiry fails the round.
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=180)
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=180,
+                       env={**os.environ, **env_extra} if env_extra else None)
     elapsed = time.perf_counter() - t
     for p in paths.values():
         os.unlink(p)
@@ -253,41 +254,54 @@ def run_flasher(name, usb_path, tty, chip, addr, A, B):
 
 def external_cmd(name, usb_path, tty, chip, addr):
     """argv template for an external flasher writing {B} at addr ({A} = old image).
-    Returns (argv | None, skip-note)."""
+    Returns (argv | None, skip-note, extra-env).
+
+    esptool FEATURE-FLAG matrix (fork = ~/git/esptool-fork bench-combo, own venv;
+    each fork feature is independently toggleable, so progression graphs can
+    isolate them — stock rows always use the system esptool):
+      esptool-full / -nocomp / -incr   system esptool (upstream baseline)
+      esptool-incr-dev                 fork: device-diff ONLY (reset pinned stock
+                                       via ESPTOOL_CFGFILE -> esptool_stock_reset.cfg)
+      esptool-full-fast                fork: fast-USJ-reset ONLY (full write)
+      esptool-incr-dev-fast            fork: BOTH features
+    """
     if name.startswith("esptool"):
         if not tty:
-            return None, "skip (no tty)"
-        # -dev = the fork's device-diff (no old image file): feat/diff-with-device
-        # in ~/git/esptool-fork, own venv so the stock rows stay stock esptool.
-        binary = (f"{FORK_ESPTOOL}" if name == "esptool-incr-dev" else "esptool")
-        cmd = [binary, "--chip", ESPTOOL_CHIP.get(chip, "auto"), "--port", tty,
+            return None, "skip (no tty)", None
+        fork = name in ("esptool-incr-dev", "esptool-incr-dev-fast", "esptool-full-fast")
+        env = None
+        if name == "esptool-incr-dev":             # isolate device-diff: stock reset
+            env = {"ESPTOOL_CFGFILE": os.path.join(ROOT, "scripts",
+                                                   "esptool_stock_reset.cfg")}
+        cmd = [FORK_ESPTOOL if fork else "esptool",
+               "--chip", ESPTOOL_CHIP.get(chip, "auto"), "--port", tty,
                "--before", "default_reset", "--after", "hard_reset", "write_flash"]
         if name == "esptool-nocomp":
             cmd += ["--no-compress"]
         cmd += [hex(addr), "{B}"]
         if name == "esptool-incr":                 # serial incremental: diff vs old image
             cmd += ["--diff-with", "{A}"]
-        elif name == "esptool-incr-dev":           # serial incremental: on-chip MD5 diff
-            cmd += ["--diff-with", "device"]
-        return cmd, ""
+        elif name in ("esptool-incr-dev", "esptool-incr-dev-fast"):
+            cmd += ["--diff-with", "device"]       # serial incremental: on-chip MD5 diff
+        return cmd, "", env
     if name == "openocd-full":
         if not os.path.exists(f"{OOCD}/bin/openocd"):
-            return None, "skip (no openocd-esp32)"
+            return None, "skip (no openocd-esp32)", None
         return [f"{OOCD}/bin/openocd", "-s", f"{OOCD}/share/openocd/scripts",
                 "-c", f"adapter usb location {usb_path}",
                 "-f", f"board/esp32{chip.lower()}-builtin.cfg",
-                "-c", "program_esp {B} " + hex(addr) + " exit"], ""
+                "-c", "program_esp {B} " + hex(addr) + " exit"], "", None
     if name.startswith("probers"):
         serial = usb_serial(usb_path)
         if not serial:
-            return None, "skip (no usb serial)"
+            return None, "skip (no usb serial)", None
         cmd = ["probe-rs", "download", "--chip", f"esp32{chip.lower()}",
                "--probe", f"303a:1001:{serial}",
                "--binary-format", "bin", "--base-address", hex(addr)]
         if name == "probers-preverify":            # its only skip-if-same mode (whole image)
             cmd += ["--preverify"]
-        return cmd + ["{B}"], ""
-    return None, f"unknown flasher {name}"
+        return cmd + ["{B}"], "", None
+    return None, f"unknown flasher {name}", None
 
 
 def fleet_riscv():
