@@ -165,8 +165,9 @@ class EspUsbJtag(EspUsbJtagTransport):
         return [res[2 * k + 2][0] for k in range(len(regnos))]
 
     # === System Bus Access: memory read/write (no running hart needed) =====
-    def _sb_setup(self, size_access=2, autoincrement=False, readondata=False,
-                  readonaddr=False):
+    @staticmethod
+    def _sbcs_value(size_access=2, autoincrement=False, readondata=False,
+                    readonaddr=False):
         # sbcs: sbaccess at [19:17] (2 = 32-bit), sbautoincrement[16],
         # sbreadondata[15], sbreadonaddr[20]
         cs = (size_access << 17)
@@ -176,7 +177,12 @@ class EspUsbJtag(EspUsbJtagTransport):
             cs |= (1 << 15)
         if readonaddr:
             cs |= (1 << 20)
-        self.dmi_write(SBCS, cs)
+        return cs
+
+    def _sb_setup(self, size_access=2, autoincrement=False, readondata=False,
+                  readonaddr=False):
+        self.dmi_write(SBCS, self._sbcs_value(size_access, autoincrement,
+                                              readondata, readonaddr))
 
     def read_mem32(self, addr):
         """Read one 32-bit word from `addr` via System Bus Access."""
@@ -221,25 +227,32 @@ class EspUsbJtag(EspUsbJtagTransport):
         if nwords <= 0:
             return []
         self._ensure_dtmcs()
-        self._sb_setup(autoincrement=True, readondata=True, readonaddr=True)
-        reqs = [(SBADDRESS0, addr & 0xFFFFFFFF, DMI_WRITE)]   # arms word0 fetch
+        # ONE batch = ONE USB round-trip for the whole read, including the SBA
+        # setup, the closing SBCS error-check read AND the SBCS clear. The old
+        # shape spent 4 round-trips (setup / burst / SBCS read / SBCS write) —
+        # ~600 µs for a single-word read where probe-rs pays ~240.
+        reqs = [(SBCS, self._sbcs_value(autoincrement=True, readondata=True,
+                                        readonaddr=True), DMI_WRITE)]
+        reqs += [(SBADDRESS0, addr & 0xFFFFFFFF, DMI_WRITE)]  # arms word0 fetch
         reqs += [(SBDATA0, 0, DMI_READ)] * (nwords + 1)       # pipeline of reads
         reqs += [(SBDATA0, 0, DMI_NOP)]                       # flush last DTM read
+        reqs += [(SBCS, 0, DMI_READ), (SBCS, 0, DMI_NOP)]     # error check
+        reqs += [(SBCS, 0, DMI_WRITE)]                        # clear/disarm SBA
         res = self._dmi_batch(reqs)
-        # res[0] is the address write; res[1] is the read-phase that returns the
-        # SBADDRESS0-write's (stale) result; res[2..2+nwords) carry word0..wordN-1.
-        out = [res[2 + i][0] for i in range(nwords)]
+        # DTM pipeline: a scan's capture is the PREVIOUS op's result. Word i's
+        # READ is issued at slot 2+i, so its data lands in slot 3+i; the SBCS
+        # read issued at slot nwords+4 lands in slot nwords+5.
+        out = [res[3 + i][0] for i in range(nwords)]
+        sbcs = res[nwords + 5][0]
         # Guard: any DTM op-status 3 (busy) in the burst = pipeline stall.
-        if any(res[i][1] == 3 for i in range(1, 2 + nwords)):
+        if any(res[i][1] == 3 for i in range(1, len(res))):
             self.dmi_write(SBCS, 0)
             return self._read_mem_slow(addr, nwords)
         # Guard: SBA bus error (sberror / sbbusyerror) -> the burst raced the bus.
-        sbcs = self.dm_read(SBCS)
         if sbcs & (SB_SBERROR | SB_SBBUSYERROR):
             self.dmi_write(SBCS, SB_SBERROR | SB_SBBUSYERROR)  # W1C clear
             self.dmi_write(SBCS, 0)
             return self._read_mem_slow(addr, nwords)
-        self.dmi_write(SBCS, 0)
         return out
 
     def write_mem(self, addr, words):
@@ -254,8 +267,11 @@ class EspUsbJtag(EspUsbJtagTransport):
         if not words:
             return 0
         self._ensure_dtmcs()
-        self._sb_setup(autoincrement=True)               # sbaccess=32, autoincr
-        reqs = [(SBADDRESS0, addr & 0xFFFFFFFF, DMI_WRITE)]
+        # SBA setup rides the stream head (it's just another DMI write); the
+        # whole write costs the stream + its sticky-status read + ONE closing
+        # batch for the SBCS error-check-and-clear.
+        reqs = [(SBCS, self._sbcs_value(autoincrement=True), DMI_WRITE)]
+        reqs += [(SBADDRESS0, addr & 0xFFFFFFFF, DMI_WRITE)]
         reqs += [(SBDATA0, w & 0xFFFFFFFF, DMI_WRITE) for w in words]
         # OUT-only stream (no capture, no FIFO chunking) + ONE sticky-status read.
         # sticky dmistat nonzero = some op was dropped -> redo slowly, correctly.
@@ -264,13 +280,14 @@ class EspUsbJtag(EspUsbJtagTransport):
             self.dmi_write(SBADDRESS0, addr & 0xFFFFFFFF)
             for w in words:
                 self.dmi_write(SBDATA0, w & 0xFFFFFFFF)
-        sbcs = self.dm_read(SBCS)
+        fin = self._dmi_batch([(SBCS, 0, DMI_READ), (SBCS, 0, DMI_NOP),
+                               (SBCS, 0, DMI_WRITE)])
+        sbcs = fin[1][0]
         if sbcs & (SB_SBERROR | SB_SBBUSYERROR):
             self.dmi_write(SBCS, SB_SBERROR | SB_SBBUSYERROR)   # W1C clear
             self.dmi_write(SBCS, 0)
             raise RuntimeError(f"write_mem SBA bus error at 0x{addr:08x} "
                                f"(sbcs=0x{sbcs:08x})")
-        self.dmi_write(SBCS, 0)
         return len(words)
 
     # === "call a function on the target" — the flash-loader call primitive (#3) ==

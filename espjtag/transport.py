@@ -10,6 +10,7 @@ src/target/riscv/debug_defines.h (BSD-2-Clause OR CC-BY-4.0). Pinned upstream
 commit: ../upstream.lock. Provenance + licensing: ../ACKNOWLEDGEMENTS.md.
 """
 
+import itertools
 import time
 
 import usb.core
@@ -215,23 +216,20 @@ class EspUsbJtagTransport:
         reference implementation). Repeating a capturing nibble repeats the
         capture, so the byte accounting is unchanged. RST/FLUSH never compress."""
         self._emit(CMD_FLUSH)
-        nibs = self._nibbles
         out = []
-        i, n = 0, len(nibs)
-        while i < n:
-            v = nibs[i]
-            out.append(v)
-            if v <= 7:
-                run = 1
-                while run < 1024 and i + run < n and nibs[i + run] == v:
-                    run += 1
-                reps = run - 1
+        for v, grp in itertools.groupby(self._nibbles):
+            run = len(list(grp))
+            if v > 7:                                   # RST/FLUSH never compress
+                out.extend([v] * run)
+                continue
+            while run > 0:
+                seg = min(run, 1024)                    # protocol max 1023 reps
+                out.append(v)
+                reps = seg - 1
                 while reps > 0:
                     out.append(0xC + (reps & 3))
                     reps >>= 2
-                i += run
-            else:
-                i += 1
+                run -= seg
         if len(out) % 2:
             out.append(CMD_FLUSH)                       # can't send a half-byte
         buf = bytes((out[i] << 4) | out[i + 1]
@@ -267,11 +265,11 @@ class EspUsbJtagTransport:
             raise RuntimeError(f"_recv: wanted {need} bytes, got {len(data)} "
                                "(device stopped producing TDO bytes)")
         self._t("usb_in_read", t)
-        bits = []
-        for byte in data:
-            for b in range(8):
-                bits.append((byte >> b) & 1)
-        return bits[:want_tdo_bits]
+        # Captured TDO comes back LSB-first per byte, bytes in capture order —
+        # exactly little-endian int packing. Returned as ONE int (bit i of the
+        # capture = bit i of the int): callers slice fields with shift/mask via
+        # _dr_field. The old per-bit list cost ~100 µs of Python per op (#21).
+        return int.from_bytes(data[:need], "little") & ((1 << want_tdo_bits) - 1)
 
     def _flush(self, want_tdo_bits=0):
         """Send the queued OUT stream and read back want_tdo_bits (legacy combined
@@ -346,13 +344,16 @@ class EspUsbJtagTransport:
     def _scan(self, value, nbits, ir=False, capture=False):
         """Shift nbits LSB-first through IR or DR, capturing TDO if requested.
         Leaves the TAP in Update->Idle. Mirrors bitq_scan_field: N-1 bits in
-        Shift with TMS=0, the last bit with TMS=1 (Exit1) — all captured."""
-        self._goto(self.SHIFT_IR if ir else self.SHIFT_DR)
-        for i in range(nbits):
-            last = i == nbits - 1
-            self._clock_tms(1 if last else 0, (value >> i) & 1,
-                            1 if capture else 0)   # last bit TMS=1 -> Exit1
-        # now in Exit1; return to Idle for the next op.
+        Shift with TMS=0, the last bit with TMS=1 (Exit1) — all captured.
+        Nibbles are built in bulk (one comprehension, no per-bit method calls —
+        the per-bit path cost ~100 µs of Python per DMI op, #21)."""
+        shift = self.SHIFT_IR if ir else self.SHIFT_DR
+        self._goto(shift)
+        cap = 4 if capture else 0
+        self._nibbles.extend(cap | ((value >> i) & 1) for i in range(nbits - 1))
+        self._nibbles.append(cap | 2 | ((value >> (nbits - 1)) & 1))  # TMS=1 -> Exit1
+        self.state = self._NEXT[shift][1]            # Exit1-IR/DR
+        # return to Idle for the next op.
         self._goto(self.IDLE)
 
     def _idle(self, n):
@@ -388,10 +389,11 @@ class EspUsbJtagTransport:
         return total
 
     def _dr_field(self, bits, offset, nbits):
-        """Slice the target-TAP field out of a captured DR stream that began at
-        `offset` (accounts for the leading `taps_after` BYPASS bits)."""
+        """Slice the target-TAP field out of a captured DR stream (an int from
+        _recv, bit i = capture bit i) that began at `offset` (accounts for the
+        leading `taps_after` BYPASS bits)."""
         lo = offset + self.taps_after
-        return _bits_to_int(bits[lo:lo + nbits])
+        return (bits >> lo) & ((1 << nbits) - 1)
 
     def _detect_chain(self):
         """Read the IDCODE chain once and pick the per-chip scan layout. The C5
@@ -407,7 +409,7 @@ class EspUsbJtagTransport:
         self._scan(0, 96, capture=True)
         self._send()
         bits = self._recv(96)
-        ids = [_bits_to_int(bits[i:i + 32]) for i in (0, 32, 64)]
+        ids = [(bits >> i) & 0xFFFFFFFF for i in (0, 32, 64)]
         self.idcode_chain = ids
         first = ids[0]
         layout = self._CHAIN_BY_IDCODE.get(first)
@@ -428,8 +430,7 @@ class EspUsbJtagTransport:
         self._scan(0, n, capture=True)
         self._send()
         bits = self._recv(n)
-        i = self.idcode_index * 32
-        return _bits_to_int(bits[i:i + 32])
+        return (bits >> (self.idcode_index * 32)) & 0xFFFFFFFF
 
     # --- DTMCS (IR=0x10): version, abits (DMI addr width), idle cycles ----
     def read_dtmcs(self):
