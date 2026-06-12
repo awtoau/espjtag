@@ -566,13 +566,21 @@ class EspUsbJtag(EspUsbJtagTransport):
                 self.call_rom("cache_enable_icache")
         return out
 
-    def flash_incremental(self, addr, data, log=None, verify=True):
+    def flash_incremental(self, addr, data, log=None, verify=True, erase="always"):
         """Incrementally program `data` (bytes) to flash byte-offset `addr`: CRC each 4 KiB
         sector ON-CHIP, erase+program ONLY the sectors whose CRC differs from the image,
         then verify-after-write by re-CRC. Same brick-safety gate + ROM path as flash_write.
         `addr` 4 KiB-aligned; `data` 0xFF-padded to a sector multiple. An all-identical
-        image writes nothing (the root early-out falls out of the loop). Returns
-        dict(sectors, changed, written, verified). Hart halted."""
+        image writes nothing (the root early-out falls out of the loop).
+
+        erase="auto": read each changed sector back and SKIP the erase when every bit
+        transition is 1->0 (NOR programming can only clear bits), programming only the
+        differing word-run in place. Big win for append-like / bit-clearing deltas
+        (logs, counters, NVS-style); a net loss (~+50% per sector) on random changes
+        because the read-back is paid and the erase happens anyway — hence opt-in.
+        The verify re-CRC covers both paths identically.
+
+        Returns dict(sectors, changed, written, overwritten, verified). Hart halted."""
         def _log(m):
             if log:
                 log(m)
@@ -602,9 +610,33 @@ class EspUsbJtag(EspUsbJtagTransport):
         # programmed, not just the changed sectors — skipping "unchanged" data inside
         # an erased unit is pyOCD's fast_program data-loss bug
         # (docs/PYOCD-INCREMENTAL-PROOF.md §3; scripts/incremental_invariant_test.py).
+        overwritten = 0
         for s in changed:
             sa = addr + s * 0x1000
             img = data[s * 0x1000:(s + 1) * 0x1000]
+            if erase == "auto":
+                # NOR programming only clears bits (1->0). Read the sector back:
+                # if no bit needs 0->1, skip the erase and program ONLY the
+                # differing word-run. Wins on append/bit-clearing deltas; the
+                # read-back makes it a net LOSS on random changes — opt-in.
+                cur = b"".join(w.to_bytes(4, "little")
+                               for w in self.flash_read_rom(sa, 0x400))
+                if all(c & n == n for c, n in zip(cur, img)):
+                    w0 = next(i for i in range(0, 0x1000, 4)
+                              if cur[i:i + 4] != img[i:i + 4])
+                    w1 = next(i for i in range(0xFFC, -4, -4)
+                              if cur[i:i + 4] != img[i:i + 4]) + 4
+                    self.call_rom("spiflash_unlock")
+                    self.write_mem(buf, [int.from_bytes(img[i:i + 4], "little")
+                                         for i in range(w0, w1, 4)])
+                    r, _ = self.call_rom("spiflash_write", args=(sa + w0, buf, w1 - w0))
+                    if r:
+                        raise RuntimeError(
+                            f"flash_incremental: overwrite @0x{sa + w0:08x} -> {r}")
+                    overwritten += 1
+                    _log(f"  flash_incremental: sector {s} overwritten in place "
+                         f"({w1 - w0} bytes, no erase)")
+                    continue
             self.call_rom("spiflash_unlock")
             r, _ = self.call_rom("spiflash_erase_sector", args=(sa >> 12,))
             if r:
@@ -622,8 +654,10 @@ class EspUsbJtag(EspUsbJtagTransport):
                     raise RuntimeError(
                         f"flash_incremental: verify FAILED @0x{addr + s * 0x1000:08x}")
                 verified += 1
-        _log(f"  flash_incremental: programmed {len(changed)}/{nsec}, verified {verified}")
-        return dict(sectors=nsec, changed=len(changed), written=len(changed), verified=verified)
+        _log(f"  flash_incremental: programmed {len(changed)}/{nsec} "
+             f"({overwritten} in place), verified {verified}")
+        return dict(sectors=nsec, changed=len(changed), written=len(changed),
+                    overwritten=overwritten, verified=verified)
 
     def diag(self, log=print):
         """Verbose read-only dump of the debug module — useful BEFORE resetting."""

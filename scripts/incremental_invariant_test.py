@@ -71,10 +71,19 @@ class SimulatedFlash(EspUsbJtag):
             return 0, 0
         if name == "spiflash_write":
             dst, src, n = args
-            self.flash[dst:dst + n] = self.staged[src][:n]
+            # REAL NOR semantics: programming can only clear bits. A wrong
+            # skip-erase decision (erase='auto') corrupts this flash and fails
+            # the content assertions — that's the point of AND-ing here.
+            staged = self.staged[src][:n]
+            self.flash[dst:dst + n] = bytes(c & w for c, w in
+                                            zip(self.flash[dst:dst + n], staged))
             self.writes.append((dst, n))
             return 0, 0
         raise AssertionError(f"unexpected ROM call {name}{args}")
+
+    def flash_read_rom(self, addr, nwords):
+        return [int.from_bytes(self.flash[addr + 4 * i:addr + 4 * i + 4], "little")
+                for i in range(nwords)]
 
 
 def covered(erases, writes):
@@ -122,6 +131,24 @@ def main():
     j2 = SimulatedFlash(img)
     res2 = j2.flash_incremental(0, bytes(img), log=None, verify=True)
     check("zero erases/writes", not j2.erases and not j2.writes and res2["changed"] == 0)
+
+    print("[3] erase='auto' — skip erase only when NOR-overwritable (fake ANDs writes)")
+    base3 = bytearray(img)
+    base3[3 * SEC + 0x200:3 * SEC + 0x300] = b"\xFF" * 0x100   # erased hole in sector 3
+    img3 = bytearray(base3)
+    img3[3 * SEC + 0x200:3 * SEC + 0x280] = random.Random(2).randbytes(0x80)  # fill: 1->0 only
+    img3[3 * SEC + 0x290] = base3[3 * SEC + 0x290] & 0x0F                     # bit-clear
+    img3[6 * SEC + 0x40] = base3[6 * SEC + 0x40] ^ 0xFF                       # needs erase (0->1)
+    j3 = SimulatedFlash(base3)
+    res3 = j3.flash_incremental(0, bytes(img3), log=None, verify=True, erase="auto")
+    erased_secs = sorted(a // SEC for a, _ in j3.erases)
+    check("sector 3 NOT erased (in-place overwrite)", 3 not in erased_secs)
+    check("sector 6 erased (0->1 transition forced it)", erased_secs == [6])
+    check("in-place write was partial (word-run, not full sector)",
+          any(n < SEC for a, n in j3.writes if a // SEC == 3))
+    check("INVARIANT: written covers every erased byte", not covered(j3.erases, j3.writes))
+    check("result: flash == image (NOR-AND semantics)", bytes(j3.flash) == bytes(img3))
+    check("counts", res3["changed"] == 2 and res3["overwritten"] == 1)
 
     print(f"VERDICT: {'PASS' if not fails else f'FAIL ({fails})'}")
     return 1 if fails else 0
