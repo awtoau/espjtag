@@ -84,15 +84,15 @@ NAREGS = 64                    # LX physical AR file size (16 windows of 4)
 PS_WOE = 0x40000               # PS.WOE bit18 — Window Overflow Enable (ENTRY/RETW active)
 IDLE = 16                     # run-test-idle settle clocks (the XDM tdi_idle)
 # READ_LATENCY = espjtag's NAR read-result pipeline depth over this transport: the
-# captured data for a NAR read lags its address scan by this many *accesses*. We
-# issue address+data as two separate DR scans (split _send()s) and capture TDO a
-# scan late, while OpenOCD's driver pipelines the pair, so over the bit-banged
-# transport the word that comes back belongs to the access TWO earlier. Hence every
-# read does READ_LATENCY+1 priming reads (nar_read) or over-reads nwords+READ_LATENCY
-# and slices off the leading READ_LATENCY (read_mem). 2 is empirical — it is the
-# value that makes the golden ROM read @0x40000000 land correctly on the bench; it
-# is NOT a guess but is transport-specific, so leave it unless re-validated on HW.
-READ_LATENCY = 2
+# captured data for a NAR read lags its address scan by this many *accesses*. read_mem
+# over-reads nwords+READ_LATENCY and slices off the leading READ_LATENCY; nar_read
+# primes READ_LATENCY+1 times and returns the last. Transport-specific and RE-DERIVED
+# on HW (a known ramp written then read back, finding the slice that aligns —
+# scripts/xcall_test.py). Was 2 in the bit-list-_recv era; the 2026-06-12 transport
+# rework (aligned int _recv, capture-narrowing) removed the lag entirely -> 0. If a
+# future transport change shifts the pipeline, re-derive (the ramp test) — do NOT
+# guess; a wrong value silently shifts every read.
+READ_LATENCY = 0
 
 
 class XtensaXDM:
@@ -350,24 +350,36 @@ class XtensaXDM:
         return out[READ_LATENCY:READ_LATENCY + nwords]
 
     def write_mem(self, addr, words):
-        """Write `words` from `addr`. Stage addr in a3, then per word: DDR=word, exec
-        SDDR32.P a3 (mem[a3]=DDR, a3+=4). Saves+restores a3 so a halted app resumes
-        intact."""
+        """Write `words` from `addr`. 1:1 with OpenOCD xtensa_write_memory
+        (probe_lsddr32p path): stage addr in a3, load the SDDR32.P instruction
+        into DIR0 ONCE for word0, then STREAM the rest through DDREXEC — writing
+        DDREXEC sets DDR AND re-executes the DIR0 instruction (mem[a3]=DDR;
+        a3+=4). The old code re-injected the instruction via DIR0EXEC every word,
+        which didn't land on silicon (#29). Saves+restores a3.
+
+        Each access carries IDLE run-test clocks so the injected instruction
+        completes before the next NAR access — matching OpenOCD's queue-execute
+        serialization."""
         j = self.j
         words = list(words)
+        if not words:
+            return 0
         saved_a3 = self._save_a3()                # preserve the app's a3
         j._drain_in()
         j._scan_ir(IR_NARSEL); j._send()
 
-        def acc(naraddr, rw, data=0):
-            j._scan_dr((naraddr << 1) | rw, 8); j._send()
-            j._scan_dr(data & 0xFFFFFFFF, 32); j._send()
+        def acc(naraddr, data):
+            j._scan_dr((naraddr << 1) | 1, 8)
+            j._scan_dr(data & 0xFFFFFFFF, 32)
+            j._idle(IDLE)                         # let an injected instr commit
+            j._send()
 
-        acc(DDR, 1, addr)                         # DDR = addr
-        acc(DIR0EXEC, 1, INS_RSR_DDR_A3)          # a3 = DDR = addr
-        for w in words:
-            acc(DDR, 1, w)                        # DDR = word
-            acc(DIR0EXEC, 1, INS_SDDR32P_A3)      # mem[a3] = DDR; a3 += 4
+        acc(DDR, addr)                            # DDR = addr
+        acc(DIR0EXEC, INS_RSR_DDR_A3)             # a3 = DDR = addr
+        acc(DDR, words[0])                        # DDR = word0
+        acc(DIR0EXEC, INS_SDDR32P_A3)             # mem[a3]=DDR; a3+=4  (load+exec)
+        for w in words[1:]:
+            acc(DDREXEC, w)                       # DDR=w AND re-exec SDDR32.P
         self._restore_a3(saved_a3)                # hand a3 back to the app
         return len(words)
 
