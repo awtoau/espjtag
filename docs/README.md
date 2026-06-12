@@ -60,6 +60,7 @@ that align to them.
 | [GIT-HISTORY-IDEAS.md](GIT-HISTORY-IDEAS.md) | Archaeology of local repos for prior art (Rust USB samples, recovery escalation, GUI patterns) | [#6](https://github.com/awtoau/espjtag/issues/6), [#13](https://github.com/awtoau/espjtag/issues/13) |
 | [C6-USJ-RESET.md](C6-USJ-RESET.md) | The C6 post-flash ROM-stick problem; OpenOCD `reset run` + pure-Python `reset_run_from_rom()` fixes | [#2](https://github.com/awtoau/espjtag/issues/2) |
 | [JTAG-PRIMER.md](JTAG-PRIMER.md) | JTAG from the wire up — how espjtag works, bottom to top | — |
+| [JTAG-SPEED-PATTERNS.md](JTAG-SPEED-PATTERNS.md) | **The generalized optimizations** — 10 transferable speed patterns + the discipline patterns, ordered by leverage; the porting checklist (read this before optimizing or porting) | — |
 | [JTAG-FLASH-WRITES.md](JTAG-FLASH-WRITES.md) | Design for high-speed flash-over-JTAG (RAM loader / ROM calls) | [#3](https://github.com/awtoau/espjtag/issues/3), [#4](https://github.com/awtoau/espjtag/issues/4) |
 | [CROSS-PLATFORM-USB.md](CROSS-PLATFORM-USB.md) | Portable USB reset (pyusb `dev.reset()`); Win/Linux/mac | [#13](https://github.com/awtoau/espjtag/issues/13) |
 | [MCP-SERVER.md](MCP-SERVER.md) | The espjtag MCP server (tools, pinning, safety tiers) + capability table | [#14](https://github.com/awtoau/espjtag/issues/14) |
