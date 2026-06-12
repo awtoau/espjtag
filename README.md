@@ -2,15 +2,37 @@
 
 # espjtag
 
-**Pure-Python RISC-V JTAG debugger for the ESP32 built-in USB-JTAG — no OpenOCD.**
+**One pure-Python tool for the ESP32 built-in USB-JTAG — debug, flash, identify.
+Faster than probe-rs and OpenOCD on the same wire. No OpenOCD, no esptool, no
+adapter — just the USB cable.**
 
 An [awto.au](https://awto.au) project.
 
+**The speed** (measured fleet-wide, fair warm-transport comparison, ESP32-C6 —
+`docs/JTAG-BENCHMARK-ANALYSIS.md` + the recorded run DB):
+
+| bulk memory (µs/word) | **espjtag** | probe-rs | OpenOCD |
+|---|---|---|---|
+| read, 1024-word burst | **30** | 46 | 97 |
+| write, 1024-word burst | **33** | ~37 | 27 |
+
+| flash a 64 KiB A→B update (2 sectors changed) | wall clock |
+|---|---|
+| **espjtag incremental** (on-chip CRC diff, verify included) | **~450 ms** |
+| esptool incremental (serial, device-diff fork) | ~560 ms |
+| esptool full (serial) | ~1.1 s |
+| OpenOCD / probe-rs full (JTAG) | 1.7–1.9 s |
+
+**The single tool**: halt/resume, registers, memory, reset, **incremental
+flash** (on-chip CRC-32 diff → write only changed sectors → verify), 64 KiB
+block erase, NOR-aware in-place writes, and flash die identification (JEDEC
+RDID + SFDP over bare SPI1 registers) — one `pip install pyusb` away, in pure
+Python. OpenOCD-class debug + esptool-class flashing + flashrom-class identify,
+without installing any of them.
+
 The ESP32-C3/C5/C6/H2 expose a USB-Serial/**JTAG** peripheral on their native USB
 (`303a:1001`). `espjtag` speaks the Espressif `esp_usb_jtag` USB protocol directly
-(via [pyusb]) and drives the RISC-V Debug Module — so you can halt the core, read
-and write registers and memory, and reset the chip, all in a few hundred lines of
-Python with no OpenOCD binary, no FTDI adapter, just the USB cable.
+(via [pyusb]) and drives the RISC-V Debug Module.
 
 ## Why
 
@@ -18,7 +40,9 @@ Python with no OpenOCD binary, no FTDI adapter, just the USB cable.
 Espressif OpenOCD build and its config tree. For scripting, CI, or just
 understanding what the silicon does, a small dependency-free Python client is
 handy. `espjtag` is that — it was extracted from a bench tooling project where it
-replaced shelling out to OpenOCD for register/memory access and chip reset.
+replaced shelling out to OpenOCD for register/memory access and chip reset, and
+then out-ran the tools it replaced (the transport story: one USB round-trip per
+batch, OUT-only write streams, full-rate TCK — `docs/ESPJTAG-STORY.md`).
 
 ## Install
 
