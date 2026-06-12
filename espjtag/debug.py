@@ -238,7 +238,12 @@ class EspUsbJtag(EspUsbJtagTransport):
         reqs += [(SBDATA0, 0, DMI_NOP)]                       # flush last DTM read
         reqs += [(SBCS, 0, DMI_READ), (SBCS, 0, DMI_NOP)]     # error check
         reqs += [(SBCS, 0, DMI_WRITE)]                        # clear/disarm SBA
-        res = self._dmi_batch(reqs)
+        # single-word reads ride the memoized one-chunk batch (OUT template
+        # cached per address): ~150 us instead of rebuilding every scan.
+        if nwords == 1:
+            res = self.dmi_batch_cached(("rm1", addr), reqs)
+        else:
+            res = self._dmi_batch(reqs)
         # DTM pipeline: a scan's capture is the PREVIOUS op's result. Word i's
         # READ is issued at slot 2+i, so its data lands in slot 3+i; the SBCS
         # read issued at slot nwords+4 lands in slot nwords+5.
@@ -304,7 +309,7 @@ class EspUsbJtag(EspUsbJtagTransport):
     _ABI_ARG_GPR = (10, 11, 12, 13, 14, 15, 16, 17)        # a0..a7 = x10..x17
 
     def call_function(self, entry, args=(), stack=None, trap=None,
-                      timeout=4000, restore=True):
+                      timeout=4000, restore=True, wait=True):
         """Call on-target code at `entry` with up to 8 integer `args` (placed in
         a0..a7), returning a0. `stack` = an SP value (a scratch SRAM top, grows
         down); `trap` = address of an SRAM word we set to `ebreak` and point ra at,
@@ -355,6 +360,16 @@ class EspUsbJtag(EspUsbJtagTransport):
             if self.dm_read(DMSTATUS) & (DM_ALLRESUMEACK | DM_ALLRUNNING):
                 break
         self.dmi_write(DMCONTROL, DM_DMACTIVE)                 # resumereq <- 0
+        if not wait:
+            return saved          # pipeline ctx: finish with _call_finish(ctx)
+        return self._call_finish(saved, timeout, restore)
+
+    def _call_finish(self, saved, timeout=4000, restore=True):
+        """Second half of call_function: wait for the callee's trap, collect a0,
+        restore the app's registers. Split out so a caller can do useful SBA
+        work (e.g. stage the NEXT flash sector) while the callee runs — SBA is
+        hart-independent; abstract register access is NOT, so between the resume
+        and this call only memory (SBA) operations are legal."""
         halted = False
         for _ in range(timeout):
             if self.dm_read(DMSTATUS) & DM_ALLHALTED:
@@ -409,6 +424,18 @@ class EspUsbJtag(EspUsbJtagTransport):
             raise RuntimeError("call_rom: no scratch SRAM window tabled")
         return self.call_function(rom[sym], args=args, stack=sram["stack"],
                                   trap=sram["trap"], restore=restore)
+
+    def call_rom_begin(self, sym, args=()):
+        """Start a ROM call WITHOUT waiting: returns a ctx for _call_finish.
+        While the callee runs, only SBA memory ops are legal (no abstract
+        register access) — used to stage the next flash sector under the
+        current sector's erase/program time."""
+        c = self._chip()
+        rom, sram = c.get("rom"), c.get("sram")
+        if not rom or sym not in rom:
+            raise RuntimeError(f"call_rom_begin: no ROM symbol {sym!r} tabled")
+        return self.call_function(rom[sym], args=args, stack=sram["stack"],
+                                  trap=sram["trap"], wait=False)
 
     def flash_read_xip(self, off, nwords):
         """Read nwords of flash via the cache-mapped XIP window (chips flash_xip +
@@ -747,6 +774,16 @@ class EspUsbJtag(EspUsbJtagTransport):
                 self.call_rom("cache_enable_icache")
         return out
 
+    def _stage_sector(self, buf, img):
+        """Stage a 4 KiB sector into scratch `buf`. (ROM-tinfl compressed
+        staging was tried for #36 and is UNUSABLE: tinfl_decompress_mem_to_mem
+        puts its ~11 KB decompressor struct ON THE CALLER STACK, blowing through
+        the whole 16 KiB scratch carve-out — measured as a corrupted staging
+        buffer + failed spiflash_write. Staging cost is hidden by pipelined
+        staging instead — see flash_incremental.)"""
+        self.write_mem(buf, [int.from_bytes(img[i:i + 4], "little")
+                             for i in range(0, 0x1000, 4)])
+
     def flash_incremental(self, addr, data, log=None, verify=True, erase="always"):
         """Incrementally program `data` (bytes) to flash byte-offset `addr`: CRC each 4 KiB
         sector ON-CHIP, erase+program ONLY the sectors whose CRC differs from the image,
@@ -815,11 +852,15 @@ class EspUsbJtag(EspUsbJtagTransport):
                          f"({w1 - w0} bytes, no erase)")
                     continue
             self.call_rom("spiflash_unlock")
-            r, _ = self.call_rom("spiflash_erase_sector", args=(sa >> 12,))
+            # PIPELINE: stage the sector over JTAG (SBA, hart-independent)
+            # WHILE the ROM erases it — staging (~35 ms) hides almost entirely
+            # under the erase (24-62 ms per die). The #36 goal (make staging
+            # free) without the ROM inflater's impossible stack demands.
+            ctx = self.call_rom_begin("spiflash_erase_sector", args=(sa >> 12,))
+            self._stage_sector(buf, img)
+            r, _ = self._call_finish(ctx)
             if r:
                 raise RuntimeError(f"flash_incremental: erase sector {sa >> 12} -> {r}")
-            self.write_mem(buf, [int.from_bytes(img[i:i + 4], "little")
-                                 for i in range(0, 0x1000, 4)])
             r, _ = self.call_rom("spiflash_write", args=(sa, buf, 0x1000))
             if r:
                 raise RuntimeError(f"flash_incremental: write @0x{sa:08x} -> {r}")

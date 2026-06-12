@@ -104,6 +104,7 @@ CHIPS = {
             crc32_le=0x40000758,
             spiflash_read_user_cmd=0x40000164,   # (status*, cmd) — RDID via 0x9F
             spiflash_erase_block=0x40000148,     # 64 KiB block erase (faster/byte)
+            tinfl_decompress_mem_to_mem=0x40000104,  # ROM miniz inflate (#36)
         ),
         # Watchdogs to disable while the hart is HALTED, so a WDT can't reset the
         # chip out from under the debugger (the C6 halt-flakiness fix — probe-rs and
@@ -171,6 +172,7 @@ CHIPS = {
             spiflash_config_clk=0x40000188,
             spiflash_read_user_cmd=0x40000174,   # (status*, cmd) — RDID via 0x9F
             spiflash_erase_block=0x40000158,     # 64 KiB block erase (faster/byte)
+            tinfl_decompress_mem_to_mem=0x40000108,  # ROM miniz inflate (#36)
             crc32_le=0x40000778,                 # on-chip CRC-32 for incremental (#34)
         ),
         # Watchdogs to disable while HALTED. The MISSING table here was #33's root

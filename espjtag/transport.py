@@ -18,7 +18,7 @@ import usb.util
 
 from .usbreset import IS_LINUX as _IS_LINUX
 from .constants import (
-    VID, PID, VENDOR_CLASS, CMD_FLUSH, _clk, _bits_to_int,
+    VID, PID, VENDOR_CLASS, CAPS_DESCRIPTOR, CMD_FLUSH, _clk, _bits_to_int,
     IR_DTMCS, IR_DMI, IR_LEN, DMI_NOP, DMI_READ, DMI_WRITE,
 )
 from . import chips
@@ -123,6 +123,8 @@ class EspUsbJtagTransport:
             pass
         self.dev.ctrl_transfer(0x40, 0, div, 0, None)  # VEND_JTAG_SETDIV
         self._nibbles = []
+        self._dmi_read_cache = {}          # address -> packed OUT template
+        self._batch_cache = {}             # key -> (OUT template, cap_bits)
         self.state = self.RESET            # TAP state unknown; reset_tap syncs it
         self.timing = None                 # set to a timing.Timer() to instrument
 
@@ -238,6 +240,7 @@ class EspUsbJtagTransport:
         t = time.perf_counter_ns() if self.timing is not None else 0
         self.ep_out.write(buf)
         self._t("usb_out_write", t)
+        return buf
 
     def _recv(self, want_tdo_bits):
         """Read want_tdo_bits captured TDO bits from the IN endpoint (LSB-first
@@ -344,17 +347,38 @@ class EspUsbJtagTransport:
     def _scan(self, value, nbits, ir=False, capture=False):
         """Shift nbits LSB-first through IR or DR, capturing TDO if requested.
         Leaves the TAP in Update->Idle. Mirrors bitq_scan_field: N-1 bits in
-        Shift with TMS=0, the last bit with TMS=1 (Exit1) — all captured.
+        Shift with TMS=0, the last bit with TMS=1 (Exit1).
         Nibbles are built in bulk (one comprehension, no per-bit method calls —
-        the per-bit path cost ~100 µs of Python per DMI op, #21)."""
+        the per-bit path cost ~100 µs of Python per DMI op, #21).
+
+        `capture` may be a `(lo, hi)` bit range to capture ONLY part of the scan
+        (capture-narrowing): a DMI response only carries data+op in its low 34
+        bits, so capturing 34 of a 44-bit scan packs ~25% more scans into each
+        IN-FIFO chunk = fewer USB round-trips per read burst. Returns the number
+        of bits actually captured."""
         shift = self.SHIFT_IR if ir else self.SHIFT_DR
         self._goto(shift)
-        cap = 4 if capture else 0
-        self._nibbles.extend(cap | ((value >> i) & 1) for i in range(nbits - 1))
-        self._nibbles.append(cap | 2 | ((value >> (nbits - 1)) & 1))  # TMS=1 -> Exit1
+        nib = self._nibbles
+        if capture is False or capture is None:
+            nib.extend(((value >> i) & 1) for i in range(nbits - 1))
+            nib.append(2 | ((value >> (nbits - 1)) & 1))
+            captured = 0
+        elif capture is True:
+            nib.extend(4 | ((value >> i) & 1) for i in range(nbits - 1))
+            nib.append(6 | ((value >> (nbits - 1)) & 1))
+            captured = nbits
+        else:
+            lo, hi = capture
+            nib.extend((4 if lo <= i < hi else 0) | ((value >> i) & 1)
+                       for i in range(nbits - 1))
+            last = nbits - 1
+            nib.append(2 | (4 if lo <= last < hi else 0)
+                       | ((value >> last) & 1))
+            captured = hi - lo
         self.state = self._NEXT[shift][1]            # Exit1-IR/DR
         # return to Idle for the next op.
         self._goto(self.IDLE)
+        return captured
 
     def _idle(self, n):
         """Clock n cycles in Run-Test-Idle (DMI needs `idle` cycles to settle)."""
@@ -387,6 +411,14 @@ class EspUsbJtagTransport:
         total = nbits + self.taps_after + self.taps_before
         self._scan(value << self.taps_after, total, capture=capture)
         return total
+
+    def _scan_dr_resp(self, value, nbits, resp_bits):
+        """DR scan capturing ONLY the low `resp_bits` of the TARGET TAP's field
+        (capture-narrowing — see _scan). Returns the captured bit count; the
+        captured stream contains the field bits directly (no BYPASS skipping)."""
+        total = nbits + self.taps_after + self.taps_before
+        return self._scan(value << self.taps_after, total,
+                          capture=(self.taps_after, self.taps_after + resp_bits))
 
     def _dr_field(self, bits, offset, nbits):
         """Slice the target-TAP field out of a captured DR stream (an int from
@@ -505,28 +537,52 @@ class EspUsbJtagTransport:
         self._ensure_dtmcs()
         width = self.abits + 34
         data = status = -1
+        # FAST PATH: a dmi_read's OUT stream is byte-identical for a given
+        # address (deterministic from the IDLE state), so cache the packed
+        # bytes and skip all scan/RLE/pack Python (~100 µs/op). Only when the
+        # TAP is in the known IDLE state and nothing is queued.
+        cached = self._dmi_read_cache.get(address)
+        if cached is not None and self.state == self.IDLE and not self._nibbles:
+            self._drain_in()
+            t = time.perf_counter_ns() if self.timing is not None else 0
+            self.ep_out.write(cached)
+            self._t("usb_out_write", t)
+            allbits = self._recv(68)                          # 2 narrowed scans
+            out = (allbits >> 34) & 0x3FFFFFFFF
+            data, status = (out >> 2) & 0xFFFFFFFF, out & 0x3
+            if status == 0:
+                return data, status
+            if status == 3:
+                self._dtmcs_dmireset()
+                self.idle += 1
+                self._dmi_read_cache.clear()                  # idle changed
+                self._batch_cache.clear()
         for _ in range(retries):
             self._drain_in()
             self.reset_tap()
             self._scan_ir(IR_DMI)                            # select DMI once
             rd = (address << 34) | (DMI_READ & 0x3)
-            t1 = self._scan_dr(rd, width, capture=True)      # issue read
+            t1 = self._scan_dr_resp(rd, width, 34)           # issue read
             self._idle(max(self.idle, 1))
             nop = (0 << 34) | (DMI_NOP & 0x3)
-            t2 = self._scan_dr(nop, width, capture=True)     # collect result
+            t2 = self._scan_dr_resp(nop, width, 34)          # collect result
             self._idle(max(self.idle, 1))
-            self._send()
-            # Both scans' captures come back concatenated, in order: the first
-            # `t1` bits are the READ-phase, the next `t2` are the NOP-phase
-            # (= the data for `address`). Slice each TAP field out (skipping the
-            # leading BYPASS bits on multi-TAP chains). Read all at once.
+            sent = self._send()
+            # Both scans' narrowed captures come back concatenated: first t1=34
+            # bits are the READ-phase response, next t2=34 the NOP-phase (= the
+            # data for `address`), already BYPASS-free. Read all at once.
             allbits = self._recv(t1 + t2)
-            out = self._dr_field(allbits, t1, width)          # nop-phase field
+            out = (allbits >> t1) & 0x3FFFFFFFF               # nop-phase field
             data, status = (out >> 2) & 0xFFFFFFFF, out & 0x3
             if status == 0:
+                # The OUT bytes started with a full TAP-reset walk, so they are
+                # state-independent — cache them for the fast path.
+                self._dmi_read_cache[address] = sent
                 return data, status
             if status == 3:                                   # busy -> more idle
                 self._dtmcs_dmireset()
+                self._dmi_read_cache.clear()                  # idle changed
+                self._batch_cache.clear()
                 self.idle += 1
         raise RuntimeError(
             f"dmi_read 0x{address:x} did not succeed (last op-status {status}) "
@@ -578,23 +634,65 @@ class EspUsbJtagTransport:
             self._send()
             bits = self._recv(cap_bits)
             for idx, off in pending:
-                out = self._dr_field(bits, off, width)
+                # capture-narrowed stream: each scan contributed exactly its
+                # 34-bit data+op response, already BYPASS-free.
+                out = (bits >> off) & 0x3FFFFFFFF
                 results[idx] = ((out >> 2) & 0xFFFFFFFF, out & 0x3)
             pending = []
             cap_bits = 0
 
         for idx, (address, data, op) in enumerate(reqs):
             word = (address << 34) | ((data & 0xFFFFFFFF) << 2) | (op & 0x3)
-            total = self._scan_dr(word, width, capture=True)   # queue DR only
+            # capture-narrowed: only the 34 response bits (data+op) come back,
+            # so ~25% more scans fit per IN-FIFO chunk = fewer round-trips.
+            got = self._scan_dr_resp(word, width, 34)
             self._idle(max(self.idle, 1))                       # settle (not captured)
             pending.append((idx, cap_bits))
-            cap_bits += total
+            cap_bits += got
             # Flush BEFORE the next scan would push captured bits over the limit,
             # so the device's IN FIFO never back-pressures the OUT endpoint.
-            if cap_bits + width + self.taps_after + self.taps_before \
-                    > self.FIFO_CHUNK_BITS:
+            if cap_bits + 34 > self.FIFO_CHUNK_BITS:
                 flush()
         flush()
+        return results
+
+    def dmi_batch_cached(self, key, reqs):
+        """_dmi_batch for SMALL request lists (one IN-FIFO chunk) with OUT-
+        template memoization: the byte stream for a fixed `reqs` shape is
+        deterministic (it opens with a full TAP-reset walk), so repeat calls
+        skip every scan/RLE/pack step — one ep write + one read. This is what
+        makes single-word read_mem probe-rs-fast. Falls back to _dmi_batch when
+        the captures wouldn't fit one chunk. Cache key must uniquely describe
+        `reqs`; caches are cleared whenever the DTM idle hint changes."""
+        if 34 * len(reqs) > self.FIFO_CHUNK_BITS:
+            return self._dmi_batch(reqs)
+        cached = self._batch_cache.get(key)
+        if cached is not None and not self._nibbles:
+            buf, cap_bits = cached
+            self._drain_in()
+            t = time.perf_counter_ns() if self.timing is not None else 0
+            self.ep_out.write(buf)
+            self._t("usb_out_write", t)
+            bits = self._recv(cap_bits)
+            self.state = self.IDLE                        # template ends in Idle
+            return [(((bits >> (34 * i)) >> 2) & 0xFFFFFFFF, (bits >> (34 * i)) & 0x3)
+                    for i in range(len(reqs))]
+        self._ensure_dtmcs()
+        width = self.abits + 34
+        self._drain_in()
+        self.reset_tap()
+        self._scan_ir(IR_DMI)
+        cap_bits = 0
+        for address, data, op in reqs:
+            word = (address << 34) | ((data & 0xFFFFFFFF) << 2) | (op & 0x3)
+            cap_bits += self._scan_dr_resp(word, width, 34)
+            self._idle(max(self.idle, 1))
+        sent = self._send()
+        bits = self._recv(cap_bits)
+        results = [(((bits >> (34 * i)) >> 2) & 0xFFFFFFFF, (bits >> (34 * i)) & 0x3)
+                   for i in range(len(reqs))]
+        if all(r[1] == 0 for r in results[1:]):           # don't cache a busy run
+            self._batch_cache[key] = (sent, cap_bits)
         return results
 
     def _dmi_stream_writes(self, reqs):

@@ -85,6 +85,14 @@ class SimulatedFlash(EspUsbJtag):
         return [int.from_bytes(self.flash[addr + 4 * i:addr + 4 * i + 4], "little")
                 for i in range(nwords)]
 
+    # pipelined-call seam: the fake "erase" completes instantly at begin time;
+    # _call_finish just reports success (matches the real begin/finish contract).
+    def call_rom_begin(self, sym, args=()):
+        return self.call_rom(sym, args)
+
+    def _call_finish(self, ctx, timeout=4000, restore=True):
+        return ctx
+
 
 def covered(erases, writes):
     """Every byte of every erased range is inside some written range?"""
