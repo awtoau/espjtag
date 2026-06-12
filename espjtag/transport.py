@@ -625,7 +625,14 @@ class EspUsbJtagTransport:
         FIFO-chunk ping-pong: both directions run at wire speed.
 
         Used for batches whose captures exceed one IN-FIFO chunk; small batches
-        keep the simpler synchronous path."""
+        keep the simpler synchronous path.
+
+        Threading contract (NO reliance on free-threaded/nogil Python): the
+        overlap is real because pyusb's libusb calls release the GIL while
+        blocking; correctness needs no GIL either — the reader exclusively owns
+        its buffer until join() (the happens-before), failures are read only
+        after join, and concurrent sync transfers on two endpoints of one
+        device handle are documented-supported libusb usage."""
         self._ensure_dtmcs()
         width = self.abits + 34
         self._drain_in()
