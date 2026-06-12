@@ -102,8 +102,25 @@ class EspUsbJtagTransport:
                 e.bEndpointAddress) == usb.util.ENDPOINT_IN)
         if not self.ep_out or not self.ep_in:
             raise RuntimeError("esp_usb_jtag: bulk endpoints not found")
-        # A conservative TCK divisor — speed is irrelevant for a few reset writes.
-        self.dev.ctrl_transfer(0x40, 0, 20, 0, None)   # VEND_JTAG_SETDIV
+        # TCK divisor: read the device's caps descriptor and run at its minimum
+        # divider (24 MHz base / div 1 on the C6/C5). The previous hardcoded
+        # div=20 (1.2 MHz!) dated from when espjtag only did reset writes — and
+        # silently TCK-walled every batched op since: a 1024-word write stream
+        # measured 48 ms of pure device clocking at div=20. OpenOCD runs USJ
+        # targets at the same full rate (`adapter speed 40000` clamps to base).
+        # Falls back to div=2 if the caps descriptor is unreadable.
+        div = 2
+        try:
+            caps = bytes(self.dev.ctrl_transfer(0x80, 6, CAPS_DESCRIPTOR, 0, 64))
+            p, ln = 2, caps[1]
+            while p < ln:
+                if caps[p] == 1:                       # speed capability
+                    div = max(1, int.from_bytes(caps[p + 4:p + 6], "little"))
+                    break
+                p += caps[p + 1]
+        except Exception:
+            pass
+        self.dev.ctrl_transfer(0x40, 0, div, 0, None)  # VEND_JTAG_SETDIV
         self._nibbles = []
         self.state = self.RESET            # TAP state unknown; reset_tap syncs it
         self.timing = None                 # set to a timing.Timer() to instrument
@@ -188,13 +205,37 @@ class EspUsbJtagTransport:
             self._validate_ok = 0
 
     def _send(self):
-        """Append CMD_FLUSH, pad to a whole byte, and write the queued OUT nibble
-        stream. Does NOT read IN — call _recv() for captured TDO."""
+        """RLE-compress, append CMD_FLUSH, pad to a whole byte, and write the
+        queued OUT nibble stream. Does NOT read IN — call _recv() for captured
+        TDO.
+
+        RLE (#20): runs of identical CLK nibbles (values 0..7) collapse into the
+        protocol's repeat command — nibble 0xC+digit, digits base-4 LSB-first,
+        max 1023 repetitions per run (probe-rs espusbjtag/protocol.rs is the
+        reference implementation). Repeating a capturing nibble repeats the
+        capture, so the byte accounting is unchanged. RST/FLUSH never compress."""
         self._emit(CMD_FLUSH)
-        if len(self._nibbles) % 2:
-            self._emit(CMD_FLUSH)                       # can't send a half-byte
-        buf = bytes((self._nibbles[i] << 4) | self._nibbles[i + 1]
-                    for i in range(0, len(self._nibbles), 2))
+        nibs = self._nibbles
+        out = []
+        i, n = 0, len(nibs)
+        while i < n:
+            v = nibs[i]
+            out.append(v)
+            if v <= 7:
+                run = 1
+                while run < 1024 and i + run < n and nibs[i + run] == v:
+                    run += 1
+                reps = run - 1
+                while reps > 0:
+                    out.append(0xC + (reps & 3))
+                    reps >>= 2
+                i += run
+            else:
+                i += 1
+        if len(out) % 2:
+            out.append(CMD_FLUSH)                       # can't send a half-byte
+        buf = bytes((out[i] << 4) | out[i + 1]
+                    for i in range(0, len(out), 2))
         self._nibbles = []
         t = time.perf_counter_ns() if self.timing is not None else 0
         self.ep_out.write(buf)
@@ -210,7 +251,21 @@ class EspUsbJtagTransport:
         need = (want_tdo_bits + 7) // 8
         rdlen = ((need + mps - 1) // mps) * mps
         t = time.perf_counter_ns() if self.timing is not None else 0
-        data = self.ep_in.read(rdlen, timeout=1000)
+        # Accumulate until the accounted byte count arrives: while the device is
+        # still CLOCKING a long capture-free OUT stream it answers IN with
+        # zero-length packets, and a single read would take the ZLP as the whole
+        # answer (leaving the real bytes as 'stale' for the next op — found by
+        # drain-validate when the write stream landed). Bounded: the bytes are
+        # guaranteed by the capture accounting; 64 empty reads ≈ 64 s of device
+        # silence = a genuinely wedged device, and raising beats hanging.
+        data = bytearray()
+        for _ in range(64):
+            data += self.ep_in.read(rdlen - (len(data) // mps) * mps, timeout=1000)
+            if len(data) >= need:
+                break
+        else:
+            raise RuntimeError(f"_recv: wanted {need} bytes, got {len(data)} "
+                               "(device stopped producing TDO bytes)")
         self._t("usb_in_read", t)
         bits = []
         for byte in data:
@@ -540,4 +595,39 @@ class EspUsbJtagTransport:
                 flush()
         flush()
         return results
+
+    def _dmi_stream_writes(self, reqs):
+        """OUT-only DMI WRITE stream: no per-scan capture, so no IN bytes and no
+        IN-FIFO chunk limit — one giant OUT burst (bulk-OUT NAK flow control
+        paces us to TCK), then ONE DTMCS read of the STICKY dmistat to learn
+        whether any op in the stream came back busy/error. This is how OpenOCD
+        hits ~27 µs/word on writes: a write scan's TDO only echoes the previous
+        op's response, which the sticky status summarises for free. The capture
+        path (~75 µs/word) spends most of its time in one-USB-round-trip-per-
+        FIFO-chunk; here the whole stream is round-trip-free.
+
+        Returns dmistat (0 = every op accepted). On nonzero the caller MUST
+        treat the WHOLE stream as suspect: DMIRESET has already been issued —
+        redo via the slow per-op path."""
+        self._ensure_dtmcs()
+        width = self.abits + 34
+        self._drain_in()
+        self.reset_tap()
+        self._scan_ir(IR_DMI)
+        for address, data, op in reqs:
+            word = (address << 34) | ((data & 0xFFFFFFFF) << 2) | (op & 0x3)
+            self._scan_dr(word, width, capture=False)
+            self._idle(max(self.idle, 1))
+            if len(self._nibbles) >= 0x8000:            # 16 KiB OUT bursts
+                self._send()
+        self._send()
+        # ONE status read: DTMCS.dmistat [11:10] is sticky across the stream.
+        self.reset_tap()
+        self._scan_ir(IR_DTMCS)
+        total = self._scan_dr(0, 32, capture=True)
+        self._send()
+        dmistat = (self._dr_field(self._recv(total), 0, 32) >> 10) & 0x3
+        if dmistat:
+            self._dtmcs_dmireset()
+        return dmistat
 

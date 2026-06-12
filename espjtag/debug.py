@@ -257,9 +257,9 @@ class EspUsbJtag(EspUsbJtagTransport):
         self._sb_setup(autoincrement=True)               # sbaccess=32, autoincr
         reqs = [(SBADDRESS0, addr & 0xFFFFFFFF, DMI_WRITE)]
         reqs += [(SBDATA0, w & 0xFFFFFFFF, DMI_WRITE) for w in words]
-        res = self._dmi_batch(reqs)
-        # any DTM busy in the burst = a stalled write -> redo slowly, correctly.
-        if any(r is not None and r[1] == 3 for r in res):
+        # OUT-only stream (no capture, no FIFO chunking) + ONE sticky-status read.
+        # sticky dmistat nonzero = some op was dropped -> redo slowly, correctly.
+        if self._dmi_stream_writes(reqs):
             self._sb_setup(autoincrement=True)
             self.dmi_write(SBADDRESS0, addr & 0xFFFFFFFF)
             for w in words:
