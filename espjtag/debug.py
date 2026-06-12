@@ -121,6 +121,40 @@ class EspUsbJtag(EspUsbJtagTransport):
         self.dmi_write(COMMAND, cmd)
         return self._abstract_wait()
 
+    # --- batched register access: one USB stream instead of ~1 ms per access.
+    # Register-transfer abstract commands complete within the DTM-advertised idle
+    # cycles _dmi_batch already inserts per scan (the same trust OpenOCD's batch
+    # path places in dtmcs.idle); any overrun shows up as DTM busy in the batch
+    # statuses or cmderr in the trailing ABSTRACTCS check, and we redo the whole
+    # thing through the slow per-register path — never trust a dirty batch.
+    def write_registers(self, pairs):
+        """Write [(regno, value), ...] in ONE batched DMI stream."""
+        reqs = []
+        for regno, value in pairs:
+            reqs.append((DATA0, value & 0xFFFFFFFF, DMI_WRITE))
+            reqs.append((COMMAND, CMD_ACCESS_REGISTER | AC_AARSIZE32 | AC_TRANSFER
+                         | AC_WRITE | (regno & 0xFFFF), DMI_WRITE))
+        res = self._dmi_batch(reqs)
+        if any(r is not None and r[1] != 0 for r in res) or self._abstract_wait():
+            for regno, value in pairs:
+                self.write_register(regno, value)
+
+    def read_registers(self, regnos):
+        """Read [regno, ...] in ONE batched DMI stream. Per register the stream is
+        [COMMAND=transfer-read, READ(DATA0)]; the DTM read pipeline returns scan
+        k's data in scan k+1's capture, so reg k's value lands in slot 2k+2 (the
+        next COMMAND write / the trailing NOP)."""
+        reqs = []
+        for regno in regnos:
+            reqs.append((COMMAND, CMD_ACCESS_REGISTER | AC_AARSIZE32 | AC_TRANSFER
+                         | (regno & 0xFFFF), DMI_WRITE))
+            reqs.append((DATA0, 0, DMI_READ))
+        reqs.append((DATA0, 0, DMI_NOP))                    # flush the last read
+        res = self._dmi_batch(reqs)
+        if any(r is not None and r[1] != 0 for r in res) or self._abstract_wait():
+            return [self.read_register(r) for r in regnos]
+        return [res[2 * k + 2][0] for k in range(len(regnos))]
+
     # === System Bus Access: memory read/write (no running hart needed) =====
     def _sb_setup(self, size_access=2, autoincrement=False, readondata=False,
                   readonaddr=False):
@@ -255,29 +289,24 @@ class EspUsbJtag(EspUsbJtagTransport):
         the callee did not trap within `timeout` polls (left halted; inspect)."""
         if len(args) > len(self._ABI_ARG_GPR):
             raise ValueError("call_function: at most 8 integer args")
-        # --- save state we're about to clobber ---
-        saved = {}
-        if restore:
-            saved["dpc"] = self.read_register(CSR_DPC)
-            saved["dcsr"] = self.read_register(CSR_DCSR)
-            saved["ra"] = self.read_register(REG_GPR_BASE + 1)
-            saved["sp"] = self.read_register(REG_GPR_BASE + 2)
-            for i in range(len(args)):
-                g = self._ABI_ARG_GPR[i]
-                saved[g] = self.read_register(REG_GPR_BASE + g)
-        # --- ebreak return-trap: write `ebreak` to the trap word, ra -> it ---
+        # --- save state we're about to clobber (ONE batched read stream) ---
+        # dcsr is read regardless: the ebreak-bits decision below needs it.
+        save_regs = [CSR_DPC, CSR_DCSR, REG_GPR_BASE + 1, REG_GPR_BASE + 2]
+        save_regs += [REG_GPR_BASE + self._ABI_ARG_GPR[i] for i in range(len(args))]
+        vals = self.read_registers(save_regs)
+        saved = dict(zip(save_regs, vals)) if restore else {}
+        dcsr = vals[1]
+        # --- ebreak return-trap + args + dpc (ONE batched write stream) ---
         self.write_mem32(trap, EBREAK)
-        self.write_register(REG_GPR_BASE + 1, trap)            # ra = trap
+        wr = [(REG_GPR_BASE + 1, trap)]                        # ra = trap
         if stack is not None:
-            self.write_register(REG_GPR_BASE + 2, stack)       # sp = scratch top
-        for i, a in enumerate(args):
-            self.write_register(REG_GPR_BASE + self._ABI_ARG_GPR[i], a & 0xFFFFFFFF)
-        # --- ensure an ebreak in M/U mode enters debug (don't trap to the app) ---
-        dcsr = self.read_register(CSR_DCSR)
-        if (dcsr | DCSR_EBREAK_BITS) != dcsr:
-            self.write_register(CSR_DCSR, dcsr | DCSR_EBREAK_BITS)
-        # --- jump there: dpc = entry, resume, wait for the trap halt ---
-        self.write_register(CSR_DPC, entry)
+            wr.append((REG_GPR_BASE + 2, stack))               # sp = scratch top
+        wr += [(REG_GPR_BASE + self._ABI_ARG_GPR[i], a & 0xFFFFFFFF)
+               for i, a in enumerate(args)]
+        if (dcsr | DCSR_EBREAK_BITS) != dcsr:                  # ebreak -> debug mode
+            wr.append((CSR_DCSR, dcsr | DCSR_EBREAK_BITS))
+        wr.append((CSR_DPC, entry))                            # jump target
+        self.write_registers(wr)
         # resume handshake (mirrors _resume_go): set resumereq, wait for the hart
         # to ack it is running, THEN clear resumereq — otherwise the request can
         # race and never take. Then poll for the ebreak re-halt.
@@ -294,17 +323,7 @@ class EspUsbJtag(EspUsbJtagTransport):
         ret = self.read_register(REG_GPR_BASE + 10) if halted else None   # a0
         # --- restore the app's registers so resume() continues it cleanly ---
         if restore and halted:
-            for g, v in saved.items():
-                if g == "dpc":
-                    self.write_register(CSR_DPC, v)
-                elif g == "dcsr":
-                    self.write_register(CSR_DCSR, v)
-                elif g == "ra":
-                    self.write_register(REG_GPR_BASE + 1, v)
-                elif g == "sp":
-                    self.write_register(REG_GPR_BASE + 2, v)
-                else:
-                    self.write_register(REG_GPR_BASE + g, v)
+            self.write_registers(list(saved.items()))          # one batched stream
         return ret, halted
 
     # === flash over JTAG — Option A: call the ROM esp_rom_spiflash_* (#3) ========
@@ -523,16 +542,29 @@ class EspUsbJtag(EspUsbJtagTransport):
         4-byte digest crosses JTAG. `size` must fit the scratch headroom (a 4 KiB sector
         does). Matches _crc_host() (same ROM, same _CRC_INIT). Hart halted; the ROM flash
         read path must be ready (flash_init / the gate, as flash_read_rom)."""
+        return self._flash_crc_many([(addr, size)])[0]
+
+    def _flash_crc_many(self, regions):
+        """On-chip CRC-32 of several `(addr, size)` flash regions in one pass.
+        The icache toggle is hoisted around the WHOLE loop (it exists to keep the
+        cache off the SPI1 bus during ROM spiflash_read; crc32_le runs from ROM
+        over SRAM scratch and doesn't care) — per-sector it was 4 ROM calls at
+        ~13 ms of DMI round-trips each, 69% of flash_incremental's wall clock."""
         rom = self._chip().get("rom", {})
         buf = self._chip()["sram"]["data"]
         has_cache = "cache_disable_icache" in rom
+        out = []
         if has_cache:
             self.call_rom("cache_disable_icache")
-        self.call_rom("spiflash_read", args=(addr, buf, size))
-        if has_cache:
-            self.call_rom("cache_enable_icache")
-        crc, _ = self.call_rom("crc32_le", args=(self._CRC_INIT, buf, size))
-        return crc & 0xFFFFFFFF
+        try:
+            for addr, size in regions:
+                self.call_rom("spiflash_read", args=(addr, buf, size))
+                crc, _ = self.call_rom("crc32_le", args=(self._CRC_INIT, buf, size))
+                out.append(crc & 0xFFFFFFFF)
+        finally:
+            if has_cache:
+                self.call_rom("cache_enable_icache")
+        return out
 
     def flash_incremental(self, addr, data, log=None, verify=True):
         """Incrementally program `data` (bytes) to flash byte-offset `addr`: CRC each 4 KiB
@@ -559,9 +591,9 @@ class EspUsbJtag(EspUsbJtagTransport):
         host = self._crc_host()
         buf = self._chip()["sram"]["data"]
         nsec = len(data) // 0x1000
+        crcs = self._flash_crc_many([(addr + s * 0x1000, 0x1000) for s in range(nsec)])
         changed = [s for s in range(nsec)
-                   if self.flash_crc_region(addr + s * 0x1000, 0x1000)
-                   != host(data[s * 0x1000:(s + 1) * 0x1000])]
+                   if crcs[s] != host(data[s * 0x1000:(s + 1) * 0x1000])]
         _log(f"  flash_incremental: {nsec} sectors, {len(changed)} differ "
              f"(digest {self._crc_host_name}) -> programming")
         # INVARIANT: every byte of every erased unit must be re-written. Today diff =
@@ -583,11 +615,12 @@ class EspUsbJtag(EspUsbJtagTransport):
             if r:
                 raise RuntimeError(f"flash_incremental: write @0x{sa:08x} -> {r}")
         verified = 0
-        if verify:
-            for s in changed:
-                sa = addr + s * 0x1000
-                if self.flash_crc_region(sa, 0x1000) != host(data[s * 0x1000:(s + 1) * 0x1000]):
-                    raise RuntimeError(f"flash_incremental: verify FAILED @0x{sa:08x}")
+        if verify and changed:
+            vcrcs = self._flash_crc_many([(addr + s * 0x1000, 0x1000) for s in changed])
+            for s, crc in zip(changed, vcrcs):
+                if crc != host(data[s * 0x1000:(s + 1) * 0x1000]):
+                    raise RuntimeError(
+                        f"flash_incremental: verify FAILED @0x{addr + s * 0x1000:08x}")
                 verified += 1
         _log(f"  flash_incremental: programmed {len(changed)}/{nsec}, verified {verified}")
         return dict(sectors=nsec, changed=len(changed), written=len(changed), verified=verified)

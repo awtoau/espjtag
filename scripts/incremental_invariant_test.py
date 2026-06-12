@@ -54,6 +54,9 @@ class SimulatedFlash(EspUsbJtag):
     def flash_crc_region(self, addr, size):
         return zlib.crc32(bytes(self.flash[addr:addr + size])) & 0xFFFFFFFF
 
+    def _flash_crc_many(self, regions):
+        return [self.flash_crc_region(a, s) for a, s in regions]
+
     def write_mem(self, addr, words):
         self.staged[addr] = b"".join(w.to_bytes(4, "little") for w in words)
 
