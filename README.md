@@ -1,5 +1,3 @@
-<img src="https://awto.au/assets/awto-logo-primary.png" alt="awto.au" width="200">
-
 # espjtag
 
 **One pure-Python tool for the ESP32 built-in USB-JTAG — debug, flash, identify.
