@@ -11,6 +11,8 @@ commit: ../upstream.lock. Provenance + licensing: ../ACKNOWLEDGEMENTS.md.
 """
 
 import itertools
+import queue
+import threading
 import time
 
 import usb.core
@@ -207,10 +209,9 @@ class EspUsbJtagTransport:
             self._validate_every *= 4
             self._validate_ok = 0
 
-    def _send(self):
-        """RLE-compress, append CMD_FLUSH, pad to a whole byte, and write the
-        queued OUT nibble stream. Does NOT read IN — call _recv() for captured
-        TDO.
+    def _pack_out(self):
+        """RLE-compress, append CMD_FLUSH, pad to a whole byte; return the
+        packed OUT bytes and clear the nibble queue (does NOT write).
 
         RLE (#20): runs of identical CLK nibbles (values 0..7) collapse into the
         protocol's repeat command — nibble 0xC+digit, digits base-4 LSB-first,
@@ -237,6 +238,12 @@ class EspUsbJtagTransport:
         buf = bytes((out[i] << 4) | out[i + 1]
                     for i in range(0, len(out), 2))
         self._nibbles = []
+        return buf
+
+    def _send(self):
+        """Pack and write the queued OUT nibble stream. Does NOT read IN — call
+        _recv() for captured TDO."""
+        buf = self._pack_out()
         t = time.perf_counter_ns() if self.timing is not None else 0
         self.ep_out.write(buf)
         self._t("usb_out_write", t)
@@ -609,7 +616,73 @@ class EspUsbJtagTransport:
     # (abits+34 + bypass) bits ~= 41 on the C6, so ~12 scans per chunk.
     FIFO_CHUNK_BITS = 480       # < (IN_BUF_SZ + hw_in_fifo_len - 1)*8 = 536
 
+    def _dmi_batch_async(self, reqs):
+        """The streaming form of _dmi_batch (#19): build the WHOLE batch as one
+        OUT buffer, then a reader thread drains the IN endpoint while the main
+        thread streams OUT. The protocol's own flow control paces everything —
+        the device NAKs OUT whenever its IN buffers fill, and the reader
+        emptying them is what un-NAKs it (this is how OpenOCD streams). No
+        FIFO-chunk ping-pong: both directions run at wire speed.
+
+        Used for batches whose captures exceed one IN-FIFO chunk; small batches
+        keep the simpler synchronous path."""
+        self._ensure_dtmcs()
+        width = self.abits + 34
+        self._drain_in()
+        self.reset_tap()
+        self._scan_ir(IR_DMI)
+        cap_bits = 0
+        for address, data, op in reqs:
+            word = (address << 34) | ((data & 0xFFFFFFFF) << 2) | (op & 0x3)
+            cap_bits += self._scan_dr_resp(word, width, 34)
+            self._idle(max(self.idle, 1))
+        out = self._pack_out()
+        need = (cap_bits + 7) // 8
+        mps = self.ep_in.wMaxPacketSize or 64
+        got = bytearray()
+        fail = []
+
+        def reader():
+            # Reads are bounded by DATA, not iterations: every successful read
+            # makes progress; 25 consecutive empty/timeout reads at 200 ms each
+            # = 5 s of total device silence = wedged, bail (vs hanging forever).
+            empty = 0
+            try:
+                while len(got) < need and empty < 25:
+                    want = min(((need - len(got) + mps - 1) // mps) * mps, 16384)
+                    try:
+                        chunk = self.ep_in.read(want, timeout=200)
+                    except usb.core.USBError:
+                        chunk = b""
+                    if len(chunk):
+                        got.extend(chunk)
+                        empty = 0
+                    else:
+                        empty += 1
+                if len(got) < need:
+                    fail.append(RuntimeError(
+                        f"_dmi_batch_async: device stopped producing TDO "
+                        f"({len(got)}/{need} bytes)"))
+            except Exception as e:                       # noqa: BLE001
+                fail.append(e)
+
+        t = threading.Thread(target=reader, daemon=True)
+        tns = time.perf_counter_ns() if self.timing is not None else 0
+        t.start()
+        for off in range(0, len(out), 16384):
+            self.ep_out.write(out[off:off + 16384])
+        t.join(timeout=10)                # reader self-bounds at ~5 s of silence
+        self._t("usb_async_batch", tns)
+        if t.is_alive() or fail:
+            raise (fail[0] if fail else
+                   RuntimeError("_dmi_batch_async: reader stalled"))
+        bits = int.from_bytes(bytes(got[:need]), "little") & ((1 << cap_bits) - 1)
+        return [(((bits >> (34 * i)) >> 2) & 0xFFFFFFFF, (bits >> (34 * i)) & 0x3)
+                for i in range(len(reqs))]
+
     def _dmi_batch(self, reqs):
+        if 34 * len(reqs) > self.FIFO_CHUNK_BITS:
+            return self._dmi_batch_async(reqs)
         """Issue a list of DMI accesses `[(address, data, op), ...]` with ONE
         IR=DMI select for the whole batch, chunking the OUT/IN at the device's
         IN-FIFO limit. Returns `[(data, op_status), ...]`, one per request, in
@@ -713,13 +786,39 @@ class EspUsbJtagTransport:
         self._drain_in()
         self.reset_tap()
         self._scan_ir(IR_DMI)
+        # PIPELINED: a writer thread ships each packed 16 KiB burst while the
+        # main thread keeps building the next one — the Python encode time
+        # (~6 ms / 1024 words) hides entirely under the USB transfer, putting
+        # the stream at the wire floor (#19's write half).
+        q = queue.Queue(maxsize=4)        # bounded: backpressure on the builder
+        fail = []
+
+        def writer():
+            try:
+                while True:
+                    b = q.get()           # blocking get releases the GIL
+                    if b is None:
+                        return
+                    self.ep_out.write(b)
+            except Exception as e:                       # noqa: BLE001
+                fail.append(e)
+
+        wt = threading.Thread(target=writer, daemon=True)
+        wt.start()
         for address, data, op in reqs:
             word = (address << 34) | ((data & 0xFFFFFFFF) << 2) | (op & 0x3)
             self._scan_dr(word, width, capture=False)
             self._idle(max(self.idle, 1))
-            if len(self._nibbles) >= 0x8000:            # 16 KiB OUT bursts
-                self._send()
-        self._send()
+            if len(self._nibbles) >= 0x2000:            # ~4 KiB packed bursts:
+                # small enough that build/send overlap from the first burst,
+                # big enough that per-URB overhead stays negligible
+                q.put(self._pack_out())
+        q.put(self._pack_out())
+        q.put(None)
+        wt.join(timeout=10)               # OUT only NAK-pauses; 10 s = wedged device
+        if wt.is_alive() or fail:
+            raise (fail[0] if fail else
+                   RuntimeError("_dmi_stream_writes: writer stalled"))
         # ONE status read: DTMCS.dmistat [11:10] is sticky across the stream.
         self.reset_tap()
         self._scan_ir(IR_DTMCS)
