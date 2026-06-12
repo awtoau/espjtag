@@ -43,6 +43,7 @@ SEC = 0x1000
 ADDR = 0x300000
 ESPTOOL_CHIP = {"C6": "esp32c6", "C5": "esp32c5"}
 OOCD = "/home/dan/.espressif/tools/openocd-esp32/v0.12.0-esp32-20251215/openocd-esp32"
+FORK_ESPTOOL = "/home/dan/git/esptool-fork/.venv/bin/esptool"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB = os.path.join(ROOT, "tmp", "flash-bench.db")
 GRAPH = os.path.join(ROOT, "docs", "images", "flash-progression.png")
@@ -256,13 +257,18 @@ def external_cmd(name, usb_path, tty, chip, addr):
     if name.startswith("esptool"):
         if not tty:
             return None, "skip (no tty)"
-        cmd = ["esptool", "--chip", ESPTOOL_CHIP.get(chip, "auto"), "--port", tty,
+        # -dev = the fork's device-diff (no old image file): feat/diff-with-device
+        # in ~/git/esptool-fork, own venv so the stock rows stay stock esptool.
+        binary = (f"{FORK_ESPTOOL}" if name == "esptool-incr-dev" else "esptool")
+        cmd = [binary, "--chip", ESPTOOL_CHIP.get(chip, "auto"), "--port", tty,
                "--before", "default_reset", "--after", "hard_reset", "write_flash"]
         if name == "esptool-nocomp":
             cmd += ["--no-compress"]
         cmd += [hex(addr), "{B}"]
         if name == "esptool-incr":                 # serial incremental: diff vs old image
             cmd += ["--diff-with", "{A}"]
+        elif name == "esptool-incr-dev":           # serial incremental: on-chip MD5 diff
+            cmd += ["--diff-with", "device"]
         return cmd, ""
     if name == "openocd-full":
         if not os.path.exists(f"{OOCD}/bin/openocd"):
