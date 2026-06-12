@@ -31,6 +31,15 @@ INS_RSR_DDR_A3 = 0x036830     # RSR  a3, DDR   (DDR special reg -> a3)
 INS_WSR_DDR_A3 = 0x136830     # WSR  a3, DDR   (a3 -> DDR)
 INS_LDDR32P_A3 = 0x0073E0     # LDDR32.P a3    (mem[a3] -> DDR, a3 += 4)
 INS_SDDR32P_A3 = 0x0073F0     # SDDR32.P a3    (DDR -> mem[a3], a3 += 4)
+# Cache ops (RRI8 with a3 base, imm8=0; encodings from OpenOCD XT_INS_* macros).
+# We write CODE (the BREAK trap, the bridge stub) through the DATA path, but the
+# core FETCHES through the icache — so after writing code we must flush dcache to
+# memory (DHWB) then invalidate icache (IHI) + ISYNC, or the core fetches stale
+# bytes and runs away instead of hitting the trap. THIS is what made every ROM
+# call fail (#29) until 2026-06-12 — exactly OpenOCD's post-write cache handling.
+INS_DHWB_A3 = 0x007342        # DHWB  a3, 0    (data-cache hit writeback)
+INS_IHI_A3 = 0x0073E2         # IHI   a3, 0    (instruction-cache hit invalidate)
+INS_ISYNC = 0x002000          # ISYNC          (pipeline sync after icache change)
 # call_function — ported from OpenOCD xtensa_start_algorithm (xtensa.c:2810). The S3
 # (LX7) debug level is 6: the debug-mode PC/PS live in EPC6 (sr 0xb6) / EPS6 (sr
 # 0xc6). RFDO returns-from-debug (resumes execution at EPC6). a-regs set/read via DDR.
@@ -226,7 +235,7 @@ class XtensaXDM:
         saved_ar = {n: self._get_ar(n) for n in range(8)}
         saved_epc = self._get_sr_a3(INS_RSR_EPC6_A3)
         saved_eps = self._get_sr_a3(INS_RSR_EPS6_A3)
-        self.write_mem(trap, [INS_BREAK])                       # return trap
+        self.write_code(trap, [INS_BREAK])                      # return trap (fetchable)
         # special regs first (they use a3 as scratch), then the arg regs LAST so a3
         # (which may hold an arg) isn't clobbered before the resume.
         self._set_sr_a3(INS_WSR_EPS6_A3, (saved_eps & ~0xF) | (DEBUGLEVEL - 1))
@@ -236,6 +245,7 @@ class XtensaXDM:
             self._set_ar(1, stack)                              # a1 = sp
         for i, a in enumerate(args):
             self._set_ar(2 + i, a)                              # a2.. = args
+        self.nar_write(DCRCLR, OCDDCR_DEBUGINTERRUPT)           # de-assert halt req
         self.nar_write(DIR0EXEC, INS_RFDO)                      # resume at EPC6
         halted = False
         for _ in range(timeout):
@@ -290,8 +300,8 @@ class XtensaXDM:
         saved_ws = self._get_sr_a3(INS_RSR_WS_A3)
         saved_vb = self._get_sr_a3(INS_RSR_VECBASE_A3)
         saved_ars = self._save_all_ars()                       # leaves WindowBase = saved_wb
-        self.write_mem(bridge, BRIDGE_STUB)                    # stage the CALL0 bridge
-        self.write_mem(trap, [INS_BREAK])                      # return trap
+        self.write_code(bridge, BRIDGE_STUB)                   # stage CALL0 bridge (fetchable)
+        self.write_code(trap, [INS_BREAK])                    # return trap (fetchable)
         # a valid parent-SP link below the SP so a window overflow of the stub frame
         # can spill (the ABI base-save area at [sp-12] = parent SP).
         if stack is not None:
@@ -408,6 +418,25 @@ class XtensaXDM:
 
     def write_mem32(self, addr, value):
         self.write_mem(addr, [value])
+
+    def write_code(self, addr, words):
+        """write_mem + make it FETCHABLE: flush dcache (DHWB) to memory then
+        invalidate icache (IHI) + ISYNC over the written range, so the core
+        fetches the new instructions and not stale cache. MUST be used for any
+        memory the core will execute (the call trap, the bridge stub) — see the
+        INS_DHWB/IHI note. Cache line is 32 B on the S3; DHWB/IHI imm8 is a
+        byte offset 0..1020, so one (a3=line) per 32 B covers any code we stage.
+        a3 is saved/restored. Core must be halted."""
+        self.write_mem(addr, words)
+        nbytes = len(words) * 4
+        sa3 = self._save_a3()
+        for off in range(0, nbytes, 32):              # 32 B icache line
+            self.nar_write(DDR, addr + off)
+            self.nar_write(DIR0EXEC, INS_RSR_DDR_A3)    # a3 = addr+off
+            self.nar_write(DIR0EXEC, INS_DHWB_A3)       # dcache writeback
+            self.nar_write(DIR0EXEC, INS_IHI_A3)        # icache invalidate
+        self.nar_write(DIR0EXEC, INS_ISYNC)             # pipeline sync
+        self._restore_a3(sa3)
 
     # === flash over JTAG — call the ROM esp_rom_spiflash_* (#29, mirrors debug.py) ===
     # Same Option-A approach as the RISC-V path (debug.EspUsbJtag.flash_*): build on
