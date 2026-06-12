@@ -39,6 +39,7 @@ step() {  # step <name> <cmd...>
 }
 
 step "invariant (hw-free)"  $PY scripts/incremental_invariant_test.py
+step "tcl-drift (hw-free)"  $PY scripts/verify_chips_vs_tcl.py
 step "selftest+dmireset C6" $PY scripts/validate_dmireset.py --usb-path "$C6_USB"
 step "selftest+dmireset C5" $PY scripts/validate_dmireset.py --usb-path "$C5_USB"
 step "xcheck 3-way dump C6" $PY scripts/xcheck.py --usb "$C6_USB" --serial "$C6_MAC"
