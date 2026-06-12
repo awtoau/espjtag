@@ -18,7 +18,7 @@ An [awto.au](https://awto.au) project.
 
 | flash a 64 KiB A→B update (2 sectors changed) | wall clock |
 |---|---|
-| **espjtag incremental** (on-chip CRC diff, verify included) | **~370 ms** |
+| **espjtag incremental** (resident RAM stub, on-chip CRC diff, verify included) | **~280 ms** |
 | esptool incremental (serial, device-diff fork) | ~560 ms |
 | esptool full (serial) | ~1.1 s |
 | OpenOCD / probe-rs full (JTAG) | 1.7–1.9 s |
