@@ -93,7 +93,8 @@ python -m espjtag --selftest      # verify the JTAG stack (C6)
 | `reset_run()` — ndmreset, reboot a running core | ✅ |
 | Boot a chip out of post-flash ROM download (`reset_run_from_rom()`) | ⚠️ Linux: needs bench re-verify after the cross-platform refactor ([#13](docs/CROSS-PLATFORM-USB.md)); macOS no-op |
 | Cross-platform USB reset (Win/Linux/mac) | ✅ pyusb `dev.reset()` — see [docs/CROSS-PLATFORM-USB.md](docs/CROSS-PLATFORM-USB.md) |
-| Flash programming over JTAG | 🚧 roadmap (ROM `esp_rom_spiflash_*` call) |
+| Flash programming over JTAG (full + **incremental**, block erase, in-place writes, pipelined staging) | ✅ fastest flasher on our bench (~370 ms for a 64 KiB 2-sector update, verify incl.) |
+| Flash die identify (JEDEC RDID + SFDP via SPI1 registers) | ✅ `python -m espjtag <usb> --info` |
 
 ## MCP server (debug from an AI client)
 
