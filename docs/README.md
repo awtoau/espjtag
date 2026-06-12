@@ -67,6 +67,7 @@ that align to them.
 | [INCREMENTAL-FLASH-DESIGN.md](INCREMENTAL-FLASH-DESIGN.md) | Incremental-flash engine design + prior-art survey (esptool/probe-rs/ST/pyOCD/SEGGER) | [#3](https://github.com/awtoau/espjtag/issues/3) |
 | [CUBEPROGRAMMER-BUGS.md](CUBEPROGRAMMER-BUGS.md) | Two CubeProgrammer `incremental` bugs found on bench (additive-sum skip; two-probe SIGSEGV) | — |
 | [PYOCD-INCREMENTAL-PROOF.md](PYOCD-INCREMENTAL-PROOF.md) | Silicon proof: pyOCD default incremental is correct on ST-Link (catches ST's sum-collision). Its `fast_program` data-loss bug: stub only — pursued outside this repo (full analysis in git history @ bcd8a2d) | — |
+| [EQUIVALENCE-AND-BENCHMARKS.md](EQUIVALENCE-AND-BENCHMARKS.md) | **Session snapshot**: 3-way equivalence (espjtag=OpenOCD=probe-rs on every board) + transport/flash benchmarks (espjtag leads bulk reads, fastest flasher 256 ms) | [#8](https://github.com/awtoau/espjtag/issues/8) |
 | [FLASH-DIE-SURVEY.md](FLASH-DIE-SURVEY.md) | Fleet flash dies (4 vendors!) + measured per-vendor erase/program timings (2.6× erase spread = the cross-board bench variance) + how chips discover memories (RDID/SFDP/IDF drivers/ROM geometry) | — |
 
 > The firmware/bench side of this story — the fleet, per-chip flashing, and *why*
