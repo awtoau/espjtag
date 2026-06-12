@@ -71,11 +71,14 @@ def esptool_s3(name, tty, chip, addr, A, B):
             paths[k] = f.name
 
     def flash(binary_, src, diff=None):
+        # --diff-with goes AFTER the positional addr+file: its OptionEatAll
+        # greedily eats following args, so placing it before the address makes
+        # esptool consume 0x300000 as the diff target (the matrix S3 bug).
         cmd = [binary_, "--chip", "esp32s3", "--port", tty, "--before",
-               "default_reset", "--after", "hard_reset", "write_flash"]
+               "default-reset", "--after", "hard-reset", "write-flash",
+               hex(addr), src]
         if diff:
             cmd += ["--diff-with", diff]
-        cmd += [hex(addr), src]
         return subprocess.run(cmd, capture_output=True, text=True, timeout=240)
 
     try:
@@ -134,7 +137,7 @@ def main():
                     for _retry in range(3):
                         try:
                             if chip == "S3":
-                                el, ok, note = esptool_s3(name, tty, chip, args.addr, A, B)
+                                el, ok, note = esptool_s3(f, tty, chip, args.addr, A, B)
                             else:
                                 el, ok, note = run_flasher(f, usb, tty, chip, args.addr, A, B)
                         except Exception as e:             # noqa: BLE001
