@@ -162,7 +162,34 @@ CHIPS = {
             spiflash_unlock=0x40000164,
             spiflash_config_param=0x40000170,
             spi_flash_attach=0x400001F0,
+            # readmode/clk reconfig (esp32c5.rom.ld) — the running app leaves SPI1
+            # in a fast/quad read mode that attach+config_param does NOT reset; the
+            # legacy ROM read then returns deterministic garbage (#33 repro).
+            spiflash_config_readmode=0x4000018C,  # arg: 5 = ESP_ROM_SPIFLASH_SLOWRD
+            spiflash_config_clk=0x40000188,
             crc32_le=0x40000778,                 # on-chip CRC-32 for incremental (#34)
+        ),
+        # Watchdogs to disable while HALTED. The MISSING table here was #33's root
+        # cause — the halted app stops feeding its WDTs and a WDT (incl. the
+        # super-WDT) hard-resets the chip mid-session: gate "garbage" reads,
+        # call_rom halted=False with dcsr.cause=5 (reset-halt), dmstatus
+        # flakiness. VERBATIM from openocd-esp32 target/esp32c5.cfg
+        # esp32c5_wdt_disable (NOT derived from headers — a first attempt from
+        # lp_wdt_reg.h used the bit-18 auto-feed for SWD and missed TG1; the
+        # super-WDT kept firing. On the C5, SWD_CONFIG bit 30 is SWD_DISABLE).
+        wdt=dict(
+            key=0x50D83AA1,
+            disable=[
+                (0x60008064, 0x60008048, 0x00000000),   # TG0 WDT
+                (0x60009064, 0x60009048, 0x00000000),   # TG1 WDT
+                (0x600B1C18, 0x600B1C00, 0x00000000),   # LP_WDT_RTC
+                (0x600B1C20, 0x600B1C1C, 0x40000000),   # LP_WDT_SWD: SWD_DISABLE (bit 30)
+            ],
+            int_clear=[
+                (0x6000807C, 0x00000004),                # TG0 wdt int state (bit 2)
+                (0x6000907C, 0x00000004),                # TG1 wdt int state (bit 2)
+                (0x600B1C30, 0xC0000000),                # LP_WDT_RTC + SWD int state
+            ],
         ),
         # scratch at the top of C5 IRAM (SOC_IRAM 0x40800000..0x40860000, soc.h).
         sram=dict(

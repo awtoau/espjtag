@@ -23,7 +23,7 @@ from .constants import (
     DM_ANYRUNNING, DM_ALLRESUMEACK, DM_ALLUNAVAIL,
     ABS_BUSY, ABS_CMDERR,
     CMD_ACCESS_REGISTER, AC_TRANSFER, AC_WRITE, AC_AARSIZE32, AC_POSTEXEC,
-    CSR_DCSR, CSR_DPC, REG_GPR_BASE, PROGBUF0,
+    CSR_DCSR, CSR_DPC, CSR_MSTATUS, MSTATUS_MIE, REG_GPR_BASE, PROGBUF0,
     DCSR_EBREAK_BITS, EBREAK,
 )
 from . import chips
@@ -108,10 +108,15 @@ class EspUsbJtag(EspUsbJtagTransport):
 
     def read_register(self, regno):
         """Read a hart register (GPR x1.. = 0x1000+n, CSR = its csr number).
-        The hart must be halted."""
+        The hart must be halted. RAISES on an abstract-command error — returning
+        stale DATA0 as if it were the register poisoned everything downstream
+        when a hart was unexpectedly running (#33 diagnosis)."""
         cmd = (CMD_ACCESS_REGISTER | AC_AARSIZE32 | AC_TRANSFER | (regno & 0xFFFF))
         self.dmi_write(COMMAND, cmd)
-        self._abstract_wait()
+        err = self._abstract_wait()
+        if err:
+            raise RuntimeError(f"read_register 0x{regno:x}: abstract cmderr={err} "
+                               "(hart running? unsupported reg?)")
         return self.dm_read(DATA0)
 
     def write_register(self, regno, value):
@@ -119,7 +124,11 @@ class EspUsbJtag(EspUsbJtagTransport):
         cmd = (CMD_ACCESS_REGISTER | AC_AARSIZE32 | AC_TRANSFER | AC_WRITE
                | (regno & 0xFFFF))
         self.dmi_write(COMMAND, cmd)
-        return self._abstract_wait()
+        err = self._abstract_wait()
+        if err:
+            raise RuntimeError(f"write_register 0x{regno:x}: abstract cmderr={err} "
+                               "(hart running? unsupported reg?)")
+        return err
 
     # --- batched register access: one USB stream instead of ~1 ms per access.
     # Register-transfer abstract commands complete within the DTM-advertised idle
@@ -290,12 +299,13 @@ class EspUsbJtag(EspUsbJtagTransport):
         if len(args) > len(self._ABI_ARG_GPR):
             raise ValueError("call_function: at most 8 integer args")
         # --- save state we're about to clobber (ONE batched read stream) ---
-        # dcsr is read regardless: the ebreak-bits decision below needs it.
-        save_regs = [CSR_DPC, CSR_DCSR, REG_GPR_BASE + 1, REG_GPR_BASE + 2]
+        # dcsr/mstatus are read regardless: the setup decisions below need them.
+        save_regs = [CSR_DPC, CSR_DCSR, CSR_MSTATUS,
+                     REG_GPR_BASE + 1, REG_GPR_BASE + 2]
         save_regs += [REG_GPR_BASE + self._ABI_ARG_GPR[i] for i in range(len(args))]
         vals = self.read_registers(save_regs)
         saved = dict(zip(save_regs, vals)) if restore else {}
-        dcsr = vals[1]
+        dcsr, mstatus = vals[1], vals[2]
         # --- ebreak return-trap + args + dpc (ONE batched write stream) ---
         self.write_mem32(trap, EBREAK)
         wr = [(REG_GPR_BASE + 1, trap)]                        # ra = trap
@@ -303,8 +313,21 @@ class EspUsbJtag(EspUsbJtagTransport):
             wr.append((REG_GPR_BASE + 2, stack))               # sp = scratch top
         wr += [(REG_GPR_BASE + self._ABI_ARG_GPR[i], a & 0xFFFFFFFF)
                for i, a in enumerate(args)]
-        if (dcsr | DCSR_EBREAK_BITS) != dcsr:                  # ebreak -> debug mode
-            wr.append((CSR_DCSR, dcsr | DCSR_EBREAK_BITS))
+        # ebreak -> debug mode, AND force prv=3: dcsr.prv is the privilege the hart
+        # RESUMES into. If the app was halted in U-mode (dcsr.prv=0 — e.g. a Zephyr
+        # user thread), the ROM callee would run unprivileged and fault/reset the
+        # chip on the spot (#33 cycle-deterministic failure, dcsr.cause=5). The
+        # saved dcsr restores the app's own privilege afterwards.
+        want_dcsr = dcsr | DCSR_EBREAK_BITS | 0x3
+        if want_dcsr != dcsr:
+            wr.append((CSR_DCSR, want_dcsr))
+        # MASK INTERRUPTS for the callee (what OpenOCD/probe-rs do for algorithm
+        # runs): once the app is past early boot, a pending timer/radio interrupt
+        # otherwise hijacks the resume at the first instruction — the callee never
+        # runs, the trap never fires, the hart is left running (#33 on the C5).
+        # The saved mstatus restores the app's interrupt state afterwards.
+        if mstatus & MSTATUS_MIE:
+            wr.append((CSR_MSTATUS, mstatus & ~MSTATUS_MIE))
         wr.append((CSR_DPC, entry))                            # jump target
         self.write_registers(wr)
         # resume handshake (mirrors _resume_go): set resumereq, wait for the hart
@@ -320,9 +343,24 @@ class EspUsbJtag(EspUsbJtagTransport):
             if self.dm_read(DMSTATUS) & DM_ALLHALTED:
                 halted = True
                 break
-        ret = self.read_register(REG_GPR_BASE + 10) if halted else None   # a0
+        if not halted:
+            # The callee never trapped (e.g. ROM spiflash_* spinning on a wedged
+            # SPI1 when the app was halted mid-flash-IO — #33). Previously we left
+            # the hart RUNNING the stuck callee, which poisoned every subsequent
+            # abstract command in the session. Re-halt, restore the app's
+            # registers, and fail CLEANLY so the caller can attempt recovery
+            # (flash_init re-attaches the controller).
+            self.dmi_write(DMCONTROL, DM_HALTREQ | DM_DMACTIVE)
+            for _ in range(256):
+                if self.dm_read(DMSTATUS) & DM_ALLHALTED:
+                    break
+            self.dmi_write(DMCONTROL, DM_DMACTIVE)
+            if restore and (self.dm_read(DMSTATUS) & DM_ALLHALTED):
+                self.write_registers(list(saved.items()))
+            return None, False
+        ret = self.read_register(REG_GPR_BASE + 10)                       # a0
         # --- restore the app's registers so resume() continues it cleanly ---
-        if restore and halted:
+        if restore:
             self.write_registers(list(saved.items()))          # one batched stream
         return ret, halted
 
@@ -395,13 +433,36 @@ class EspUsbJtag(EspUsbJtagTransport):
         rom = self._chip().get("rom", {})
         if "spiflash_config_param" not in rom:
             raise RuntimeError("flash_init: spiflash_config_param not tabled for this chip")
-        # attach first — sets the legacy funcs' dummy cycles/read mode (without it the
+        # clk first when tabled — empirically REQUIRED on the C5 when the app was
+        # halted mid-flash-IO: attach+config_param alone left the gate failing in
+        # 4/5 repro hits; config_clk(div=1) + attach + param recovered every one
+        # (#33, scripts/c5_rom_read_repro.py bisect).
+        if "spiflash_config_clk" in rom:
+            self.call_rom("spiflash_config_clk", args=(1, 1))
+        # attach — sets the legacy funcs' dummy cycles/read mode (without it the
         # ROM read returns garbage on a running app). ishspi=0 (default GPIO), legacy=0.
         if "spi_flash_attach" in rom:
             self.call_rom("spi_flash_attach", args=(0, 0))
         r, _ = self.call_rom("spiflash_config_param",
                              args=(0, chip_size, 0x10000, 0x1000, 0x100, 0xFFFF))
         return r
+
+    def _ensure_flash_ready(self, _log, who, attempts=3):
+        """Gate + recovery ladder: re-run flash_init (clk + attach + config_param)
+        up to `attempts-1` times. Bench-measured on a C5 with a live flash-IO app
+        (#33, c5_rom_read_repro 30-cycle soak): 18/18 gate failures recovered, 14
+        on the first flash_init and 4 needing a second — one retry is not enough.
+        Returns the final (ready, rom_words, magic)."""
+        ready, rw, xw = self._rom_flash_ready()
+        can_init = "spiflash_config_param" in self._chip().get("rom", {})
+        for attempt in range(attempts - 1):
+            if ready or not can_init:
+                break
+            _log(f"  {who}: gate failed — flash_init recovery "
+                 f"(attempt {attempt + 1}/{attempts - 1})")
+            self.flash_init()
+            ready, rw, xw = self._rom_flash_ready()
+        return ready, rw, xw
 
     def _rom_flash_ready(self, nwords=4):
         """SAFETY GATE for any ROM erase/program. Read flash offset 0 via the ROM
@@ -454,19 +515,15 @@ class EspUsbJtag(EspUsbJtagTransport):
                 log(m)
         if len(data) % 4 or addr % 4:
             raise ValueError("flash_write: addr and len(data) must be 4-byte aligned")
-        ready, rw, xw = self._rom_flash_ready()
-        if not ready and "spiflash_config_param" in self._chip().get("rom", {}):
-            _log("  flash_write: gate failed cold — running flash_init (config_param)")
-            self.flash_init()                       # repopulate ROM geometry, retry
-            ready, rw, xw = self._rom_flash_ready()
+        ready, rw, xw = self._ensure_flash_ready(_log, "flash_write")
         if not ready:
             raise RuntimeError(
                 "flash_write: ROM spiflash read-back self-test FAILED — the legacy "
                 "ROM flash read path is not configured on this target (ROM read "
                 f"{rw}, first-byte magic {xw}, want 0xE9). Refusing to erase/program "
-                "(brick risk). flash_init runs spi_flash_attach + config_param; if "
-                "the magic is still wrong this chip/revision needs more (config_clk/"
-                "readmode or an ECO workaround — see #33), or flash it with esptool.")
+                "(brick risk). flash_init (clk+attach+config_param) was retried; if "
+                "the magic is still wrong this chip/revision needs an ECO workaround "
+                "(see #33), or flash it with esptool.")
         c = self._chip()
         sram = c["sram"]
         buf = sram["data"]
@@ -588,11 +645,7 @@ class EspUsbJtag(EspUsbJtagTransport):
             raise ValueError("flash_incremental: addr must be 4 KiB-aligned")
         if len(data) % 0x1000:
             data = data + b"\xFF" * (0x1000 - len(data) % 0x1000)
-        ready, rw, xw = self._rom_flash_ready()
-        if not ready and "spiflash_config_param" in self._chip().get("rom", {}):
-            _log("  flash_incremental: gate cold — flash_init()")
-            self.flash_init()
-            ready, rw, xw = self._rom_flash_ready()
+        ready, rw, xw = self._ensure_flash_ready(_log, "flash_incremental")
         if not ready:
             raise RuntimeError("flash_incremental: ROM flash read self-test FAILED — "
                                "refusing to erase/program (brick risk)")

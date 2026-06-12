@@ -84,6 +84,8 @@ AC_POSTEXEC = 1 << 18
 # CSR numbers
 CSR_DCSR = 0x7B0
 CSR_DPC = 0x7B1
+CSR_MSTATUS = 0x300
+MSTATUS_MIE = 1 << 3      # global M-mode interrupt enable
 # GPR register index in abstract-command regno space (0x1000 + gpr)
 REG_GPR_BASE = 0x1000
 
