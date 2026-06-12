@@ -1082,6 +1082,13 @@ def selftest(usb_path=None, rounds=3):
         ic = j.read_idcode()
         dt = j.read_dtmcs()
         ds, st = j.dmi_read(DMSTATUS)
+        if (ds & 0xF) == 0:
+            # dmstatus reads as all-zero (version=0) until something sets
+            # dmcontrol.dmactive after a chip reset — the long-standing C5
+            # "dmstatus FLAKY" rows were exactly first-touch-after-reset.
+            # Activating the DM is benign (no halt, no run-state change).
+            j.dmi_write(DMCONTROL, DM_DMACTIVE)
+            ds, st = j.dmi_read(DMSTATUS)
         exp_abits = chips.abits_for(ic)
         dmver = ds & 0xF
         ok = (exp_abits is not None and (dt & 0xF) == 1 and j.abits == exp_abits
