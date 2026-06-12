@@ -1,5 +1,15 @@
 # JTAG benchmark — analysis (FAIR rebuild)
 
+> **⚠️ SPEED NUMBERS SUPERSEDED (2026-06-12).** This doc records the state of an
+> earlier optimization era. After the TCK-divider fix (a hardcoded div=20 had
+> capped TCK at 1.2 MHz), async IN/OUT streaming, capture-narrowing, OUT
+> memoization and the #27 RAM stub, the current numbers are: bulk reads
+> **20–23 µs/word** (probe-rs 46, OpenOCD 27–97), writes ~30, single-word read
+> 247 µs, 64 KiB incremental flash **246 ms**. espjtag now LEADS probe-rs and
+> OpenOCD on reads and ties OpenOCD on writes. Live numbers: the README table +
+> the recorded run DBs (`jtag-tests.db`, `tmp/flash-bench.db`). The analysis
+> and methodology below remain valid history.
+
 ![headline](images/jtag-headline.png)
 
 What the numbers say, in plain terms. Data: `tmp/jtag-tests.db` (SQLite), graphs

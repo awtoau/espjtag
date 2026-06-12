@@ -1,5 +1,15 @@
 # espjtag — the story: pure-Python JTAG that caught (and in places beat) the giants
 
+> **⚠️ SPEED NUMBERS SUPERSEDED (2026-06-12).** This doc records the state of an
+> earlier optimization era. After the TCK-divider fix (a hardcoded div=20 had
+> capped TCK at 1.2 MHz), async IN/OUT streaming, capture-narrowing, OUT
+> memoization and the #27 RAM stub, the current numbers are: bulk reads
+> **20–23 µs/word** (probe-rs 46, OpenOCD 27–97), writes ~30, single-word read
+> 247 µs, 64 KiB incremental flash **246 ms**. espjtag now LEADS probe-rs and
+> OpenOCD on reads and ties OpenOCD on writes. Live numbers: the README table +
+> the recorded run DBs (`jtag-tests.db`, `tmp/flash-bench.db`). The analysis
+> and methodology below remain valid history.
+
 How a "we just need to reboot the C6 after flashing" annoyance turned into a
 pure-Python RISC-V JTAG debugger that does halt/registers/memory/reset with **no
 OpenOCD binary**, got ~235× faster through a bag of tricks, and ended up *faster

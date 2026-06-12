@@ -79,12 +79,14 @@ that align to them.
 - **espjtag does real RISC-V debug in pure Python.** Halt/resume, GPR+CSR
   read/write, memory read/write (SBA), reset — over the built-in USB-JTAG, no
   OpenOCD. (package `README.md` "What works"; OTHER-CORE-DEBUG-PROTOCOLS.md.)
-- **Speed went ~235× and is now competitive with OpenOCD.** ~24,456 → **~73–202 µs/word**
-  in measured steps (drain-timeout fix, batched SBA reads, drain removal); at large
-  bursts espjtag ≈ OpenOCD's batched path (~87 µs/word) and **beats** its per-word `mdw`
-  loop (~740–996 µs). Fairly measured, probe-rs is ~1.7× faster (~44 µs/word) — espjtag
-  is a close, respectable second, all in pure Python.
-  (JTAG-BENCHMARK-ANALYSIS.md, ESPJTAG-STORY.md.)
+- **Speed went ~1,200× and now LEADS the field.** ~24,456 → **~20–23 µs/word** bulk
+  reads (probe-rs 46, OpenOCD 27–97), writes ~30 (OpenOCD 27 — tied), single-word
+  read 247 µs (probe-rs parity). The eras: drain fix → batched SBA → full-rate TCK
+  (a hardcoded div=20 had capped TCK at 1.2 MHz) → async IN/OUT streaming +
+  capture-narrowing + OUT memoization. Incremental flash: **246 ms** for a 64 KiB
+  2-sector update via the #27 resident RAM stub — fastest tool on the bench.
+  (JTAG-BENCHMARK-ANALYSIS.md and ESPJTAG-STORY.md carry the history, with
+  supersession banners; live numbers = the package README + the run DBs.)
 - **The C6 ROM-boot works in pure Python** — but only as a **combination**:
   USBDEVFS reset (clear the download-strap latch) **+** the full ndmreset / SBA
   soc-reset / deassert / halt / resume handshake. A bare `ndmreset` alone is **not**
