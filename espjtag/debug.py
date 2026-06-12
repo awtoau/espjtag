@@ -407,7 +407,11 @@ class EspUsbJtag(EspUsbJtagTransport):
         return self.read_mem(xip + off, nwords)
 
     _FLASH_VENDORS = {0x20: "XMC", 0xEF: "Winbond", 0xC8: "GigaDevice",
-                      0x85: "Puya", 0x68: "Boya", 0xA1: "Fudan", 0x0B: "XTX"}
+                      0x85: "Puya", 0x68: "Boya", 0xA1: "Fudan", 0x0B: "XTX",
+                      # 0x46: JEP106 says Silicon Spice (defunct telecom) — the
+                      # real holder is an unregistered fab; identified by SFDP
+                      # fingerprint + behaviour only (docs/FLASH-DIE-SURVEY.md)
+                      0x46: "unregistered-0x46"}
     # SPI1 (the non-cache flash controller) user-command registers — identical
     # layout + base on C5/C6 (DR_REG_SPI1_BASE, spi_mem_reg.h).
     _SPI1 = 0x60003000
@@ -415,6 +419,39 @@ class EspUsbJtag(EspUsbJtagTransport):
         _SPI1 + 0x0, _SPI1 + 0x18, _SPI1 + 0x20, _SPI1 + 0x28, _SPI1 + 0x58
     _SPI_USR = 1 << 18                       # CMD.usr: start user transaction
     _SPI_USR_COMMAND, _SPI_USR_MISO = 1 << 31, 1 << 28
+
+    _SPI_ADDR, _SPI_USER1 = _SPI1 + 0x4, _SPI1 + 0x1C
+    _SPI_USR_ADDR, _SPI_USR_DUMMY = 1 << 30, 1 << 29
+
+    def flash_sfdp(self, addr, nbytes):
+        """Read `nbytes` of the SFDP space (JESD216, cmd 0x5A + 24-bit address +
+        8 dummy cycles) over JTAG via SPI1 registers. Returns bytes."""
+        out = bytearray()
+        for off in range(0, nbytes, 4):
+            n = min(4, nbytes - off)
+            save = {r: self.read_mem32(r) for r in
+                    (self._SPI_USER, self._SPI_USER1, self._SPI_USER2,
+                     self._SPI_MISO_DLEN, self._SPI_ADDR)}
+            try:
+                self.write_mem32(self._SPI_USER,
+                                 self._SPI_USR_COMMAND | self._SPI_USR_MISO
+                                 | self._SPI_USR_ADDR | self._SPI_USR_DUMMY)
+                self.write_mem32(self._SPI_USER1,
+                                 (23 << 26) | 7)            # 24 addr bits, 8 dummies
+                self.write_mem32(self._SPI_USER2, (7 << 28) | 0x5A)
+                self.write_mem32(self._SPI_ADDR, addr + off)   # right-aligned (24-bit)
+                self.write_mem32(self._SPI_MISO_DLEN, n * 8 - 1)
+                self.write_mem32(self._SPI_CMD, self._SPI_USR)
+                for _ in range(1000):
+                    if not (self.read_mem32(self._SPI_CMD) & self._SPI_USR):
+                        break
+                else:
+                    raise RuntimeError("flash_sfdp: transaction never completed")
+                out += self.read_mem32(self._SPI_W0).to_bytes(4, "little")[:n]
+            finally:
+                for r, v in save.items():
+                    self.write_mem32(r, v)
+        return bytes(out)
 
     def _spi1_user_read(self, cmd, nbytes):
         """Execute a bare SPI flash command on SPI1 via direct register access

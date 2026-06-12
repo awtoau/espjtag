@@ -17,6 +17,28 @@ medians of 4 sectors at the 0x300000 test window). Raw run: `tmp/flash_chip_surv
 Four different manufacturers across five boards — including two *different* dies
 on the two "identical" Seeed XIAO C6s.
 
+### Who is vendor `0x46`? (investigated — deliberately unnamed)
+
+Chased through JEDEC, software databases and community logs (2026-06-12):
+the official JEP106 bank-1 holder of `0x46` is **Silicon Spice** — a defunct
+1990s telecom company that never made NOR flash — and no practical database
+names a bare-`0x46` SPI NOR vendor (esp-idf's per-vendor drivers: generic
+handles it; esptool, flashrom-world lists, Tasmota/ESPHome device logs: no
+hit; flashrom's PMC PM25LQ032 uses continuation-coded `7F 9D 46`, not bare
+`0x46`). Conclusion: an **unregistered/ID-squatting low-cost fab** — common in
+the Chinese NOR market. We therefore report it by evidence, not name:
+
+- RDID `46 40 16` (repeats cyclically on over-read — standard behaviour)
+- SFDP rev 1.6, 3 parameter tables; basic table fingerprint
+  `e520f9ffffffff0144eb086b083b42bbfeffffffffff00ffffff40eb0c200f5210d800ff`
+  (standard 4K/`20` 32K/`52` 64K/`D8` erase trio, QE in SR2, 32 Mbit);
+  vendor table at `0xD0` re-states ID `0x46`, no JEP106 bank/continuation
+- Behaviourally excellent: fastest eraser on the bench (24 ms/sector,
+  88 ms/block), all flash ops verified correct across every soak
+
+`espjtag --info` labels it `unregistered-0x46`. If a name ever surfaces, the
+SFDP fingerprint above is the match key.
+
 ## How much the timing varies (and what it explains)
 
 - **Erase: 2.6× spread** (24–62 ms/sector) — the dominant variable.
