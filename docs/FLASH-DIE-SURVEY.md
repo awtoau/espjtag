@@ -70,6 +70,38 @@ boards than others.
   this survey's one-command table.
 - Cross-board flash comparisons in benchmark write-ups should cite the die
   (e.g. "c6-xiao-b (fast `0x46` die)").
-- Open idea: espjtag could read RDID/SFDP itself over JTAG via SPI1 register
-  access (no stub, no serial) — would make the survey a pure-espjtag one-liner
-  and let `flash_incremental` log the die it's writing to.
+- ~~Open idea: espjtag could read RDID itself over JTAG~~ **Done**: `flash_info()`
+  executes JEDEC RDID directly on SPI1 via register access over SBA (no stub, no
+  ROM call, no serial) — `python -m espjtag <usb> --info`. Verified against
+  esptool on three different dies incl. the two-TAP C5.
+
+## "Can we ignore the vendor and just make flash faster?" — yes, but not with clocks
+
+Erase and program time are **die-internal physics** (charge pumps); SPI clock
+tweaks (80 MHz, QIO — what esptool/IDF already expose) only speed *transfer and
+reads*, which our table shows are not the bottleneck. Overdriving the clock
+beyond datasheet (flashrom-community style) buys nothing on the write path.
+
+The vendor-independent levers that DO work, in measured order:
+
+1. **Bigger erase units** — measured on all three vendors: one 64 KiB block
+   erase vs 16 sector erases = **4.4–5.7× faster** (Winbond 987→211 ms,
+   Puya 741→130 ms, the 0x46 die 391→88 ms). Every NOR die honours
+   sector/block/chip erase per JEDEC; esptool's stub already exploits this —
+   and now espjtag's `flash_write` does too (block erase for fully-covered
+   aligned 64 KiB spans only — the partially-covered ends stay sector-erased,
+   per the never-erase-what-you-won't-rewrite invariant). espjtag-full 64 KiB:
+   2453 → 1918 ms on the gate board.
+2. **Don't write at all** — the incremental engine (#34): unchanged sectors cost
+   zero erase AND zero program, the only optimization that beats the die.
+3. **Skip erase when bits only fall** — `erase="auto"` in-place overwrites
+   (NOR can clear bits without erasing): wins on append/bit-clear patterns plus
+   saves a wear cycle.
+4. **Suspend-aware scheduling** (unexplored) — dies with suspend support (a
+   per-vendor RDID-keyed property in IDF's chip drivers) can suspend an erase to
+   service reads; relevant to #33's wedge, not yet a speed lever for us.
+
+Found along the way: `flash_write(verify=True)` overflowed the scratch window
+for images > ~4 KiB (single whole-image `flash_read_rom` — clobbered the trap
+word and wedged the session). First exercised at 64 KiB during the block-erase
+bench; verify now reads back in scratch-sized chunks.

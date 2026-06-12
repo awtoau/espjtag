@@ -102,6 +102,8 @@ CHIPS = {
             # scratch so only the 4-byte digest crosses JTAG, not the sector data.
             # The REAL CRC the field uses (pyOCD/J-Flash) — never ST's additive sum.
             crc32_le=0x40000758,
+            spiflash_read_user_cmd=0x40000164,   # (status*, cmd) — RDID via 0x9F
+            spiflash_erase_block=0x40000148,     # 64 KiB block erase (faster/byte)
         ),
         # Watchdogs to disable while the hart is HALTED, so a WDT can't reset the
         # chip out from under the debugger (the C6 halt-flakiness fix — probe-rs and
@@ -167,6 +169,8 @@ CHIPS = {
             # legacy ROM read then returns deterministic garbage (#33 repro).
             spiflash_config_readmode=0x4000018C,  # arg: 5 = ESP_ROM_SPIFLASH_SLOWRD
             spiflash_config_clk=0x40000188,
+            spiflash_read_user_cmd=0x40000174,   # (status*, cmd) — RDID via 0x9F
+            spiflash_erase_block=0x40000158,     # 64 KiB block erase (faster/byte)
             crc32_le=0x40000778,                 # on-chip CRC-32 for incremental (#34)
         ),
         # Watchdogs to disable while HALTED. The MISSING table here was #33's root

@@ -406,6 +406,53 @@ class EspUsbJtag(EspUsbJtagTransport):
             raise RuntimeError("flash_read_xip: no flash_xip window tabled")
         return self.read_mem(xip + off, nwords)
 
+    _FLASH_VENDORS = {0x20: "XMC", 0xEF: "Winbond", 0xC8: "GigaDevice",
+                      0x85: "Puya", 0x68: "Boya", 0xA1: "Fudan", 0x0B: "XTX"}
+    # SPI1 (the non-cache flash controller) user-command registers — identical
+    # layout + base on C5/C6 (DR_REG_SPI1_BASE, spi_mem_reg.h).
+    _SPI1 = 0x60003000
+    _SPI_CMD, _SPI_USER, _SPI_USER2, _SPI_MISO_DLEN, _SPI_W0 = \
+        _SPI1 + 0x0, _SPI1 + 0x18, _SPI1 + 0x20, _SPI1 + 0x28, _SPI1 + 0x58
+    _SPI_USR = 1 << 18                       # CMD.usr: start user transaction
+    _SPI_USR_COMMAND, _SPI_USR_MISO = 1 << 31, 1 << 28
+
+    def _spi1_user_read(self, cmd, nbytes):
+        """Execute a bare SPI flash command on SPI1 via direct register access
+        (SBA) and read back `nbytes` (<=4): command phase only + MISO phase —
+        no stub, no ROM call, no serial. Touched registers are saved/restored.
+        Flash must be idle (run after the gate); hart halted not required but
+        we only call this from halted contexts."""
+        save = {r: self.read_mem32(r) for r in
+                (self._SPI_USER, self._SPI_USER2, self._SPI_MISO_DLEN)}
+        try:
+            self.write_mem32(self._SPI_USER, self._SPI_USR_COMMAND | self._SPI_USR_MISO)
+            self.write_mem32(self._SPI_USER2, (7 << 28) | (cmd & 0xFF))
+            self.write_mem32(self._SPI_MISO_DLEN, nbytes * 8 - 1)
+            self.write_mem32(self._SPI_CMD, self._SPI_USR)
+            for _ in range(1000):            # poll usr-clear: a cmd+4B read is ~µs
+                if not (self.read_mem32(self._SPI_CMD) & self._SPI_USR):
+                    break
+            else:
+                raise RuntimeError(f"_spi1_user_read: cmd 0x{cmd:02x} never completed")
+            return self.read_mem32(self._SPI_W0) & ((1 << (8 * nbytes)) - 1)
+        finally:
+            for r, v in save.items():
+                self.write_mem32(r, v)
+
+    def flash_info(self):
+        """Identify the flash die over JTAG alone: JEDEC RDID (cmd 0x9F) on SPI1.
+        Returns dict(rdid, mfg, device, size_mb, vendor). Hart halted; runs the
+        gate ladder first so SPI1 is attached/idle. Capacity is the JEDEC
+        convention 2^cap bytes (e.g. 0x16 -> 4 MB; bytes arrive mfg, type, cap)."""
+        self._ensure_flash_ready(lambda m: None, "flash_info")
+        raw = self._spi1_user_read(0x9F, 3)
+        mfg = raw & 0xFF                         # byte0 = manufacturer
+        dev = ((raw >> 8) & 0xFF) << 8 | ((raw >> 16) & 0xFF)   # type:cap, flash-id style
+        cap = (raw >> 16) & 0xFF
+        size_mb = (1 << cap) // (1024 * 1024) if 0x10 <= cap <= 0x20 else None
+        return dict(rdid=raw & 0xFFFFFF, mfg=mfg, device=dev, size_mb=size_mb,
+                    vendor=self._FLASH_VENDORS.get(mfg, f"unknown(0x{mfg:02x})"))
+
     def flash_read_rom(self, addr, nwords):
         """Read nwords from RAW flash byte-offset `addr` via the ROM
         esp_rom_spiflash_read (needs flash_init done / the gate passing). Unlike
@@ -531,13 +578,29 @@ class EspUsbJtag(EspUsbJtagTransport):
         _log(f"  flash_write: 0x{addr:08x} +{len(data)}B ({len(words)} words)")
         # unlock once
         self.call_rom("spiflash_unlock")
-        # erase covering sectors
+        # erase covering sectors — use 64 KiB BLOCK erase for fully-covered aligned
+        # blocks: measured 4.4-5.7x faster than 16 sector erases on every die on
+        # the bench (Winbond 987->211 ms, Puya 741->130, 0x46 391->88;
+        # tmp/block_erase_bench.log). INVARIANT: a block is erased ONLY when the
+        # write range covers all 16 of its sectors — partially-covered ends fall
+        # back to sector erase (never erase what we won't rewrite; the pyOCD
+        # fast_program bug class, scripts/incremental_invariant_test.py).
         first = addr & ~0xFFF
         last = (addr + len(data) - 1) & ~0xFFF
-        for sa in range(first, last + 1, 0x1000):
-            r, _ = self.call_rom("spiflash_erase_sector", args=(sa >> 12,))
-            if r != 0:
-                raise RuntimeError(f"flash erase sector {sa >> 12} -> {r}")
+        rom = self._chip().get("rom", {})
+        sa = first
+        while sa <= last:
+            if ("spiflash_erase_block" in rom and sa % 0x10000 == 0
+                    and sa + 0x10000 - 0x1000 <= last):
+                r, _ = self.call_rom("spiflash_erase_block", args=(sa >> 16,))
+                if r != 0:
+                    raise RuntimeError(f"flash erase block {sa >> 16} -> {r}")
+                sa += 0x10000
+            else:
+                r, _ = self.call_rom("spiflash_erase_sector", args=(sa >> 12,))
+                if r != 0:
+                    raise RuntimeError(f"flash erase sector {sa >> 12} -> {r}")
+                sa += 0x1000
         # stage + program in chunks bounded by the scratch buffer headroom
         chunk_words = 0x400                       # 4 KiB per call (well within scratch)
         for w0 in range(0, len(words), chunk_words):
@@ -548,9 +611,16 @@ class EspUsbJtag(EspUsbJtagTransport):
             if r != 0:
                 raise RuntimeError(f"flash write @0x{dest:08x} -> {r}")
         if verify:
-            got = self.flash_read_rom(addr, len(words))   # raw ROM read (true offset)
-            if got != words:
-                raise RuntimeError(f"flash_write: verify mismatch @0x{addr:08x}")
+            # read back in scratch-sized chunks — a single flash_read_rom of the
+            # whole image overflows the scratch window for anything > ~4 KiB
+            # (it clobbered the trap word and wedged the session; found when
+            # 64 KiB verify=True was first exercised, 2026-06-12).
+            for w0 in range(0, len(words), chunk_words):
+                want = words[w0:w0 + chunk_words]
+                got = self.flash_read_rom(addr + w0 * 4, len(want))
+                if got != want:
+                    raise RuntimeError(
+                        f"flash_write: verify mismatch @0x{addr + w0 * 4:08x}")
             _log("  flash_write: verify OK")
         return True
 
