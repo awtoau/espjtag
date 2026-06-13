@@ -31,11 +31,21 @@ INDICATORS = re.compile(
 # warning we consciously accept, not a blanket mute.
 ALLOW = [
     # (substring, reason)
-    ("Failed to get flash map", "OpenOCD program_esp reads the ESP app/partition "
-     "map; we write a RAW test offset (no app image) — benign, flash still writes"),
-    ("Application image is invalid", "same: program_esp app-image check on a raw "
-     "test offset — expected, the write itself succeeds + is independently verified"),
-    ("appimage_offset", "same program_esp app-image note on a raw test offset"),
+    #
+    # OpenOCD program_esp runs `reset init` internally, which ALWAYS inspects the
+    # ESP partition table / app image at boot. Our boards carry no valid app image
+    # (we only ever flash RAW test offsets), so that inspection fails and warns —
+    # before, and independently of, the write we actually do. This is structural,
+    # not a bug: confirmed `esp appimage_offset -1` does NOT silence it (no real
+    # app exists to point at) and a separate init/halt to suppress it collides with
+    # program_esp's own reset init and breaks the flash erase. The write itself
+    # succeeds and is INDEPENDENTLY verified by esptool serial readback. So this is
+    # a cosmetic third-party boot note that genuinely cannot be silenced at source.
+    ("Failed to get flash map", "program_esp boot-time partition inspection; no app "
+     "image on a raw test offset — cannot be silenced (appimage_offset -1 tested)"),
+    ("Application image is invalid", "same program_esp boot inspection; write "
+     "succeeds + is independently verified by esptool serial readback"),
+    ("appimage_offset", "same program_esp app-image boot note on a raw test offset"),
 ]
 
 
