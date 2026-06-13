@@ -38,10 +38,10 @@ RISCV_FLASHERS = ["espjtag-full", "espjtag-incr", "esptool-incr-dev-fast",
                   "openocd-full", "probers-full"]
 XTENSA_FLASHERS = ["esptool-full", "esptool-incr-dev-fast"]   # serial; espjtag #29
 
-# per-flasher full-output logs (full tool stdout/stderr, not the 120-char tail)
-LOGDIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                      "tmp", "flash_matrix_logs")
-os.makedirs(LOGDIR, exist_ok=True)
+# ONE log file for everything — full tool stdout/stderr of every invocation,
+# appended with a header line per call (not the 120-char tail, not per-file).
+LOGFILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "tmp", "flash_matrix_full.log")
 
 
 def fleet():
@@ -120,7 +120,8 @@ def main():
     print(f"fleet: {sum(b[4] for b in boards)}/{len(boards)} online; "
           f"sizes {sizes} KiB, {args.changed} sectors changed, "
           f"{args.rounds} rounds, verify included")
-    print(f"per-flasher logs -> {LOGDIR}/<board>_<size>k_<flasher>.log\n")
+    open(LOGFILE, "w").close()                          # fresh full log per run
+    print(f"full tool output -> {LOGFILE}\n")
 
     csv = ["board,chip,size_kb,flasher,median_ms,eff_MBps,act_MBps,n,status"]
     for name, chip, usb, tty, online in boards:
@@ -146,17 +147,22 @@ def main():
                     # on the bus, the C5 #33 post-reset gate, etc.) before scoring
                     # a FAIL — a real failure fails all RETRIES consistently.
                     el = ok = note = None
-                    logf = os.path.join(LOGDIR, f"{name}_{kb}k_{f}.log")
                     for _retry in range(3):
+                        with open(LOGFILE, "a") as lf:
+                            lf.write(f"\n##### {name} [{chip}] {kb}KiB {f} "
+                                     f"(try {_retry}) #####\n")
                         try:
                             if chip == "S3":
                                 el, ok, note = esptool_s3(f, tty, chip, args.addr, A, B,
-                                                          logfile=logf)
+                                                          logfile=LOGFILE)
                             else:
                                 el, ok, note = run_flasher(f, usb, tty, chip, args.addr,
-                                                           A, B, logfile=logf)
+                                                           A, B, logfile=LOGFILE)
                         except Exception as e:             # noqa: BLE001
+                            import traceback
                             el, ok, note = None, False, f"EXC {e}"
+                            with open(LOGFILE, "a") as lf:
+                                lf.write(traceback.format_exc())
                         if ok or ok is None:
                             break                          # success or genuine skip
                     if el is not None and ok:
