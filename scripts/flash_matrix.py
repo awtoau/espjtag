@@ -110,7 +110,7 @@ def main():
           f"sizes {sizes} KiB, {args.changed} sectors changed, "
           f"{args.rounds} rounds, verify included\n")
 
-    csv = ["board,chip,size_kb,flasher,median_ms,n,status"]
+    csv = ["board,chip,size_kb,flasher,median_ms,eff_MBps,act_MBps,n,status"]
     for name, chip, usb, tty, online in boards:
         riscv = chip in ("C6", "C5", "C3")
         flashers = (RISCV_FLASHERS if riscv else
@@ -152,17 +152,29 @@ def main():
                         fails += 1
                 if times:
                     med = statistics.median(times)
-                    cells[f] = f"{med:6.0f} ms (n={len(times)})"
-                    csv.append(f"{name},{chip},{kb},{f},{med:.0f},{len(times)},ok")
+                    # two rates: EFFECTIVE = whole image / time (how fast the
+                    # update completes, the user-facing number), ACTUAL =
+                    # bytes-actually-written / time (raw throughput). For full
+                    # flashers they're equal; for incremental, only `changed`
+                    # sectors are written so ACTUAL >> EFFECTIVE.
+                    sec = med / 1000.0
+                    eff = (kb / 1024.0) / sec                  # MB/s on image size
+                    written_mb = (args.changed * SEC / 1e6 if "incr" in f
+                                  else kb * 1024 / 1e6)
+                    act = written_mb / sec                     # MB/s on bytes written
+                    cells[f] = (f"{med:6.0f} ms  {eff:5.2f} MB/s eff "
+                                f"{act:5.2f} MB/s act (n={len(times)})")
+                    csv.append(f"{name},{chip},{kb},{f},{med:.0f},"
+                               f"{eff:.3f},{act:.3f},{len(times)},ok")
                 elif fails < 0:
                     cells[f] = "skip (no tty / unsupported)"
-                    csv.append(f"{name},{chip},{kb},{f},,,skip")
+                    csv.append(f"{name},{chip},{kb},{f},,,,,skip")
                 else:
                     cells[f] = f"FAIL x{fails} — {(note or '?')[:70]}"   # show WHY
-                    csv.append(f"{name},{chip},{kb},{f},,,fail:{(note or '?')[:60]}")
+                    csv.append(f"{name},{chip},{kb},{f},,,,,fail:{(note or '?')[:60]}")
             print(f"  {kb:5d} KiB:")
             for f in flashers:
-                print(f"      {f:24s} {cells.get(f, '-')}")
+                print(f"      {f:28s} {cells.get(f, '-')}")
         print()
 
     out = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
