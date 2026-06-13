@@ -62,6 +62,39 @@ The recorded progression (`flash_bench.py --report`, graph at
 `docs/images/flash-progression.png`) traces 1568 → 256 ms across the day's fixes:
 call-batching, TCK-divider, async IN/OUT streaming, the #27 RAM stub.
 
+## 3b. Flash across the FLEET and image SIZES (matrix, verify included)
+
+`scripts/flash_matrix.py` — every online board × {64, 256, 1024} KiB, per-chip
+flasher set, 2 sectors changed, medians of 2. Two rates: **eff** = image÷time
+(time-to-updated-flash, the user-facing number), **act** = bytes-written÷time
+(raw; for incremental this is tiny because it only writes the 2 changed sectors —
+that's the point, not slowness). Full log: `tmp/flash_matrix_full.log`; CSV:
+`tmp/flash_matrix.csv`.
+
+**Effective MB/s — incremental scales with image size, full writes don't:**
+
+| 1 MiB A→B update | eff MB/s | wall-clock |
+|---|---|---|
+| **espjtag-incr** (C6, JTAG) | **0.84** | 1195 ms |
+| esptool device-diff (C6, serial fork) | 0.58 | 1733 ms |
+| esptool device-diff (S3, serial) | 0.25 | ~4000 ms |
+| espjtag-full (C6, JTAG) | 0.07 | 15101 ms |
+| openocd-full (C6, JTAG) | 0.08 | 12835 ms |
+| probe-rs-full (C6, JTAG) | 0.07 | 14220 ms |
+
+espjtag-incr's eff climbs **0.22 → 0.54 → 0.84 MB/s** across 64K→256K→1M (it skips
+unchanged sectors); every full flasher stays pinned ~0.07 MB/s. At 1 MiB
+incremental is **~11× faster than any JTAG full write** and 1.45× the serial fork.
+
+**Per-chip coverage:** C6 (c6-maker-a/-b), C5 (c5-xiao-a), S3 (3 boards incl. the
+production ble_bridge) — all clean. **S3 is esptool-serial only** (espjtag flash
+execution is open, #29); its full-write eff *rises* with size (0.05→0.12 MB/s) as
+the fixed reset+stub cost amortizes. **C3 was offline** (not on the bus). One
+honest gap: c6-maker-b dropped off a deep USB hub branch (`1-1.3.1.3.x`) at its
+1 MiB step — a physical bus-contention drop under matrix load (not a tool
+failure; its 64K/256K rows are complete), the same branch that dropped other
+boards across runs. The numbers are otherwise complete and reproducible.
+
 ## 4. What this proves
 
 Correctness (the equivalence table) and speed (the benchmarks) are measured by
