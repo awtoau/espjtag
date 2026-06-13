@@ -161,7 +161,24 @@ def usb_serial(usb_path):
 
 
 def connect(usb_path):
-    j = EspUsbJtag(usb_path)
+    try:
+        j = EspUsbJtag(usb_path)
+    except usb.core.USBError as e:
+        # [Errno 16] Resource busy = a leaked libusb interface claim survived a
+        # previous process (e.g. a benchmark killed mid-flash). The kernel holds
+        # the claim until the device is reset — so reset it and retry once.
+        if e.errno != 16:
+            raise
+        dev = next((d for d in usb.core.find(find_all=True, idVendor=0x303A,
+                                             idProduct=0x1001)
+                    if f"{d.bus}-" + ".".join(str(p) for p in (d.port_numbers or ()))
+                    == usb_path), None)
+        if dev is not None:
+            try:
+                dev.reset()
+            except usb.core.USBError:
+                pass
+        j = EspUsbJtag(usb_path)
     j.examine()
     if not j.halt():
         raise RuntimeError("halt failed")
