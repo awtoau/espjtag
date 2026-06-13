@@ -198,6 +198,35 @@ def verify_crc(j, addr, B):
                for s in range(len(B) // SEC))
 
 
+def verify_independent(tty, chip, addr, B, logfile=None):
+    """INDEPENDENT cross-tool verify: read the flashed region back with esptool
+    over SERIAL and compare to B. The strongest correctness check for an espjtag
+    flash — espjtag writes over JTAG, esptool reads over a totally separate
+    transport + codebase, so a shared bug can't self-certify. Returns (ok, note).
+    (probe-rs XIP read returns 0addbad0 = unmapped; openocd flash read is
+    chip-flaky on the C5 — esptool serial read is the reliable independent path.)"""
+    if not tty:
+        return None, "no tty for independent verify"
+    espchip = ESPTOOL_CHIP.get(chip, "auto")
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+        rb = f.name
+    try:
+        cmd = ["esptool", "--chip", espchip, "--port", tty, "--before",
+               "default-reset", "--after", "hard-reset", "read-flash",
+               hex(addr), str(len(B)), rb]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        if logfile:
+            with open(logfile, "a") as lf:
+                lf.write(f"$ {' '.join(cmd)}\n--- independent verify rc={r.returncode}"
+                         f" ---\n{r.stdout}\n{r.stderr}\n")
+        if r.returncode != 0:
+            return False, f"esptool read-flash rc={r.returncode}"
+        got = open(rb, "rb").read()
+        return got == B, "" if got == B else "independent readback != written image"
+    finally:
+        os.unlink(rb)
+
+
 def verify_after_external(usb_path, addr, B, tries=3):
     """Reconnect + verify after an external flasher's reset, retrying the whole
     connect/halt/verify on transient post-reset failures (the app is rebooting;
@@ -262,10 +291,14 @@ def run_flasher(name, usb_path, tty, chip, addr, A, B, logfile=None):
             else:
                 j.flash_incremental(addr, B, verify=False)
             elapsed = time.perf_counter() - t
-            return elapsed, verify_crc(j, addr, B), ""
         finally:
             j.resume()
             usb.util.dispose_resources(j.dev)
+        # INDEPENDENT verify: espjtag wrote over JTAG; esptool reads back over
+        # SERIAL and compares — no self-certification. (Needs the espjtag USB
+        # handle disposed first so esptool can take the serial port.)
+        ok, note = verify_independent(tty, chip, addr, B, logfile=logfile)
+        return elapsed, ok, note
     cmd, note, env_extra = external_cmd(name, usb_path, tty, chip, addr)
     if cmd is None:
         return None, None, note
@@ -313,11 +346,14 @@ def external_cmd(name, usb_path, tty, chip, addr):
         if name == "esptool-incr-dev":             # isolate device-diff: stock reset
             env = {"ESPTOOL_CFGFILE": os.path.join(ROOT, "scripts",
                                                    "esptool_stock_reset.cfg")}
+        # non-deprecated names (default-reset/hard-reset/write-flash) — the
+        # underscore forms warn on esptool 5.x and trip the fail-fast audit.
+        # --no-compress always: our test images are RANDOM (incompressible), so
+        # esptool prints a "cannot compress" Note otherwise (also audit dirt).
         cmd = [FORK_ESPTOOL if fork else "esptool",
                "--chip", ESPTOOL_CHIP.get(chip, "auto"), "--port", tty,
-               "--before", "default_reset", "--after", "hard_reset", "write_flash"]
-        if name == "esptool-nocomp":
-            cmd += ["--no-compress"]
+               "--before", "default-reset", "--after", "hard-reset", "write-flash",
+               "--no-compress"]
         cmd += [hex(addr), "{B}"]
         if name == "esptool-incr":                 # serial incremental: diff vs old image
             cmd += ["--diff-with", "{A}"]
@@ -327,6 +363,11 @@ def external_cmd(name, usb_path, tty, chip, addr):
     if name == "openocd-full":
         if not os.path.exists(f"{OOCD}/bin/openocd"):
             return None, "skip (no openocd-esp32)", None
+        # program_esp is the command that actually WORKS on the fleet (it
+        # auto-detects the flash; plain `flash write_image` fails to probe the
+        # C5 — 'size 0 KB'). It emits BENIGN app-image warnings when writing a
+        # raw test offset (no app image there) — those are ALLOW-listed in
+        # audit_bench_log.py with a reason, not a real problem.
         return [f"{OOCD}/bin/openocd", "-s", f"{OOCD}/share/openocd/scripts",
                 "-c", f"adapter usb location {usb_path}",
                 "-f", f"board/esp32{chip.lower()}-builtin.cfg",

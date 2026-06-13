@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from flash_bench import (make_ab, run_flasher, ESPTOOL_CHIP, FORK_ESPTOOL,  # noqa: E402
                          DEVPY, SEC)
+from audit_bench_log import audit                          # noqa: E402
 
 # extend the esptool chip map for the full fleet
 ESPTOOL_CHIP.update({"C3": "esp32c3", "S3": "esp32s3"})
@@ -82,7 +83,7 @@ def esptool_s3(name, tty, chip, addr, A, B, logfile=None):
         # esptool consume 0x300000 as the diff target (the matrix S3 bug).
         cmd = [binary_, "--chip", "esp32s3", "--port", tty, "--before",
                "default-reset", "--after", "hard-reset", "write-flash",
-               hex(addr), src]
+               "--no-compress", hex(addr), src]    # random imgs don't compress
         if diff:
             cmd += ["--diff-with", diff]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
@@ -143,28 +144,36 @@ def main():
             for f in flashers:
                 times, fails = [], 0
                 for _ in range(args.rounds):
-                    # retry transient glitches (USB/reset contention with 7 boards
-                    # on the bus, the C5 #33 post-reset gate, etc.) before scoring
-                    # a FAIL — a real failure fails all RETRIES consistently.
+                    # FAIL FAST: one attempt, no retry-masking. After it, audit
+                    # this invocation's fresh log slice; ANY warning/error/EXC
+                    # aborts the whole run immediately (don't grind 8 boards x 3
+                    # sizes to report at the end). Fix the warning, then re-run.
                     el = ok = note = None
-                    for _retry in range(3):
+                    with open(LOGFILE, "r+") as lf:
+                        mark = lf.seek(0, 2)               # offset before this call
+                        lf.write(f"\n##### {name} [{chip}] {kb}KiB {f} #####\n")
+                    try:
+                        if chip == "S3":
+                            el, ok, note = esptool_s3(f, tty, chip, args.addr, A, B,
+                                                      logfile=LOGFILE)
+                        else:
+                            el, ok, note = run_flasher(f, usb, tty, chip, args.addr,
+                                                       A, B, logfile=LOGFILE)
+                    except Exception as e:                 # noqa: BLE001
+                        import traceback
+                        el, ok, note = None, False, f"EXC {e}"
                         with open(LOGFILE, "a") as lf:
-                            lf.write(f"\n##### {name} [{chip}] {kb}KiB {f} "
-                                     f"(try {_retry}) #####\n")
-                        try:
-                            if chip == "S3":
-                                el, ok, note = esptool_s3(f, tty, chip, args.addr, A, B,
-                                                          logfile=LOGFILE)
-                            else:
-                                el, ok, note = run_flasher(f, usb, tty, chip, args.addr,
-                                                           A, B, logfile=LOGFILE)
-                        except Exception as e:             # noqa: BLE001
-                            import traceback
-                            el, ok, note = None, False, f"EXC {e}"
-                            with open(LOGFILE, "a") as lf:
-                                lf.write(traceback.format_exc())
-                        if ok or ok is None:
-                            break                          # success or genuine skip
+                            lf.write(traceback.format_exc())
+                    # audit ONLY this invocation's output -> abort on any dirt
+                    slice_path = LOGFILE + ".slice"
+                    with open(LOGFILE) as lf:
+                        lf.seek(mark)
+                        open(slice_path, "w").write(lf.read())
+                    if audit([slice_path]) or ok is False:
+                        print(f"\n!!! FAIL-FAST: {name} {chip} {kb}KiB {f} "
+                              f"-> aborting. note={note!r}")
+                        print(f"!!! full output: {LOGFILE}")
+                        return 1
                     if el is not None and ok:
                         times.append(el * 1000)
                     elif ok is None:
@@ -203,14 +212,9 @@ def main():
     os.makedirs(os.path.dirname(out), exist_ok=True)
     open(out, "w").write("\n".join(csv) + "\n")
     print(f"CSV -> {out}")
-
-    # SELF-AUDIT: the run is only clean if NO tool emitted a warning/error.
-    # The audit reads the full tool log and fails the run on any unexpected
-    # warning — so the test process finds problems, not a human grepping after.
-    print()
-    from audit_bench_log import audit
-    dirty = audit([LOGFILE])
-    return 1 if dirty else 0
+    # if we got here, fail-fast never tripped — the whole run was clean
+    print("\nALL CLEAN — no tool warnings/errors (fail-fast would have aborted).")
+    return 0
 
 
 if __name__ == "__main__":

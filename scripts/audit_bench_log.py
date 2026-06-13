@@ -31,7 +31,11 @@ INDICATORS = re.compile(
 # warning we consciously accept, not a blanket mute.
 ALLOW = [
     # (substring, reason)
-    # e.g. ("probe-rs ... udev", "third-party env note, cosmetic on this bench"),
+    ("Failed to get flash map", "OpenOCD program_esp reads the ESP app/partition "
+     "map; we write a RAW test offset (no app image) — benign, flash still writes"),
+    ("Application image is invalid", "same: program_esp app-image check on a raw "
+     "test offset — expected, the write itself succeeds + is independently verified"),
+    ("appimage_offset", "same program_esp app-image note on a raw test offset"),
 ]
 
 
