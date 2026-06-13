@@ -240,9 +240,18 @@ def setup_a(usb_path, addr, A):
                 usb.util.dispose_resources(j.dev)
 
 
-def run_flasher(name, usb_path, tty, chip, addr, A, B):
+def _wlog(logfile, text):
+    """Append text to a per-flasher log file when one was provided."""
+    if logfile:
+        with open(logfile, "a") as f:
+            f.write(text)
+
+
+def run_flasher(name, usb_path, tty, chip, addr, A, B, logfile=None):
     """Put A on flash (setup), TIME flashing B with `name`, verify B independently.
-    Returns (elapsed_s | None, ok | None, note)."""
+    Returns (elapsed_s | None, ok | None, note). When `logfile` is given, the
+    full external-tool stdout/stderr (or the espjtag exception) is written there
+    — so a FAIL is never just a 120-char tail."""
     if name.startswith("espjtag"):
         j = connect(usb_path)
         try:
@@ -273,6 +282,8 @@ def run_flasher(name, usb_path, tty, chip, addr, A, B):
     r = subprocess.run(argv, capture_output=True, text=True, timeout=180,
                        env={**os.environ, **env_extra} if env_extra else None)
     elapsed = time.perf_counter() - t
+    _wlog(logfile, f"$ {' '.join(argv)}\n--- rc={r.returncode} ({elapsed*1000:.0f} ms) ---\n"
+                   f"{r.stdout}\n{r.stderr}\n")
     for p in paths.values():
         os.unlink(p)
     if r.returncode != 0:

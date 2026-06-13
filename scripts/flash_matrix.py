@@ -38,6 +38,11 @@ RISCV_FLASHERS = ["espjtag-full", "espjtag-incr", "esptool-incr-dev-fast",
                   "openocd-full", "probers-full"]
 XTENSA_FLASHERS = ["esptool-full", "esptool-incr-dev-fast"]   # serial; espjtag #29
 
+# per-flasher full-output logs (full tool stdout/stderr, not the 120-char tail)
+LOGDIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      "tmp", "flash_matrix_logs")
+os.makedirs(LOGDIR, exist_ok=True)
+
 
 def fleet():
     """All boards from dev.py fleet-status: (name, CHIP, usb_path|None, tty|None,
@@ -58,10 +63,11 @@ def fleet():
     return boards
 
 
-def esptool_s3(name, tty, chip, addr, A, B):
+def esptool_s3(name, tty, chip, addr, A, B, logfile=None):
     """S3 flash via esptool (serial): write A, time write B, esptool verifies
     (rc==0 = its post-write MD5 passed). Uses the fork's device-diff for the
-    incr variant. Returns (elapsed_s | None, ok | None, note)."""
+    incr variant. Returns (elapsed_s | None, ok | None, note). When `logfile`
+    is given, the full esptool stdout/stderr is written there."""
     bins = {"esptool-full": "esptool", "esptool-incr-dev-fast": FORK_ESPTOOL}
     binary = bins[name]
     paths = {}
@@ -79,7 +85,12 @@ def esptool_s3(name, tty, chip, addr, A, B):
                hex(addr), src]
         if diff:
             cmd += ["--diff-with", diff]
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        if logfile:
+            with open(logfile, "a") as lf:
+                lf.write(f"$ {' '.join(cmd)}\n--- rc={r.returncode} ---\n"
+                         f"{r.stdout}\n{r.stderr}\n")
+        return r
 
     try:
         r = flash("esptool", paths["A"])              # setup A (stock esptool)
@@ -108,7 +119,8 @@ def main():
     boards = fleet()
     print(f"fleet: {sum(b[4] for b in boards)}/{len(boards)} online; "
           f"sizes {sizes} KiB, {args.changed} sectors changed, "
-          f"{args.rounds} rounds, verify included\n")
+          f"{args.rounds} rounds, verify included")
+    print(f"per-flasher logs -> {LOGDIR}/<board>_<size>k_<flasher>.log\n")
 
     csv = ["board,chip,size_kb,flasher,median_ms,eff_MBps,act_MBps,n,status"]
     for name, chip, usb, tty, online in boards:
@@ -134,12 +146,15 @@ def main():
                     # on the bus, the C5 #33 post-reset gate, etc.) before scoring
                     # a FAIL — a real failure fails all RETRIES consistently.
                     el = ok = note = None
+                    logf = os.path.join(LOGDIR, f"{name}_{kb}k_{f}.log")
                     for _retry in range(3):
                         try:
                             if chip == "S3":
-                                el, ok, note = esptool_s3(f, tty, chip, args.addr, A, B)
+                                el, ok, note = esptool_s3(f, tty, chip, args.addr, A, B,
+                                                          logfile=logf)
                             else:
-                                el, ok, note = run_flasher(f, usb, tty, chip, args.addr, A, B)
+                                el, ok, note = run_flasher(f, usb, tty, chip, args.addr,
+                                                           A, B, logfile=logf)
                         except Exception as e:             # noqa: BLE001
                             el, ok, note = None, False, f"EXC {e}"
                         if ok or ok is None:
