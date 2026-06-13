@@ -203,7 +203,14 @@ def main():
     os.makedirs(os.path.dirname(out), exist_ok=True)
     open(out, "w").write("\n".join(csv) + "\n")
     print(f"CSV -> {out}")
-    return 0
+
+    # SELF-AUDIT: the run is only clean if NO tool emitted a warning/error.
+    # The audit reads the full tool log and fails the run on any unexpected
+    # warning — so the test process finds problems, not a human grepping after.
+    print()
+    from audit_bench_log import audit
+    dirty = audit([LOGFILE])
+    return 1 if dirty else 0
 
 
 if __name__ == "__main__":
