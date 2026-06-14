@@ -46,26 +46,24 @@ LOGFILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 
 def fleet():
-    """All boards from dev.py fleet-status: (name, CHIP, usb_path|None, tty|None,
-    online, serial|None). CHIP is the short label (C6/C5/C3/S3); serial is the
-    STABLE USB MAC used to re-resolve a board that re-enumerated (blocker #2)."""
-    out = subprocess.run(["python3", DEVPY, "fleet-status"], capture_output=True,
-                         text=True).stdout
-    import re
+    """All boards from dev.py fleet-status --json: (name, CHIP, usb_path|None,
+    tty|None, online, serial|None, off_limits). CHIP is the short label
+    (C6/C5/C3/S3); serial is the STABLE USB MAC used to re-resolve a board that
+    re-enumerated (blocker #2); off_limits is the structured esp32-devices.json
+    flag (production boards — respected by default, see --include-off-limits).
+    Uses --json, not text parsing, so a newly-tagged off-limits board is picked
+    up automatically."""
+    import json
+    out = subprocess.run(["python3", DEVPY, "fleet-status", "--json"],
+                         capture_output=True, text=True).stdout
+    data = json.loads(out)
+    rows = data if isinstance(data, list) else data.get("boards", data.get("devices", []))
     boards = []
-    for line in out.splitlines():
-        # name chip usb_path serial(MAC) ... — capture the MAC after the path.
-        m = re.search(r"([●○])\s+(\S+)\s+esp32(\w+)\s+(\S+)\s+"
-                      r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})", line)
-        if not m:
-            continue
-        online = m.group(1) == "●"
-        chip = m.group(3).upper()
-        usb = m.group(4) if m.group(4)[0].isdigit() else None
-        serial = m.group(5)
-        tty = re.search(r"/dev/ttyACM\d+", line)
-        boards.append((m.group(2), chip, usb, tty.group(0) if tty else None,
-                       online, serial))
+    for r in rows:
+        chip = (r.get("chip") or "").replace("esp32", "").upper() or "?"
+        boards.append((r.get("name"), chip, r.get("usb_path"), r.get("tty"),
+                       bool(r.get("connected")), r.get("serial"),
+                       bool(r.get("off_limits"))))
     return boards
 
 
@@ -119,6 +117,10 @@ def main():
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--changed", type=int, default=2)
     ap.add_argument("--addr", type=lambda x: int(x, 0), default=0x300000)
+    ap.add_argument("--include-off-limits", action="store_true",
+                    help="ALSO flash boards marked off_limits in esp32-devices.json "
+                         "(e.g. the production ble_bridge_s3). DEFAULT: skip them — "
+                         "flashing overwrites production firmware.")
     args = ap.parse_args()
     sizes = [int(s) for s in args.sizes.split(",")]
 
@@ -126,16 +128,25 @@ def main():
     print(f"fleet: {sum(b[4] for b in boards)}/{len(boards)} online; "
           f"sizes {sizes} KiB, {args.changed} sectors changed, "
           f"{args.rounds} rounds, verify included")
+    if args.include_off_limits:
+        print("!!! --include-off-limits: off_limits boards WILL be flashed "
+              "(production firmware will be overwritten)")
     open(LOGFILE, "w").close()                          # fresh full log per run
     print(f"full tool output -> {LOGFILE}\n")
 
     csv = ["board,chip,size_kb,flasher,median_ms,eff_MBps,act_MBps,n,status"]
-    for name, chip, usb, tty, online, serial in boards:
+    for name, chip, usb, tty, online, serial, off_limits in boards:
         riscv = chip in ("C6", "C5", "C3")
         flashers = (RISCV_FLASHERS if riscv else
                     XTENSA_FLASHERS if chip == "S3" else [])
         print(f"=== {name} [{chip}] {'online' if online else 'OFFLINE'} "
-              f"{usb or ''} {tty or ''} ===")
+              f"{usb or ''} {tty or ''}{' OFF-LIMITS' if off_limits else ''} ===")
+        if off_limits and not args.include_off_limits:
+            # Respect the production guard by default; flashing overwrites the
+            # board's firmware. Opt in with --include-off-limits.
+            print("    OFF-LIMITS — skipped (pass --include-off-limits to flash)\n")
+            csv.append(f"{name},{chip},,,,,,,off-limits-skipped")
+            continue
         if not online:
             print("    offline — skipped\n")
             csv.append(f"{name},{chip},,,,,offline")
