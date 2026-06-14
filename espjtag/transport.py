@@ -26,6 +26,16 @@ from .constants import (
 from . import chips
 
 
+def norm_serial(s):
+    """Normalize a USB serial (the ESP MAC) for tolerant matching: accept it with
+    or without colons and in any case. '58:E6:C5:11:B7:EC', '58e6c511b7ec', and
+    '58-e6-c5-11-b7-ec' all normalize to '58e6c511b7ec'. Returns None for None so
+    callers can pass an absent serial straight through."""
+    if s is None:
+        return None
+    return "".join(ch for ch in str(s).lower() if ch.isalnum())
+
+
 class EspUsbJtagTransport:
     # --- JTAG scan-chain layout ------------------------------------------
     # Most ESP RISC-V parts (C3/C6/H2) expose ONE TAP, so the target debug TAP
@@ -63,11 +73,14 @@ class EspUsbJtagTransport:
         #              stale, not the board being gone).
         #   usb_path — the sysfs port chain (e.g. "1-1.3.1.3.1" -> bus 1, ports
         #              (1,3,1,3,1)); volatile, but unambiguous when present.
-        # Pass at most one; serial wins if both are given.
+        # Pass at most one; serial wins if both are given. Serial matching is
+        # tolerant of colons/case (norm_serial): '58:E6:..' == '58e6..' etc.
+        want_serial = norm_serial(serial)
+
         def _match(d):
             if serial is not None:
                 try:
-                    return usb.util.get_string(d, d.iSerialNumber) == serial
+                    return norm_serial(usb.util.get_string(d, d.iSerialNumber)) == want_serial
                 except (usb.core.USBError, ValueError):
                     return False
             if usb_path is None:

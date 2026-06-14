@@ -33,11 +33,19 @@ from .constants import (
 from .transport import EspUsbJtagTransport
 
 
-def reset_run(usb_path=None):
+def reset_run(usb_path=None, serial=None):
     """Reboot the matching RISC-V ESP (C3/C5/C6/H2) into its app by pulsing
     ndmreset over the built-in USB-JTAG. Pure Python, no OpenOCD, transport-only.
-    Returns True on a clean run."""
-    j = EspUsbJtagTransport(usb_path)
+    Returns True on a clean run.
+
+    Pin the unit by `serial` (the USB MAC — STABLE across re-enumeration) or
+    `usb_path` (volatile bus-port). serial is preferred for any esptool+espjtag
+    combo: esptool flashes with `--after no-reset` (which does NOT re-enumerate),
+    then this boots the app over JTAG (also no re-enumeration) — so the device
+    keeps the same bus address the whole time and nothing races. Use this INSTEAD
+    of esptool `--after hard-reset`, whose RTS reset drops the USB-Serial/JTAG
+    peripheral off the bus (esptool #970; openocd-esp32 #316/#342)."""
+    j = EspUsbJtagTransport(usb_path, serial=serial)
     j.dmi_write(DMCONTROL, DM_DMACTIVE)                              # claim DM
     j.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)
     j.dmi_write(DMCONTROL, DM_HALTREQ | DM_NDMRESET | DM_DMACTIVE)   # assert reset

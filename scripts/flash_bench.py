@@ -167,37 +167,16 @@ def path_for_serial(serial):
     Returns None if the board isn't currently present. This is the fix for the
     matrix drop (#2): a board that re-enumerated under hub load keeps its serial
     but gets a new path, so re-resolving here finds it instead of failing on the
-    stale path cached at fleet-scan time."""
+    stale path cached at fleet-scan time. Serial match is colon/case tolerant."""
     import usb.core
+    from espjtag.transport import norm_serial
+    want = norm_serial(serial)
     for d in usb.core.find(find_all=True, idVendor=0x303A, idProduct=0x1001):
         try:
-            if usb.util.get_string(d, d.iSerialNumber) == serial:
+            if norm_serial(usb.util.get_string(d, d.iSerialNumber)) == want:
                 return f"{d.bus}-" + ".".join(str(p) for p in (d.port_numbers or ()))
         except (usb.core.USBError, ValueError):
             continue
-    return None
-
-
-def wait_usb_ready(serial, tries=200):
-    """Poll until the 303a:1001 with `serial` is enumerated AND its string
-    descriptor is readable, returning its live usb_path (or None if it never
-    comes back). OpenOCD opens the device and immediately reads the USB string
-    descriptor; if launched during a re-enumeration window (the preceding
-    esptool --after hard-reset re-enumerates the chip) it fails in ~20 ms with
-    'libusb_get_string_descriptor_ascii() failed with -9' (LIBUSB_ERROR_PIPE).
-    This gates the next tool on the descriptor actually being readable — the same
-    operation that was failing — so we wait for the real condition, not a blind
-    sleep. `tries` is a generous bound: re-enumeration completes well under a
-    second; if the descriptor isn't readable after the bound the board is
-    genuinely gone (caller reports it rather than hanging)."""
-    import usb.core
-    for _ in range(tries):
-        for d in usb.core.find(find_all=True, idVendor=0x303A, idProduct=0x1001):
-            try:
-                if usb.util.get_string(d, d.iSerialNumber) == serial:
-                    return f"{d.bus}-" + ".".join(str(p) for p in (d.port_numbers or ()))
-            except (usb.core.USBError, ValueError):
-                continue                       # descriptor not readable yet -> keep polling
     return None
 
 
@@ -372,17 +351,21 @@ def heal_mspi_clock(tty, chip, logfile=None):
                    f"{r.stdout}\n{r.stderr}\n")
 
 
-def _hard_reset(tty, chip, logfile=None):
-    """Boot firmware and leave the chip in a clean reset state (esptool hard-reset)
-    — used to undo the no-reset MSPI heal so the next tool starts known-good."""
-    if not tty:
-        return
-    espchip = ESPTOOL_CHIP.get(chip, "auto")
-    cmd = ["esptool", "--chip", espchip, "--port", tty, "--before",
-           "default-reset", "--after", "hard-reset", "flash-id"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    _wlog(logfile, f"$ {' '.join(cmd)}\n--- hard-reset restore rc={r.returncode} ---\n"
-                   f"{r.stdout}\n{r.stderr}\n")
+def _espjtag_reset(usb_path, logfile=None):
+    """Boot the chip into its app over JTAG (espjtag ndmreset) — used to leave a
+    known-good RUNNING state after the no-reset MSPI heal. Replaces the old
+    esptool --after hard-reset, whose RTS reset RE-ENUMERATES the USB-Serial/JTAG
+    peripheral (esptool #970; openocd-esp32 #316/#342) and caused the next tool's
+    USB descriptor read to race (libusb -9). espjtag's ndmreset is a full-system
+    reset that re-straps + boots the app WITHOUT dropping USB — same device, same
+    bus address, no race."""
+    from espjtag.reset import reset_run
+    try:
+        reset_run(usb_path)
+        _wlog(logfile, f"$ espjtag.reset_run({usb_path})\n--- ndmreset boot OK "
+                       f"(no USB re-enumeration) ---\n")
+    except Exception as e:                                  # noqa: BLE001
+        _wlog(logfile, f"$ espjtag.reset_run({usb_path})\n--- FAILED: {e} ---\n")
 
 
 def run_flasher(name, usb_path, tty, chip, addr, A, B, logfile=None):
@@ -417,23 +400,6 @@ def run_flasher(name, usb_path, tty, chip, addr, A, B, logfile=None):
         # leave the C5 MSPI flash clock dead -> openocd's probe would see 0 KB.
         # Boot firmware over serial first to re-init the clock the documented way.
         heal_mspi_clock(tty, chip, logfile=logfile)
-        # ROOT CAUSE (openocd-esp32 #316/#342): esptool --after hard-reset on
-        # C3/C6 is a classic RTS reset, and the USB-Serial/JTAG peripheral is in
-        # that reset domain -> it RE-ENUMERATES. If the PRECEDING flasher
-        # (esptool-incr-dev-fast --after hard-reset) is still re-enumerating when
-        # openocd attaches, openocd's init descriptor read dies in ~20 ms with
-        # libusb -9. The structural fix is "let openocd own the reset" (its JTAG
-        # ndmreset does NOT re-enumerate) — but we can't change the MEASURED
-        # esptool flasher's --after. So gate openocd's launch on the descriptor
-        # being readable again (poll the EXACT op that fails — not a blind sleep)
-        # and re-resolve the path it re-enumerated onto.
-        serial = usb_serial(usb_path)
-        if serial:
-            ready_path = wait_usb_ready(serial)
-            if ready_path is None:
-                return None, False, "device not back on USB after reset (openocd gate)"
-            usb_path = ready_path
-            cmd, note, env_extra = external_cmd(name, usb_path, tty, chip, addr)
     paths = {}
     for key, data in (("A", A), ("B", B)):
         with tempfile.NamedTemporaryFile(suffix=".bin", delete=False, dir=TMP) as f:
@@ -450,11 +416,15 @@ def run_flasher(name, usb_path, tty, chip, addr, A, B, logfile=None):
                    f"{r.stdout}\n{r.stderr}\n")
     for p in paths.values():
         os.unlink(p)
-    if name == "openocd-full" and chip in MSPI_HEAL_CHIPS:
-        # The no-reset heal left firmware running mid-stub; restore a clean
-        # hard-reset state so the NEXT flasher's espjtag setup_a (ROM flash
-        # self-test) and this call's verify both start from a known-good chip.
-        _hard_reset(tty, chip, logfile=logfile)
+    if name == "openocd-full":
+        # openocd's program_esp leaves the chip halted/reset; the NEXT flasher's
+        # espjtag setup_a (ROM flash gate) can then fail its first erase ('flash
+        # erase block N -> 1' on the C6). Boot the app over JTAG (espjtag
+        # ndmreset, NO USB re-enumeration) to leave a known-good RUNNING chip so
+        # the next setup_a + this call's verify both start clean — without the
+        # ~450ms USB re-enumeration an esptool hard-reset would cost. (On the C5
+        # this also pairs with the no-reset MSPI heal above.)
+        _espjtag_reset(usb_path, logfile=logfile)
     if r.returncode != 0:
         return elapsed, False, f"rc={r.returncode}: {(r.stderr or r.stdout)[-120:].strip()}"
     ok, note = verify_after_external(usb_path, addr, B)         # retries post-reset
