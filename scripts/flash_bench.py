@@ -216,31 +216,55 @@ def verify_crc(j, addr, B):
                for s in range(len(B) // SEC))
 
 
-def verify_independent(tty, chip, addr, B, logfile=None):
+# esptool serial-connection errors that are TRANSIENT (contended USB hub, the chip
+# not yet back in a serial-responsive state after espjtag's JTAG flash) — retry
+# these. A byte MISMATCH is never in here: that's a real failure, never retried.
+_ESPTOOL_TRANSIENT = (
+    "stopped responding", "serial data stream stopped", "serial noise",
+    "failed to connect", "no serial data received", "wrong boot mode",
+    "timed out waiting", "could not open",
+)
+
+
+def verify_independent(tty, chip, addr, B, logfile=None, tries=3):
     """INDEPENDENT cross-tool verify: read the flashed region back with esptool
     over SERIAL and compare to B. The strongest correctness check for an espjtag
     flash — espjtag writes over JTAG, esptool reads over a totally separate
     transport + codebase, so a shared bug can't self-certify. Returns (ok, note).
     (probe-rs XIP read returns 0addbad0 = unmapped; openocd flash read is
-    chip-flaky on the C5 — esptool serial read is the reliable independent path.)"""
+    chip-flaky on the C5 — esptool serial read is the reliable independent path.)
+
+    Retries TRANSIENT serial-connection failures (contended hub / chip not yet
+    serial-ready after the JTAG flash) up to `tries` — but a byte MISMATCH or any
+    non-transient error returns immediately, so a real bad write is never masked."""
     if not tty:
         return None, "no tty for independent verify"
     espchip = ESPTOOL_CHIP.get(chip, "auto")
     with tempfile.NamedTemporaryFile(suffix=".bin", delete=False, dir=TMP) as f:
         rb = f.name
     try:
-        cmd = ["esptool", "--chip", espchip, "--port", tty, "--before",
-               "default-reset", "--after", "hard-reset", "read-flash",
-               hex(addr), str(len(B)), rb]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
-        if logfile:
-            with open(logfile, "a") as lf:
-                lf.write(f"$ {' '.join(cmd)}\n--- independent verify rc={r.returncode}"
-                         f" ---\n{r.stdout}\n{r.stderr}\n")
-        if r.returncode != 0:
-            return False, f"esptool read-flash rc={r.returncode}"
-        got = open(rb, "rb").read()
-        return got == B, "" if got == B else "independent readback != written image"
+        last = "?"
+        for attempt in range(tries):
+            cmd = ["esptool", "--chip", espchip, "--port", tty, "--before",
+                   "default-reset", "--after", "hard-reset", "read-flash",
+                   hex(addr), str(len(B)), rb]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+            if logfile:
+                with open(logfile, "a") as lf:
+                    lf.write(f"$ {' '.join(cmd)}\n--- independent verify "
+                             f"rc={r.returncode} (attempt {attempt + 1}/{tries}) "
+                             f"---\n{r.stdout}\n{r.stderr}\n")
+            if r.returncode == 0:
+                got = open(rb, "rb").read()
+                if got == B:
+                    return True, ""
+                return False, "independent readback != written image"  # REAL fail
+            out = (r.stderr + r.stdout).lower()
+            last = f"esptool read-flash rc={r.returncode}"
+            if not any(t in out for t in _ESPTOOL_TRANSIENT):
+                return False, last                       # non-transient — don't retry
+            # transient serial error -> loop and retry (chip/hub settles)
+        return False, f"{last} (transient, {tries} tries)"
     finally:
         os.unlink(rb)
 
