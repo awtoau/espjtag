@@ -46,6 +46,17 @@ ALLOW = [
     ("Application image is invalid", "same program_esp boot inspection; write "
      "succeeds + is independently verified by esptool serial readback"),
     ("appimage_offset", "same program_esp app-image boot note on a raw test offset"),
+    #
+    # When the bench alternates espjtag and openocd on one chip, openocd finds
+    # espjtag's resident RAM stub (#27) in the stub region (the magic is RISC-V
+    # `jal` opcodes, 0x...006F — i.e. real code, not openocd's stub), warns, then
+    # installs ITS OWN stub and proceeds. Confirmed self-recovering: the slice
+    # that emits this still reports "Programming Finished" + rc=0 and passes the
+    # independent verify. Benign cross-tool RAM contention, not a flash failure.
+    ("Installed stub code magic_num", "openocd found espjtag's resident RAM stub; "
+     "it reinstalls its own and finishes OK (verified) — benign cross-tool note"),
+    ("Expected stub code magic_num", "pair of the above; openocd reinstalls its "
+     "stub and programming finishes + is independently verified"),
 ]
 
 
