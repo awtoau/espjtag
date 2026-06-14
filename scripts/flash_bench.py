@@ -276,6 +276,50 @@ def _wlog(logfile, text):
             f.write(text)
 
 
+# Chips whose MSPI (flash) clock is NOT preserved across a JTAG/SoC reset, so
+# OpenOCD's program_esp can't probe flash on a back-to-back invocation ("Failed
+# to read flash size!" -> "size 0 KB"). Confirmed on the C5: the FIRST openocd
+# run after firmware booted works; the SECOND fails because esp32c5_soc_reset
+# leaves the MSPI clock source unset (normal boot does bootloader_init_mspi_clock,
+# the reset proc doesn't). esptool over SERIAL hard-resets -> ROM boot re-inits
+# the MSPI clock, restoring flash access — proven on hardware. NOT reinventing:
+# this is the bootloader's own clock-init path, triggered the documented way.
+MSPI_HEAL_CHIPS = {"C5"}
+
+
+def heal_mspi_clock(tty, chip, logfile=None):
+    """Boot firmware over SERIAL so the ROM re-inits the MSPI (flash) clock that a
+    prior JTAG/SoC reset left dead — otherwise OpenOCD's next flash probe sees
+    0 KB. A cheap esptool flash-id does it (its default/hard reset boots the ROM).
+    No-op for chips that preserve the clock across reset (see MSPI_HEAL_CHIPS)."""
+    if chip not in MSPI_HEAL_CHIPS or not tty:
+        return
+    espchip = ESPTOOL_CHIP.get(chip, "auto")
+    # --after no-reset is load-bearing: esptool's stub boots and inits the MSPI
+    # clock, and NOT hard-resetting at the end leaves that clock LIVE when openocd
+    # attaches. A final hard-reset re-kills the clock (openocd's own soc_reset
+    # preserves a running MSPI clock but can't init a dead one) -> probe sees
+    # 0 KB. Proven: hard-reset gives flaky pass/fail, no-reset gives 3/3 clean.
+    cmd = ["esptool", "--chip", espchip, "--port", tty, "--before",
+           "default-reset", "--after", "no-reset", "flash-id"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    _wlog(logfile, f"$ {' '.join(cmd)}\n--- MSPI-clock heal rc={r.returncode} ---\n"
+                   f"{r.stdout}\n{r.stderr}\n")
+
+
+def _hard_reset(tty, chip, logfile=None):
+    """Boot firmware and leave the chip in a clean reset state (esptool hard-reset)
+    — used to undo the no-reset MSPI heal so the next tool starts known-good."""
+    if not tty:
+        return
+    espchip = ESPTOOL_CHIP.get(chip, "auto")
+    cmd = ["esptool", "--chip", espchip, "--port", tty, "--before",
+           "default-reset", "--after", "hard-reset", "flash-id"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    _wlog(logfile, f"$ {' '.join(cmd)}\n--- hard-reset restore rc={r.returncode} ---\n"
+                   f"{r.stdout}\n{r.stderr}\n")
+
+
 def run_flasher(name, usb_path, tty, chip, addr, A, B, logfile=None):
     """Put A on flash (setup), TIME flashing B with `name`, verify B independently.
     Returns (elapsed_s | None, ok | None, note). When `logfile` is given, the
@@ -303,6 +347,11 @@ def run_flasher(name, usb_path, tty, chip, addr, A, B, logfile=None):
     if cmd is None:
         return None, None, note
     setup_a(usb_path, addr, A)
+    if name == "openocd-full":
+        # setup_a wrote A over espjtag JTAG, which (like any JTAG/SoC reset) can
+        # leave the C5 MSPI flash clock dead -> openocd's probe would see 0 KB.
+        # Boot firmware over serial first to re-init the clock the documented way.
+        heal_mspi_clock(tty, chip, logfile=logfile)
     paths = {}
     for key, data in (("A", A), ("B", B)):
         with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
@@ -319,6 +368,11 @@ def run_flasher(name, usb_path, tty, chip, addr, A, B, logfile=None):
                    f"{r.stdout}\n{r.stderr}\n")
     for p in paths.values():
         os.unlink(p)
+    if name == "openocd-full" and chip in MSPI_HEAL_CHIPS:
+        # The no-reset heal left firmware running mid-stub; restore a clean
+        # hard-reset state so the NEXT flasher's espjtag setup_a (ROM flash
+        # self-test) and this call's verify both start from a known-good chip.
+        _hard_reset(tty, chip, logfile=logfile)
     if r.returncode != 0:
         return elapsed, False, f"rc={r.returncode}: {(r.stderr or r.stdout)[-120:].strip()}"
     ok, note = verify_after_external(usb_path, addr, B)         # retries post-reset
