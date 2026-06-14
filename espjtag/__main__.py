@@ -26,7 +26,38 @@ def _opt(name):
     return None
 
 
+USAGE = """\
+espjtag — pure-Python ESP32 USB-Serial/JTAG debugger
+
+Usage:
+  python -m espjtag [USB_PATH] [--serial MAC] [ACTION]
+
+Pin a unit (when several ESPs are on the bus):
+  USB_PATH            bus-port path, e.g. 1-1.3.1.3.4 (volatile)
+  --serial MAC        USB serial, e.g. 58:E6:C5:11:B7:EC — STABLE across
+                      re-enumeration, colon/case tolerant (PREFERRED)
+
+Actions (default = print transport + Debug Module diag):
+  --info              chip identity + flash info (JTAG, no stub, no serial)
+  --selftest          run the built-in self-test
+  --reset-run         ndmreset -> boot the app (normal reboot; NO USB re-enum)
+  --reset-from-rom    USB-bus reset + ndmreset -> boot OUT of post-flash ROM
+                      download mode (when a plain reset lands back in ROM)
+  -h, --help          this help
+
+Reset actions boot the chip over JTAG without dropping USB (no re-enumeration,
+no buttons) — see docs/RESET-WITHOUT-REENUMERATION.md.
+
+Examples:
+  python -m espjtag --info --serial 58:E6:C5:11:B7:EC
+  python -m espjtag --reset-from-rom --serial 58:E6:C5:11:B7:EC
+"""
+
+
 def main():
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(USAGE)
+        return 0
     serial = _opt("--serial")
     # positional usb_path = first bare arg that isn't a flag or a flag's value
     flag_vals = {v for f in ("--serial",) for v in [_opt(f)] if v}
