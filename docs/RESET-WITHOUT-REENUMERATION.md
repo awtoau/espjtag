@@ -63,9 +63,15 @@ reset_run(usb_path="1-1.3.1.3.4")         # or by bus-port path
 - It's **transport-only** (no halt/registers/flash) — deliberately small so it can
   be lifted into a minimal esptool PR (see below).
 - For a chip stuck in **post-flash ROM download** (BOOT strap latched low), a plain
-  `reset run` lands back in ROM; use `EspUsbJtag.reset_run_from_rom()` (USB-bus
-  reset to clear the latch **+** ndmreset) — wrapped by
-  [`scripts/boot_from_rom.py`](../scripts/boot_from_rom.py).
+  `reset run` lands back in ROM; use `--reset-from-rom` (USB-bus reset to clear the
+  latch **+** ndmreset), or the API `EspUsbJtag.reset_run_from_rom()`.
+
+Or from the command line (no script, works anywhere espjtag is installed):
+
+```
+python -m espjtag --reset-run       --serial 58:E6:C5:11:B7:EC   # boot the app
+python -m espjtag --reset-from-rom  --serial 58:E6:C5:11:B7:EC   # out of ROM dl
+```
 
 ## The esptool + espjtag combo (the recommended workflow)
 
