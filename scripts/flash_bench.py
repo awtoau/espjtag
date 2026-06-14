@@ -43,10 +43,30 @@ SEC = 0x1000
 ADDR = 0x300000
 ESPTOOL_CHIP = {"C6": "esp32c6", "C5": "esp32c5"}
 OOCD = "/home/dan/.espressif/tools/openocd-esp32/v0.12.0-esp32-20251215/openocd-esp32"
-FORK_ESPTOOL = "/home/dan/git/esptool-fork/.venv/bin/esptool"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = os.path.join(ROOT, "tmp")                  # workspace tmp, NOT system /tmp
 os.makedirs(TMP, exist_ok=True)
+
+
+def _resolve_fork_esptool():
+    """Locate the esptool FORK the bench compares against (device-diff +
+    fast-USJ-reset features). Resolution order, no hard-coded sibling path:
+      1) $FORK_ESPTOOL env var (explicit override)
+      2) vendored copy in this repo: vendor/esptool-fork/.venv/bin/esptool
+      3) legacy sibling checkout ~/git/esptool-fork/.venv/bin/esptool
+      4) "esptool" on PATH (LAST resort — may be upstream, not the fork; the
+         fork-only rows will then just measure upstream)
+    """
+    cand = [os.environ.get("FORK_ESPTOOL"),
+            os.path.join(ROOT, "vendor", "esptool-fork", ".venv", "bin", "esptool"),
+            os.path.expanduser("~/git/esptool-fork/.venv/bin/esptool")]
+    for c in cand:
+        if c and os.path.exists(c):
+            return c
+    return "esptool"
+
+
+FORK_ESPTOOL = _resolve_fork_esptool()
 DB = os.path.join(TMP, "flash-bench.db")
 GRAPH = os.path.join(ROOT, "docs", "images", "flash-progression.png")
 
