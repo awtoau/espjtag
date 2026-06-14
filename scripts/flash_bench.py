@@ -440,7 +440,14 @@ def external_cmd(name, usb_path, tty, chip, addr):
         # C5 — 'size 0 KB'). It emits BENIGN app-image warnings when writing a
         # raw test offset (no app image there) — those are ALLOW-listed in
         # audit_bench_log.py with a reason, not a real problem.
+        # Disable the gdb/tcl/telnet servers: a one-shot program_esp never uses
+        # them, and a prior invocation's gdb server on :3333 can still hold the
+        # port when the next starts ("couldn't bind gdb to socket on port 3333:
+        # Address already in use" -> OpenOCD init failed). Turning them off
+        # removes the host-side port race entirely (not a chip problem).
         return [f"{OOCD}/bin/openocd", "-s", f"{OOCD}/share/openocd/scripts",
+                "-c", "gdb port disabled", "-c", "tcl port disabled",
+                "-c", "telnet port disabled",
                 "-c", f"adapter usb location {usb_path}",
                 "-f", f"board/esp32{chip.lower()}-builtin.cfg",
                 "-c", "program_esp {B} " + hex(addr) + " exit"], "", None
