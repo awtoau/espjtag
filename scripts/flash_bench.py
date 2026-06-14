@@ -162,6 +162,22 @@ def usb_serial(usb_path):
     return None
 
 
+def path_for_serial(serial):
+    """Live usb_path for a STABLE serial (the MAC), re-read from the bus NOW.
+    Returns None if the board isn't currently present. This is the fix for the
+    matrix drop (#2): a board that re-enumerated under hub load keeps its serial
+    but gets a new path, so re-resolving here finds it instead of failing on the
+    stale path cached at fleet-scan time."""
+    import usb.core
+    for d in usb.core.find(find_all=True, idVendor=0x303A, idProduct=0x1001):
+        try:
+            if usb.util.get_string(d, d.iSerialNumber) == serial:
+                return f"{d.bus}-" + ".".join(str(p) for p in (d.port_numbers or ()))
+        except (usb.core.USBError, ValueError):
+            continue
+    return None
+
+
 def connect(usb_path):
     try:
         j = EspUsbJtag(usb_path)

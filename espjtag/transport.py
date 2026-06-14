@@ -53,10 +53,23 @@ class EspUsbJtagTransport:
     # need listing (single-TAP is the class default above).
     _CHAIN_BY_IDCODE = chips.chain_by_idcode()
 
-    def __init__(self, usb_path=None):
-        # Match the right unit when several 303a:1001 are on the bus, by the
-        # sysfs port chain (e.g. "1-1.3.1.3.1" -> bus 1, ports (1,3,1,3,1)).
+    def __init__(self, usb_path=None, serial=None):
+        # Pin the right unit when several 303a:1001 are on the bus. Two keys:
+        #   serial   — the device's USB serial (the MAC); STABLE across re-enumer-
+        #              ation. PREFER THIS: a board that drops and comes back under
+        #              hub load gets a new usb_path but keeps its serial, so a
+        #              serial-pinned caller still finds it (the matrix's "no
+        #              303a:1001 matching '1-1.3.1.3.3.4'" drop was usb_path going
+        #              stale, not the board being gone).
+        #   usb_path — the sysfs port chain (e.g. "1-1.3.1.3.1" -> bus 1, ports
+        #              (1,3,1,3,1)); volatile, but unambiguous when present.
+        # Pass at most one; serial wins if both are given.
         def _match(d):
+            if serial is not None:
+                try:
+                    return usb.util.get_string(d, d.iSerialNumber) == serial
+                except (usb.core.USBError, ValueError):
+                    return False
             if usb_path is None:
                 return True
             try:
@@ -70,7 +83,8 @@ class EspUsbJtagTransport:
         dev = next((d for d in usb.core.find(find_all=True, idVendor=VID,
                                              idProduct=PID) if _match(d)), None)
         if dev is None:
-            raise RuntimeError(f"esp_usb_jtag: no 303a:1001 matching {usb_path!r}")
+            want = f"serial {serial!r}" if serial is not None else repr(usb_path)
+            raise RuntimeError(f"esp_usb_jtag: no 303a:1001 matching {want}")
         self.dev = dev
         cfg = dev.get_active_configuration()
         # The JTAG interface is the VENDOR-SPEC one (0xFF). iface 0/1 are the

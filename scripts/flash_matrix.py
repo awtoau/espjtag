@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from flash_bench import (make_ab, run_flasher, ESPTOOL_CHIP, FORK_ESPTOOL,  # noqa: E402
-                         DEVPY, SEC, TMP)
+                         DEVPY, SEC, TMP, path_for_serial)
 from audit_bench_log import audit                          # noqa: E402
 
 # extend the esptool chip map for the full fleet
@@ -47,20 +47,25 @@ LOGFILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 def fleet():
     """All boards from dev.py fleet-status: (name, CHIP, usb_path|None, tty|None,
-    online). CHIP is the short label (C6/C5/C3/S3)."""
+    online, serial|None). CHIP is the short label (C6/C5/C3/S3); serial is the
+    STABLE USB MAC used to re-resolve a board that re-enumerated (blocker #2)."""
     out = subprocess.run(["python3", DEVPY, "fleet-status"], capture_output=True,
                          text=True).stdout
     import re
     boards = []
     for line in out.splitlines():
-        m = re.search(r"([●○])\s+(\S+)\s+esp32(\w+)\s+(\S+)", line)
+        # name chip usb_path serial(MAC) ... — capture the MAC after the path.
+        m = re.search(r"([●○])\s+(\S+)\s+esp32(\w+)\s+(\S+)\s+"
+                      r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})", line)
         if not m:
             continue
         online = m.group(1) == "●"
         chip = m.group(3).upper()
         usb = m.group(4) if m.group(4)[0].isdigit() else None
+        serial = m.group(5)
         tty = re.search(r"/dev/ttyACM\d+", line)
-        boards.append((m.group(2), chip, usb, tty.group(0) if tty else None, online))
+        boards.append((m.group(2), chip, usb, tty.group(0) if tty else None,
+                       online, serial))
     return boards
 
 
@@ -125,7 +130,7 @@ def main():
     print(f"full tool output -> {LOGFILE}\n")
 
     csv = ["board,chip,size_kb,flasher,median_ms,eff_MBps,act_MBps,n,status"]
-    for name, chip, usb, tty, online in boards:
+    for name, chip, usb, tty, online, serial in boards:
         riscv = chip in ("C6", "C5", "C3")
         flashers = (RISCV_FLASHERS if riscv else
                     XTENSA_FLASHERS if chip == "S3" else [])
@@ -149,15 +154,21 @@ def main():
                     # aborts the whole run immediately (don't grind 8 boards x 3
                     # sizes to report at the end). Fix the warning, then re-run.
                     el = ok = note = None
+                    # Re-resolve usb_path from the STABLE serial NOW (#2): a board
+                    # that re-enumerated under hub load keeps its serial but gets a
+                    # new path. cur falls back to the scan-time path if the board
+                    # isn't found (so the failure is "board gone", not a stale path).
+                    cur = (path_for_serial(serial) or usb) if serial else usb
                     with open(LOGFILE, "r+") as lf:
                         mark = lf.seek(0, 2)               # offset before this call
-                        lf.write(f"\n##### {name} [{chip}] {kb}KiB {f} #####\n")
+                        lf.write(f"\n##### {name} [{chip}] {kb}KiB {f} "
+                                 f"(usb {cur}) #####\n")
                     try:
                         if chip == "S3":
                             el, ok, note = esptool_s3(f, tty, chip, args.addr, A, B,
                                                       logfile=LOGFILE)
                         else:
-                            el, ok, note = run_flasher(f, usb, tty, chip, args.addr,
+                            el, ok, note = run_flasher(f, cur, tty, chip, args.addr,
                                                        A, B, logfile=LOGFILE)
                     except Exception as e:                 # noqa: BLE001
                         import traceback
