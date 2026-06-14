@@ -45,7 +45,9 @@ ESPTOOL_CHIP = {"C6": "esp32c6", "C5": "esp32c5"}
 OOCD = "/home/dan/.espressif/tools/openocd-esp32/v0.12.0-esp32-20251215/openocd-esp32"
 FORK_ESPTOOL = "/home/dan/git/esptool-fork/.venv/bin/esptool"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB = os.path.join(ROOT, "tmp", "flash-bench.db")
+TMP = os.path.join(ROOT, "tmp")                  # workspace tmp, NOT system /tmp
+os.makedirs(TMP, exist_ok=True)
+DB = os.path.join(TMP, "flash-bench.db")
 GRAPH = os.path.join(ROOT, "docs", "images", "flash-progression.png")
 
 
@@ -208,7 +210,7 @@ def verify_independent(tty, chip, addr, B, logfile=None):
     if not tty:
         return None, "no tty for independent verify"
     espchip = ESPTOOL_CHIP.get(chip, "auto")
-    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False, dir=TMP) as f:
         rb = f.name
     try:
         cmd = ["esptool", "--chip", espchip, "--port", tty, "--before",
@@ -354,7 +356,7 @@ def run_flasher(name, usb_path, tty, chip, addr, A, B, logfile=None):
         heal_mspi_clock(tty, chip, logfile=logfile)
     paths = {}
     for key, data in (("A", A), ("B", B)):
-        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False, dir=TMP) as f:
             f.write(data)
             paths[key] = f.name
     argv = [a.format(A=paths["A"], B=paths["B"]) for a in cmd]

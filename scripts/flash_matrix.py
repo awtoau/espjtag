@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from flash_bench import (make_ab, run_flasher, ESPTOOL_CHIP, FORK_ESPTOOL,  # noqa: E402
-                         DEVPY, SEC)
+                         DEVPY, SEC, TMP)
 from audit_bench_log import audit                          # noqa: E402
 
 # extend the esptool chip map for the full fleet
@@ -73,7 +73,7 @@ def esptool_s3(name, tty, chip, addr, A, B, logfile=None):
     binary = bins[name]
     paths = {}
     for k, data in (("A", A), ("B", B)):
-        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False, dir=TMP) as f:
             f.write(data)
             paths[k] = f.name
 
