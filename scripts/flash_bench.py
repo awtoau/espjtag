@@ -178,6 +178,29 @@ def path_for_serial(serial):
     return None
 
 
+def wait_usb_ready(serial, tries=200):
+    """Poll until the 303a:1001 with `serial` is enumerated AND its string
+    descriptor is readable, returning its live usb_path (or None if it never
+    comes back). OpenOCD opens the device and immediately reads the USB string
+    descriptor; if launched during a re-enumeration window (the preceding
+    esptool --after hard-reset re-enumerates the chip) it fails in ~20 ms with
+    'libusb_get_string_descriptor_ascii() failed with -9' (LIBUSB_ERROR_PIPE).
+    This gates the next tool on the descriptor actually being readable — the same
+    operation that was failing — so we wait for the real condition, not a blind
+    sleep. `tries` is a generous bound: re-enumeration completes well under a
+    second; if the descriptor isn't readable after the bound the board is
+    genuinely gone (caller reports it rather than hanging)."""
+    import usb.core
+    for _ in range(tries):
+        for d in usb.core.find(find_all=True, idVendor=0x303A, idProduct=0x1001):
+            try:
+                if usb.util.get_string(d, d.iSerialNumber) == serial:
+                    return f"{d.bus}-" + ".".join(str(p) for p in (d.port_numbers or ()))
+            except (usb.core.USBError, ValueError):
+                continue                       # descriptor not readable yet -> keep polling
+    return None
+
+
 def connect(usb_path):
     try:
         j = EspUsbJtag(usb_path)
@@ -394,6 +417,23 @@ def run_flasher(name, usb_path, tty, chip, addr, A, B, logfile=None):
         # leave the C5 MSPI flash clock dead -> openocd's probe would see 0 KB.
         # Boot firmware over serial first to re-init the clock the documented way.
         heal_mspi_clock(tty, chip, logfile=logfile)
+        # ROOT CAUSE (openocd-esp32 #316/#342): esptool --after hard-reset on
+        # C3/C6 is a classic RTS reset, and the USB-Serial/JTAG peripheral is in
+        # that reset domain -> it RE-ENUMERATES. If the PRECEDING flasher
+        # (esptool-incr-dev-fast --after hard-reset) is still re-enumerating when
+        # openocd attaches, openocd's init descriptor read dies in ~20 ms with
+        # libusb -9. The structural fix is "let openocd own the reset" (its JTAG
+        # ndmreset does NOT re-enumerate) — but we can't change the MEASURED
+        # esptool flasher's --after. So gate openocd's launch on the descriptor
+        # being readable again (poll the EXACT op that fails — not a blind sleep)
+        # and re-resolve the path it re-enumerated onto.
+        serial = usb_serial(usb_path)
+        if serial:
+            ready_path = wait_usb_ready(serial)
+            if ready_path is None:
+                return None, False, "device not back on USB after reset (openocd gate)"
+            usb_path = ready_path
+            cmd, note, env_extra = external_cmd(name, usb_path, tty, chip, addr)
     paths = {}
     for key, data in (("A", A), ("B", B)):
         with tempfile.NamedTemporaryFile(suffix=".bin", delete=False, dir=TMP) as f:
