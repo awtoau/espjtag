@@ -269,3 +269,5 @@ STUBS = {
         },
     },
 }
+
+TRAMP_WIN = bytes.fromhex('92c12090d149ad02bd03cd04dd0560e620e008002d0a00400006ffff')
