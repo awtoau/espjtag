@@ -15,11 +15,6 @@ source). Mirrors the C structure exactly; comments cite the C function/line.
 import time
 
 from .xtensa_stubs import STUBS, TRAMP_WIN
-from .xtensa import (
-    DIR0EXEC, DSR, OCDDSR_STOPPED, INS_RFDO,
-    INS_WSR_EPC6_A3, INS_WSR_EPS6_A3, INS_WSR_VECBASE_A3,
-    INS_WSR_WB_A3, INS_WSR_WS_A3,
-)
 
 
 def _bytes_to_words(b):
@@ -140,30 +135,26 @@ class XtensaFlasher:
         if self.loaded is None:
             raise RuntimeError("no stub loaded")
         s = self.stub
-        x = self.x
         sp = (s["stack_addr"] & ~0xF) - 16                       # algo_regs_init_start
-        # --- xtensa_start_algorithm (xtensa.c:2810) ---
-        # special regs via _set_sr_a3 (WSR a3,<sr>) FIRST — they clobber a3 — then
-        # the a-regs LAST so an arg in a3 isn't lost. (mirrors _call0's ordering.)
-        x._set_sr_a3(INS_WSR_VECBASE_A3, s["trap_entry_addr"])   # VECBASE=trap_entry
-        x._set_sr_a3(INS_WSR_EPS6_A3, RUN_PS)                    # run-PS (EPS6)
-        x._set_sr_a3(INS_WSR_WB_A3, 0)                           # windowbase=0
-        x._set_sr_a3(INS_WSR_WS_A3, 1)                           # windowstart=1
-        x._set_sr_a3(INS_WSR_EPC6_A3, s["tramp_mapped_addr"])    # PC = trampoline
-        x._set_ar(0, 0)                                          # a0
-        x._set_ar(1, sp)                                         # a1 = sp
-        x._set_ar(8, s["entry"])                                 # a8 = windowed entry
-        for i, a in enumerate(args):
-            x._set_ar(2 + i, a & 0xFFFFFFFF)                     # a2..a6 = args
-        # resume (RFDO -> EPC6 = the trampoline, which callx8's into entry)
-        x.nar_write(DIR0EXEC, INS_RFDO)
-        # --- xtensa_wait_algorithm (xtensa.c:2911): wait HALTED at exit BREAK ---
-        deadline = time.perf_counter() + timeout_ms / 1000.0
-        halted = False
-        while time.perf_counter() < deadline:
-            if x.nar_read(DSR) & OCDDSR_STOPPED:
-                halted = True
-                break
+        # Build the reg_params exactly as esp_xtensa_algo_regs_init_start does
+        # (esp_xtensa_algorithm.c:47), then call the ONE faithful start/wait_algorithm
+        # port in xtensa.py. VECBASE=trap_entry_addr is start_algorithm's stub vector
+        # table. a2 is inout (the return code). Resume onto the trampoline, which
+        # callx8's the windowed entry (a8) natively.
+        reg_params = [
+            ("vecbase", s["trap_entry_addr"], "out"),
+            ("ps", RUN_PS, "out"),                               # WOE+UM+INTLEVEL6
+            ("windowbase", 0, "out"),
+            ("windowstart", 1, "out"),
+            ("a0", 0, "out"),
+            ("a1", sp, "out"),
+            ("a8", s["entry"], "out"),                           # windowed entry
+            ("a2", args[0] if args else 0, "inout"),             # arg0 / return code
+        ]
+        for i, a in enumerate(args[1:], start=3):                # a3..a6 = args 1..4
+            reg_params.append((f"a{i}", a & 0xFFFFFFFF, "out"))
+        self.x.start_algorithm(reg_params, s["tramp_mapped_addr"])
+        out, halted = self.x.wait_algorithm(reg_params, timeout=timeout_ms)
         if not halted:
             raise RuntimeError("stub did not halt at exit BREAK (timeout)")
-        return x._get_ar(2)                                      # a2 = return code
+        return out["a2"]                                         # return code

@@ -199,6 +199,70 @@ class XtensaXDM:
         self.nar_write(DIR0EXEC, INS_WSR_DDR_A3)     # DDR = a3
         return self.nar_read(DDR)
 
+    # --- xtensa_start_algorithm / xtensa_wait_algorithm (xtensa.c:2810/2911) ------
+    # ONE faithful port of OpenOCD's two functions, taking NAMED reg_params exactly
+    # like the C (struct reg_param: reg_name, value, direction). Both the bare-call
+    # path and the stub-flasher build their reg_params and call these — same as
+    # OpenOCD, where xtensa_start_algorithm is one function used by every caller.
+    #
+    # reg_params: list of (name, value, direction) where direction is "out" (write
+    # before run) or "inout" (write before, read back after). Names map to the
+    # esp setters: 'a0'..'a15' -> _set_ar; 'ps' -> EPS6; 'windowbase'/'windowstart'
+    # -> WB/WS; 'vecbase' -> VECBASE. PS uses EPS6 because on LX the run-PS lives in
+    # the debug-level EPS (xtensa_start_algorithm maps ps -> eps_dbglevel_idx).
+    _REG_WSR = {
+        "ps": INS_WSR_EPS6_A3, "windowbase": INS_WSR_WB_A3,
+        "windowstart": INS_WSR_WS_A3, "vecbase": INS_WSR_VECBASE_A3,
+    }
+
+    def _reg_set(self, name, val):
+        if name in self._REG_WSR:
+            self._set_sr_a3(self._REG_WSR[name], val)
+        elif name[0] == "a" and name[1:].isdigit():
+            self._set_ar(int(name[1:]), val & 0xFFFFFFFF)
+        else:
+            raise ValueError(f"unknown reg_param {name!r}")
+
+    def _reg_get(self, name):
+        if name[0] == "a" and name[1:].isdigit():
+            return self._get_ar(int(name[1:]))
+        raise ValueError(f"cannot read reg_param {name!r}")
+
+    def start_algorithm(self, reg_params, entry_point, trap=None):
+        """xtensa_start_algorithm (xtensa.c:2810): set the run regs, then resume to
+        entry_point. Mirrors the C: special regs (which clobber a3) are written
+        FIRST, the a-regs LAST. `entry_point` is set via EPC6 (the debug-level PC)
+        and the resume is RFDO. `trap` (optional): the exit BREAK is written there
+        by the caller; we don't manage exit_point here beyond the resume.
+
+        NOTE: full a0..a7 context SAVE/RESTORE is the caller's job (it knows what to
+        preserve) — OpenOCD saves the whole core_cache; we save the regs we touch."""
+        # special/named SR params first (a3 scratch), a-regs after
+        for name, val, _dir in reg_params:
+            if name in self._REG_WSR:
+                self._reg_set(name, val)
+        self._set_sr_a3(INS_WSR_EPC6_A3, entry_point)      # PC = entry
+        for name, val, _dir in reg_params:
+            if name not in self._REG_WSR:
+                self._reg_set(name, val)
+        self.nar_write(DIR0EXEC, INS_RFDO)                 # resume at EPC6
+
+    def wait_algorithm(self, reg_params, timeout=4000):
+        """xtensa_wait_algorithm (xtensa.c:2911): poll DSR until STOPPED (the exit
+        BREAK), then read back the 'inout' reg_params. Returns (out_dict, halted).
+        out_dict maps each inout reg name to its post-run value."""
+        halted = False
+        for _ in range(timeout):
+            if self.nar_read(DSR) & OCDDSR_STOPPED:
+                halted = True
+                break
+        out = {}
+        if halted:
+            for name, _val, direction in reg_params:
+                if direction == "inout":
+                    out[name] = self._reg_get(name)
+        return out, halted
+
     def call_function(self, entry, args=(), stack=None, trap=None, timeout=4000,
                       windowed=True, bridge=None):
         """Call on-target code at `entry` with up to 6 int args; returns
