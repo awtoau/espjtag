@@ -124,10 +124,13 @@ class XtensaFlasher:
         return self.stub
 
     # --- run_image (esp_algorithm.c:144) + start/wait_algorithm ------------
-    def run(self, args=(), timeout_ms=4000):
-        """Run the loaded stub with up to 5 int args (a2..a6). Returns the stub
-        return code (a2). Mirrors esp_algorithm_run_image -> target_start_algorithm
-        (xtensa_start_algorithm) -> target_wait_algorithm (xtensa_wait_algorithm).
+    def run(self, args=(), mem_params=None, timeout_ms=4000):
+        """Run the loaded stub. `args` = up to 5 int args (a2..a6). `mem_params` =
+        list of {arg: <user-arg index>, size: <bytes>, data: <out bytes or None>}:
+        a RAM buffer is allocated for each, its address written into arg[arg]
+        (esp_algorithm_run_image:185-198), and read back into the dict's 'out'
+        after the run. Returns the stub return code (a2). Mirrors run_image ->
+        start_algorithm -> wait_algorithm.
 
         Resume at tramp_mapped_addr with: a0=0, a1=sp, a8=entry, args a2..a6,
         ps=0x60025, windowbase=0, windowstart=1; VECBASE=trap_entry_addr; halt
@@ -135,12 +138,27 @@ class XtensaFlasher:
         if self.loaded is None:
             raise RuntimeError("no stub loaded")
         s = self.stub
+        args = list(args)
+        # mem args: allocate buffers below the stack (descending dram area), write
+        # each buffer's address into its user-arg register. (run_image:185-198 — the
+        # preloaded path bases mem args at stub.stack_addr and grows up; we place
+        # them just below the stack base, clear of the SP, growing down.)
+        mem_params = mem_params or []
+        base = s["stack_addr"] - s["stack_size"] - 0x10
+        for mp in mem_params:
+            base = (base - _align_up(mp["size"], 4)) & ~0xF
+            mp["_addr"] = base
+            idx = mp["arg"]
+            while len(args) <= idx:
+                args.append(0)
+            args[idx] = base
+            if mp.get("data"):                                  # PARAM_OUT-to-target
+                self.x.write_mem(base, _bytes_to_words(mp["data"]))
         sp = (s["stack_addr"] & ~0xF) - 16                       # algo_regs_init_start
         # Build the reg_params exactly as esp_xtensa_algo_regs_init_start does
         # (esp_xtensa_algorithm.c:47), then call the ONE faithful start/wait_algorithm
-        # port in xtensa.py. VECBASE=trap_entry_addr is start_algorithm's stub vector
-        # table. a2 is inout (the return code). Resume onto the trampoline, which
-        # callx8's the windowed entry (a8) natively.
+        # port in xtensa.py. a2 is inout (the return code). Resume onto the
+        # trampoline, which callx8's the windowed entry (a8) natively.
         reg_params = [
             ("vecbase", s["trap_entry_addr"], "out"),
             ("ps", RUN_PS, "out"),                               # WOE+UM+INTLEVEL6
@@ -157,4 +175,8 @@ class XtensaFlasher:
         out, halted = self.x.wait_algorithm(reg_params, timeout=timeout_ms)
         if not halted:
             raise RuntimeError("stub did not halt at exit BREAK (timeout)")
+        # read back PARAM_IN mem buffers
+        for mp in mem_params:
+            words = self.x.read_mem(mp["_addr"], _align_up(mp["size"], 4) // 4)
+            mp["out"] = b"".join(w.to_bytes(4, "little") for w in words)[:mp["size"]]
         return out["a2"]                                         # return code
