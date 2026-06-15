@@ -1,0 +1,4 @@
+[submodule "vendor/esptool-fork"]
+	path = vendor/esptool-fork
+	url = https://github.com/awtoau/esptool.git
+	branch = bench-combo
