@@ -238,13 +238,23 @@ def verify_crc(j, addr, B):
                for s in range(len(B) // SEC))
 
 
-# esptool serial-connection errors that are TRANSIENT (contended USB hub, the chip
-# not yet back in a serial-responsive state after espjtag's JTAG flash) — retry
-# these. A byte MISMATCH is never in here: that's a real failure, never retried.
+# esptool serial errors split by what retrying actually does (#43):
+#
+# CONTENTION — the serial port is owned/locked by ANOTHER process, or we lack
+# permission. Retrying just RACES the other owner again; it never recovers. Report
+# it as contention so the failure is diagnosed, not silently burned through 3 tries.
+# (This is the case the "another process took the device" incident actually was.)
+_ESPTOOL_CONTENTION = (
+    "could not open", "permission denied", "resource busy", "device or resource busy",
+    "access is denied", "in use",
+)
+# TRANSIENT — the CHIP itself isn't serial-ready yet (mid-reboot right after the
+# JTAG flash, a momentary sync glitch). Retrying genuinely helps: the chip settles.
+# A byte MISMATCH is in NEITHER list — that's a real bad write, returned immediately.
 _ESPTOOL_TRANSIENT = (
     "stopped responding", "serial data stream stopped", "serial noise",
     "failed to connect", "no serial data received", "wrong boot mode",
-    "timed out waiting", "could not open",
+    "timed out waiting",
 )
 
 
@@ -283,9 +293,14 @@ def verify_independent(tty, chip, addr, B, logfile=None, tries=3):
                 return False, "independent readback != written image"  # REAL fail
             out = (r.stderr + r.stdout).lower()
             last = f"esptool read-flash rc={r.returncode}"
+            if any(c in out for c in _ESPTOOL_CONTENTION):
+                # Port owned by another process / no permission. Retrying just
+                # races the other owner — report it as contention instead (#43).
+                return False, (f"{last}: serial port CONTENTION (another process "
+                               f"owns {tty}? or permissions) — not retried")
             if not any(t in out for t in _ESPTOOL_TRANSIENT):
                 return False, last                       # non-transient — don't retry
-            # transient serial error -> loop and retry (chip/hub settles)
+            # transient (chip mid-reboot / sync glitch) -> loop and retry; it settles
         return False, f"{last} (transient, {tries} tries)"
     finally:
         os.unlink(rb)
