@@ -86,14 +86,20 @@ espjtag-incr's eff climbs **0.22 → 0.54 → 0.84 MB/s** across 64K→256K→1M
 unchanged sectors); every full flasher stays pinned ~0.07 MB/s. At 1 MiB
 incremental is **~11× faster than any JTAG full write** and 1.45× the serial fork.
 
-**Per-chip coverage:** C6 (c6-maker-a/-b), C5 (c5-xiao-a), S3 (3 boards incl. the
-production ble_bridge) — all clean. **S3 is esptool-serial only** (espjtag flash
-execution is open, #29); its full-write eff *rises* with size (0.05→0.12 MB/s) as
-the fixed reset+stub cost amortizes. **C3 was offline** (not on the bus). One
-honest gap: c6-maker-b dropped off a deep USB hub branch (`1-1.3.1.3.x`) at its
-1 MiB step — a physical bus-contention drop under matrix load (not a tool
-failure; its 64K/256K rows are complete), the same branch that dropped other
-boards across runs. The numbers are otherwise complete and reproducible.
+**Per-chip coverage:** C6 (c6-xiao/-maker units), C5 (c5-xiao-a), S3 (xiao S3
+units). **S3 is esptool-serial only** (espjtag flash execution is open, #29); its
+full-write eff *rises* with size (0.05→0.12 MB/s) as the fixed reset+stub cost
+amortizes. Boards flagged `off_limits` (the production ble_bridge_s3; the reserved
+c6-xiao-b) are **skipped by default** — pass `--include-off-limits` to measure
+them. **C3 was offline** at the time of these numbers.
+
+One earlier gap, since corrected: a C6 dropped off the bus mid-run. That was
+originally written up as a "deep USB hub branch under contention" — that framing
+was wrong (checked `lsusb -t`: it's a normal ThinkPad-dock hub port). The real
+cause is a **hung firmware app dropping its USB-Serial/JTAG peripheral off the
+bus** until a power-cycle — the same failure mode the reset work addresses; once
+re-enumerated, the board flashes fine. The numbers are complete and reproducible
+on present boards.
 
 ## 4. What this proves
 

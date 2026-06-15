@@ -1,9 +1,8 @@
 # Fleet flash benchmark — process & status
 
-How the cross-fleet flash benchmark works, how to run it, what guarantees it
-gives, and what's currently blocking a clean full run. Kept in sync with the
-tracker issue: **[#39 — P0: fix blockers before the next full fleet run](https://github.com/awtoau/espjtag/issues/39)**
-(and the C5-specific **[#38](https://github.com/awtoau/espjtag/issues/38)**).
+How the cross-fleet flash benchmark works, how to run it, and what guarantees it
+gives. The blocker tracker (#39) and the C5 probe issue (#38) that gated the first
+clean run are both **closed** — their fixes are described under *Status* below.
 
 ## What it measures
 
@@ -41,6 +40,12 @@ Flasher sets:
    `ALLOW` list, each with a written reason.
 3. **Single full log.** Every tool's full stdout/stderr for every invocation goes
    to one file: `tmp/flash_matrix_full.log` (plus a CSV at `tmp/flash_matrix.csv`).
+4. **Stable-serial device resolution.** Boards are pinned by their USB serial (the
+   MAC, colon/case tolerant), not the volatile bus-port path — so a board that
+   re-enumerates mid-run is still found at its new path instead of dropping out.
+5. **off_limits respected.** Boards flagged `off_limits` in `esp32-devices.json`
+   (production firmware, or reserved units) are **skipped by default**; pass
+   `--include-off-limits` to flash them deliberately.
 
 ## How to run
 
@@ -54,51 +59,45 @@ Options: `--sizes` (KiB CSV), `--rounds`, `--changed` (sectors), `--addr`
 A healthy run ends `ALL CLEAN`. A `!!! FAIL-FAST` line names the exact
 board/size/flasher that tripped and points at the full log.
 
-## Current status (HEAD `b155e85`, 2026-06-14)
+## Status
 
-**Working & committed:** the harness, fail-fast audit, independent verify, clean
-tool output (esptool deprecations removed + `--no-compress`; OpenOCD kept on
-`program_esp`, its un-silenceable boot-time appimage notes ALLOW-listed *with
-proof* — `esp appimage_offset -1` was tested and does not help).
+The harness is complete and the blockers that gated the first clean run are fixed
+(all committed). What changed, and why:
 
-**Last run aborted** (correctly) at **c5-xiao-a, 256 KiB, `openocd-full`**:
+- **C5 `openocd-full` flash-probe** (#38): after a JTAG/SoC reset the C5's MSPI
+  (flash) clock is left unset, so `program_esp`'s probe sees `0 KB`. Fix: an
+  esptool serial "MSPI-clock heal" (`--after no-reset`) before openocd re-inits the
+  clock the bootloader's documented way; an espjtag JTAG reset restores a clean
+  running state after. (`esp appimage_offset -1` was tested and does *not* help —
+  the benign boot-time appimage notes are ALLOW-listed with that proof.)
+- **Stable-serial resolution** (was a code bug, not USB): `EspUsbJtag(serial=…)` +
+  per-round re-resolution of the path from the serial, so a re-enumerated board is
+  found, not dropped (`no 303a:1001 matching '…'`).
+- **openocd `:3333` port race**: a one-shot `program_esp` never needs the gdb/tcl/
+  telnet servers, so they're disabled — kills the "Address already in use" abort.
+- **esptool `--after hard-reset` USB re-enumeration race** (openocd-esp32 #316/#342):
+  the RTS hard-reset drops the USB-Serial/JTAG peripheral off the bus and
+  re-enumerates it, racing the next tool's descriptor read (`libusb -9`). Replaced
+  the inter-tool resets with espjtag's JTAG `ndmreset` (no re-enumeration) — ~7×
+  faster and the race is gone. See `docs/RESET-WITHOUT-REENUMERATION.md`.
+- **Independent-verify retry split** (#43): a serial-port *contention* error
+  ("could not open" / "resource busy" — another process owns the port) is now
+  reported as contention, not retry-raced; only genuine chip-mid-reboot errors are
+  retried. A byte mismatch is never retried.
+- **Temp images** now go to workspace `./tmp/`, not system `/tmp`.
 
-```
-Warn : Failed to read flash size!
-Error: Failed to probe flash, size 0 KB
-Error: auto_probe failed
-** Clock configuration set failed **
-```
-
-The C5 first `openocd-full` round (64 KiB) passed; it fails on a *later*
-invocation after prior resets piled up — the on-chip flash stub can't read SPI
-flash size after a rapid JTAG CPU reset. "Clock configuration set failed" is the
-downstream symptom (no bank to clock-boost), not the cause.
-
-**Last clean numbers before the abort** (medians of 2, verify incl.):
-- ble_bridge_s3 (S3, esptool serial): 64K 1121 / 256K 2570 / 1024K 8430 ms
-- c5-xiao-a (C5) 64 KiB: espjtag-incr **310 ms**, espjtag-full 1027, esptool-incr
-  591, openocd-full 2051, probers-full 1587 ms
-
-## Blockers before the next full run (→ #39)
-
-1. **C5 `openocd-full` repeat-invocation probe failure** (→ #38). Try
-   `no_clock_boost`; if the 0 KB probe still aborts, settle the chip before
-   `program_esp` (or run openocd first per board), root-cause the stub, or drop
-   openocd-full for the C5 as a documented gap.
-2. **Device resolution by stable serial, not volatile `usb_path`.** Everything in
-   `flash_bench.py` keys on the bus-port string (`connect`, `run_flasher`,
-   `setup_a`, `verify_after_external`). When a board re-enumerates under hub load
-   the path changes and it can't be found ("esp_usb_jtag: no 303a:1001 matching
-   '1-1.3.1.3.3.4'"). Resolve by serial, re-derive `usb_path` on each reconnect.
-   **This is a code bug, not USB.**
-3. **Temp images leak to system `/tmp`.** `flash_matrix.py:76`,
-   `flash_bench.py:211,308` use `tempfile.NamedTemporaryFile` with no `dir=` —
-   lands in `/tmp`. Repo rule is workspace `./tmp/`. Point them there.
+**Known bench-only quirk (not user-facing, won't-fix):** alternating `openocd-full`
+and `espjtag` flashing the *same* chip back-to-back can intermittently trip
+`flash erase block -> 1` on a C6 (espjtag flash is 3/3 clean in isolation and after
+a clean openocd; only the mixed interleave the bench does trips it). Users never
+interleave the two flashers on one board, so there's no shipped-path impact (#41,
+closed).
 
 ## Related issues
 
-- **#38** — C5 OpenOCD flash-probe failure (the specific abort above).
-- **#39** — P0 tracker: the three blockers; gate the next full run on them.
+- **#38** — C5 OpenOCD flash-probe (fixed; MSPI-clock heal).
+- **#39** — P0 blocker tracker (closed; all blockers fixed).
+- **#41** — bench-only C6 openocd↔espjtag interleave (closed, won't-fix).
+- **#43** — verify contention-vs-transient split (fixed).
 - **#29** — S3 flash-over-JTAG (why S3 is esptool-serial-only here).
-- **#13** — cross-platform USB reset/recovery (overlaps blocker #2).
+- **#13** — cross-platform USB reset/recovery.
