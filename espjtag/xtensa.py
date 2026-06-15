@@ -245,6 +245,10 @@ class XtensaXDM:
         for name, val, _dir in reg_params:
             if name not in self._REG_WSR:
                 self._reg_set(name, val)
+        # de-assert the debug-interrupt halt request, THEN RFDO — without this the
+        # core never leaves debug mode (DSR stays STOPPED, PC unchanged). Same step
+        # _call_windowed does before its RFDO; resume() is exactly this DCRCLR.
+        self.nar_write(DCRCLR, OCDDCR_DEBUGINTERRUPT)
         self.nar_write(DIR0EXEC, INS_RFDO)                 # resume at EPC6
 
     def wait_algorithm(self, reg_params, timeout=4000):
