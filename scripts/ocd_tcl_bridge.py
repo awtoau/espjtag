@@ -105,37 +105,45 @@ class OcdTclBridge:
         t.register("poll", self._poll)
         t.register("sleep", self._sleep)
         t.register("echo", lambda a: (print(*a), "")[1])
-        # S3 stub-flasher (#29): drive the OpenOCD prebuilt flasher stub via Tcl,
-        # backed by espjtag.xtensa_flasher (the 1:1 port of esp_algorithm_*). Lets
-        # the #29 step-tests run as Tcl scripts through this bridge (the OpenOCD
-        # way) instead of hand-rolled python.
+        # Command naming convention: processor-extension commands are
+        # `<extension>_<noun>_<verb>` (e.g. xtensa_core_halt, xtensa_stub_load) so
+        # the name alone says which extension + what it acts on; generic test/perf
+        # commands are plain `noun_verb` (assert_equal, time_mark). A user never
+        # needs to read the implementation to understand a command.
+
+        # --- Xtensa extension: stub flasher (#29) ---
+        # Drive the OpenOCD prebuilt flasher stub via Tcl, backed by
+        # espjtag.xtensa_flasher (the 1:1 port of esp_algorithm_*).
         self._flasher = None
-        t.register("stub_load", self._stub_load)
-        t.register("stub_run", self._stub_run)
-        t.register("xhalt", self._xhalt)
-        # PURE validators — NO JTAG. plan_load() computes the memory image (addrs +
-        # bytes) the load WOULD write; these expose it so Tcl can assert the layout
-        # is right independent of hardware (the part paraphrase-bugs hid in).
-        t.register("stub_plan", self._stub_plan)
-        t.register("compare", self._compare)
-        # Instrumentation: the same harness MEASURES, not just pass/fails. `mark`/
-        # `elapsed` time a span; `jtag_count` reports transactions; `assert_lt`/
-        # `assert_eq` gate on thresholds. (Perf becomes a Tcl-scriptable test.)
-        t.register("mark", self._mark)
-        t.register("elapsed", self._elapsed)
-        t.register("jtag_count", self._jtag_count)
-        t.register("assert_eq", self._assert_eq)
-        t.register("assert_lt", self._assert_lt)
-        self._marks = {}
-        # MOCK-backed commands — run the flasher against MockXtensaXDM (NO JTAG),
-        # then assert on the recorded ops/mem/regs. The full no-hardware test path.
+        t.register("xtensa_core_halt", self._xtensa_core_halt)
+        t.register("xtensa_stub_load", self._xtensa_stub_load)
+        t.register("xtensa_stub_run", self._xtensa_stub_run)
+        # PURE plan validators — NO JTAG. plan_load() computes the memory image
+        # (addresses + bytes) the load WOULD write; these expose it so the layout
+        # is asserted independently of hardware (where transcription bugs hide).
+        t.register("xtensa_stub_plan_address", self._xtensa_stub_plan_address)
+        t.register("xtensa_stub_plan_bytes", self._xtensa_stub_plan_bytes)
+        t.register("xtensa_stub_plan_writes", self._xtensa_stub_plan_writes)
+        t.register("xtensa_plan_assert_no_overlap",
+                   self._xtensa_plan_assert_no_overlap)
+        # --- Xtensa extension: NO-HARDWARE mock (MockXtensaXDM) ---
+        # Run the flasher against the software model and assert on the recorded
+        # memory/registers/operation-sequence — the full no-chip test path.
         self._mock = None
-        t.register("mock_load", self._mock_load)
-        t.register("mock_run", self._mock_run)
-        t.register("mem_expect", self._mem_expect)
-        t.register("reg_expect", self._reg_expect)
-        t.register("op_count", self._op_count)
-        t.register("plan_no_overlap", self._plan_no_overlap)
+        t.register("xtensa_mock_load", self._xtensa_mock_load)
+        t.register("xtensa_mock_run", self._xtensa_mock_run)
+        t.register("xtensa_memory_expect", self._xtensa_memory_expect)
+        t.register("xtensa_register_expect", self._xtensa_register_expect)
+        t.register("xtensa_operation_count", self._xtensa_operation_count)
+
+        # --- generic test + performance instrumentation (no extension prefix) ---
+        t.register("value_equal", self._value_equal)
+        t.register("assert_equal", self._assert_equal)
+        t.register("assert_less_than", self._assert_less_than)
+        t.register("time_mark", self._time_mark)
+        t.register("time_elapsed_ms", self._time_elapsed_ms)
+        t.register("jtag_transaction_count", self._jtag_transaction_count)
+        self._marks = {}
         if self.core == "riscv":
             # the DMI-register globals esp32c6_soc_reset reads (just the DMI
             # addresses espjtag already knows), and the verbatim C6 procs.
@@ -184,8 +192,18 @@ class OcdTclBridge:
         # poll instead (its native reset path does the same). Intentional no-op.
         return ""
 
-    # --- S3 stub-flasher Tcl commands (#29) -----------------------------------
-    def _flasher_obj(self):
+    # --- Xtensa stub-flasher Tcl commands (#29) -------------------------------
+    # Register ROLES: a user writes the role, not the raw a-register number, so
+    # the test reads meaningfully. (Xtensa passes function args/results in a-regs;
+    # the trampoline contract assigns these roles — esp_xtensa_algo_regs_init.)
+    _REGISTER_ROLE = {
+        "return_address": "a0",      # a0 — return addr (the BREAK trap)
+        "stack_pointer": "a1",       # a1 — stack pointer
+        "return_value": "a2",        # a2 — arg0 in / return code out
+        "entry_point": "a8",         # a8 — the windowed entry the trampoline calls
+    }
+
+    def _xtensa_flasher(self):
         if self.xdm is None:
             raise RuntimeError("stub flasher needs an Xtensa (S3) target")
         if self._flasher is None:
@@ -193,152 +211,57 @@ class OcdTclBridge:
             self._flasher = XtensaFlasher(self.xdm, "esp32s3")
         return self._flasher
 
-    def _xhalt(self, args):
-        """xhalt — powerup + halt the Xtensa core. Returns 1 on halted."""
+    def _xtensa_core_halt(self, args):
+        """xtensa_core_halt — power up + halt the Xtensa core. Returns 1 if halted."""
         self.xdm.powerup()
         return "1" if self.xdm.halt() else "0"
 
-    def _stub_load(self, args):
-        """stub_load <cmd> — load a prebuilt flasher stub (e.g. cmd_test1,
-        cmd_flash_map_get). Returns 'entry stack tramp' addresses."""
-        st = self._flasher_obj().load(args[0])
+    def _xtensa_stub_load(self, args):
+        """xtensa_stub_load <command> — load a prebuilt flasher stub (e.g.
+        cmd_test1, cmd_flash_map_get) into target RAM over JTAG. Returns
+        'entry_point stack_pointer trampoline' addresses."""
+        st = self._xtensa_flasher().load(args[0])
         return (f"0x{st['entry']:x} 0x{st['stack_addr']:x} "
                 f"0x{st['tramp_mapped_addr']:x}")
 
-    def _stub_run(self, args):
-        """stub_run [arg ...] — run the loaded stub with int args (a2..a6).
-        Returns the stub return code (a2) as 0xNN, or 'TIMEOUT' if it didn't halt."""
+    def _xtensa_stub_run(self, args):
+        """xtensa_stub_run [arg ...] — run the loaded stub with integer args.
+        Returns the stub return value (hex), or 'TIMEOUT' if it did not halt."""
         a = tuple(int(x, 0) for x in args)
         try:
-            rc = self._flasher_obj().run(args=a, timeout_ms=3000)
+            rc = self._xtensa_flasher().run(args=a, timeout_ms=3000)
         except RuntimeError:
             return "TIMEOUT"
         return f"0x{rc:x}"
 
-    def _stub_plan(self, args):
-        """stub_plan <cmd> <field> — PURE (no JTAG). field is a stub address
-        (entry|tramp_mapped_addr|stack_addr|dram_org|...), or:
-          nwrites          — number of (addr,bytes) writes the load would do
-          waddr <i>        — hex address of write i
-          wbytes <i> <n>   — first n bytes of write i, hex (to golden-check the
-                             reversed code / normal data without touching silicon)
-        Lets Tcl validate the load LAYOUT deterministically."""
-        # plan_load is PURE (only reads STUBS). Make a flasher with NO target so
-        # this validator never touches JTAG. (x=None is fine — plan_load never
-        # uses self.x.)
+    def _plan(self, command):
+        # plan_load is PURE (only reads the stub table); a flasher with NO target
+        # is fine — it never touches JTAG.
         from espjtag.xtensa_flasher import XtensaFlasher
-        fl = XtensaFlasher(None, "esp32s3")
-        p = fl.plan_load(args[0])
-        field = args[1]
-        if field == "nwrites":
-            return str(len(p["writes"]))
-        if field == "waddr":
-            return f"0x{p['writes'][int(args[2])][0]:x}"
-        if field == "wbytes":
-            i, n = int(args[2]), int(args[3])
-            return p["writes"][i][1][:n].hex()
-        return f"0x{p['stub'][field]:x}"
+        return XtensaFlasher(None, "esp32s3").plan_load(command)
 
-    def _compare(self, args):
-        """compare <a> <b> — returns 1 if equal (string), else 0. For Tcl asserts."""
-        return "1" if args[0] == args[1] else "0"
+    def _xtensa_stub_plan_address(self, args):
+        """xtensa_stub_plan_address <command> <name> — PURE (no JTAG). A planned
+        address by name: entry | tramp_mapped_addr | stack_addr | dram_org |
+        iram_org | trap_entry_addr. Validates the layout without a chip."""
+        return f"0x{self._plan(args[0])['stub'][args[1]]:x}"
 
-    # --- instrumentation: perf measurement as Tcl ----------------------------
-    def _mark(self, args):
-        """mark <name> — record a timestamp + jtag-transaction count for a span."""
-        import time as _t
-        self._marks[args[0]] = (_t.perf_counter(), len(self.trace))
-        return ""
+    def _xtensa_stub_plan_writes(self, args):
+        """xtensa_stub_plan_writes <command> — PURE. Number of (address, bytes)
+        writes the load would perform."""
+        return str(len(self._plan(args[0])["writes"]))
 
-    def _elapsed(self, args):
-        """elapsed <name> — ms since `mark <name>` (string, 3dp). 0 if no mark."""
-        import time as _t
-        if args[0] not in self._marks:
-            return "0"
-        t0, _ = self._marks[args[0]]
-        return f"{(_t.perf_counter() - t0) * 1000:.3f}"
+    def _xtensa_stub_plan_bytes(self, args):
+        """xtensa_stub_plan_bytes <command> <write_index> <count> — PURE. First
+        <count> bytes (hex) of planned write <write_index> — to golden-check the
+        reversed code / normal data without touching silicon."""
+        i, n = int(args[1]), int(args[2])
+        return self._plan(args[0])["writes"][i][1][:n].hex()
 
-    def _jtag_count(self, args):
-        """jtag_count [name] — total leaf transactions, or those since `mark name`.
-        (Counts mww/mdw/dmi via self.trace; the proxy for JTAG round-trips.)"""
-        if args and args[0] in self._marks:
-            return str(len(self.trace) - self._marks[args[0]][1])
-        return str(len(self.trace))
-
-    def _assert_eq(self, args):
-        """assert_eq <label> <got> <want> — print PASS/FAIL."""
-        ok = args[1] == args[2]
-        print(f"  [{'PASS' if ok else 'FAIL'}] {args[0]} -> "
-              f"{args[1]}" + ("" if ok else f" (want {args[2]})"))
-        return "1" if ok else "0"
-
-    def _assert_lt(self, args):
-        """assert_lt <label> <got> <limit> — PASS if float(got) < float(limit)."""
-        ok = float(args[1]) < float(args[2])
-        print(f"  [{'PASS' if ok else 'FAIL'}] {args[0]} -> {args[1]} "
-              f"< {args[2]}" + ("" if ok else " (TOO SLOW)"))
-        return "1" if ok else "0"
-
-    # --- MOCK-backed commands (NO JTAG) --------------------------------------
-    def _mock_fl(self):
-        from espjtag.xtensa_mock import MockXtensaXDM
-        from espjtag.xtensa_flasher import XtensaFlasher
-        if self._mock is None:
-            self._mock = MockXtensaXDM()
-            self._mock_flasher = XtensaFlasher(self._mock, "esp32s3")
-        return self._mock_flasher
-
-    def _mock_load(self, args):
-        """mock_load <cmd> — load a stub against the MOCK (records writes, no JTAG).
-        Returns the write count."""
-        fl = self._mock_fl()
-        fl.load(args[0])
-        return str(len(self._mock.writes))
-
-    def _mock_run(self, args):
-        """mock_run <result> [arg ...] — script the stub's a2 return = <result>,
-        then run against the mock (records the start/wait_algorithm reg dance +
-        resume). Returns the a2 the flasher read back (should equal <result>)."""
-        fl = self._mock_fl()
-        self._mock.set_run_result(int(args[0], 0))
-        a = tuple(int(x, 0) for x in args[1:])
-        rc = fl.run(args=a)
-        return f"0x{rc:x}"
-
-    def _mem_expect(self, args):
-        """mem_expect <addr> <hexbytes> — assert the MOCK model RAM at addr equals
-        the golden bytes (validates the reversed code / normal data landed)."""
-        addr = int(args[0], 0)
-        want = bytes.fromhex(args[1])
-        nwords = (len(want) + 3) // 4
-        words = self._mock.read_mem(addr, nwords)
-        got = b"".join(w.to_bytes(4, "little") for w in words)[:len(want)]
-        ok = got == want
-        print(f"  [{'PASS' if ok else 'FAIL'}] mem@0x{addr:x} == {args[1]}"
-              + ("" if ok else f" (got {got.hex()})"))
-        return "1" if ok else "0"
-
-    def _reg_expect(self, args):
-        """reg_expect <a-reg> <val> — assert a register the run set (e.g. a8 a1)."""
-        name, want = args[0], int(args[1], 0)
-        got = self._mock.regs.get(name)
-        ok = got == want
-        print(f"  [{'PASS' if ok else 'FAIL'}] reg {name} == 0x{want:x}"
-              + ("" if ok else f" (got {got if got is None else hex(got)})"))
-        return "1" if ok else "0"
-
-    def _op_count(self, args):
-        """op_count [kind] — number of mock ops (write_mem/read_mem/set_ar/...),
-        total or of a given kind. Proves the op SEQUENCE/shape."""
-        if args:
-            return str(sum(1 for o in self._mock.ops if o[0] == args[0]))
-        return str(len(self._mock.ops))
-
-    def _plan_no_overlap(self, args):
-        """plan_no_overlap <cmd> — PURE: assert no two planned writes overlap
-        (auto-catches layout collisions like the stack/buffer-overlap bug)."""
-        from espjtag.xtensa_flasher import XtensaFlasher
-        p = XtensaFlasher(None, "esp32s3").plan_load(args[0])
+    def _xtensa_plan_assert_no_overlap(self, args):
+        """xtensa_plan_assert_no_overlap <command> — PURE. PASS if no two planned
+        writes overlap (auto-catches layout collisions, e.g. stack/buffer overlap)."""
+        p = self._plan(args[0])
         spans = sorted((a, a + len(b)) for a, b in p["writes"])
         bad = None
         for i in range(1, len(spans)):
@@ -349,6 +272,101 @@ class OcdTclBridge:
         print(f"  [{'PASS' if ok else 'FAIL'}] {args[0]} plan no-overlap"
               + ("" if ok else f" — {hex(bad[0][0])}..{hex(bad[0][1])} vs {hex(bad[1][0])}"))
         return "1" if ok else "0"
+
+    # --- Xtensa NO-HARDWARE mock (MockXtensaXDM) ------------------------------
+    def _xtensa_mock_flasher(self):
+        from espjtag.xtensa_mock import MockXtensaXDM
+        from espjtag.xtensa_flasher import XtensaFlasher
+        if self._mock is None:
+            self._mock = MockXtensaXDM()
+            self._mock_flasher = XtensaFlasher(self._mock, "esp32s3")
+        return self._mock_flasher
+
+    def _xtensa_mock_load(self, args):
+        """xtensa_mock_load <command> — load a stub against the software model
+        (records writes, NO JTAG). Returns the write count."""
+        self._xtensa_mock_flasher().load(args[0])
+        return str(len(self._mock.writes))
+
+    def _xtensa_mock_run(self, args):
+        """xtensa_mock_run <return_value> [arg ...] — script the stub's return
+        value, then run against the model (records the register setup + resume,
+        NO JTAG). Returns the value the flasher read back."""
+        fl = self._xtensa_mock_flasher()
+        self._mock.set_run_result(int(args[0], 0))
+        rc = fl.run(args=tuple(int(x, 0) for x in args[1:]))
+        return f"0x{rc:x}"
+
+    def _xtensa_memory_expect(self, args):
+        """xtensa_memory_expect <address> <hex_bytes> — assert the model RAM at
+        <address> equals the golden bytes (validates reversed code / normal data)."""
+        addr = int(args[0], 0)
+        want = bytes.fromhex(args[1])
+        words = self._mock.read_mem(addr, (len(want) + 3) // 4)
+        got = b"".join(w.to_bytes(4, "little") for w in words)[:len(want)]
+        ok = got == want
+        print(f"  [{'PASS' if ok else 'FAIL'}] memory@0x{addr:x} == {args[1]}"
+              + ("" if ok else f" (got {got.hex()})"))
+        return "1" if ok else "0"
+
+    def _xtensa_register_expect(self, args):
+        """xtensa_register_expect <role> <value> — assert the run set the register
+        for <role>. role is a meaningful name (entry_point | stack_pointer |
+        return_value | return_address), not a raw a-register number."""
+        role, want = args[0], int(args[1], 0)
+        reg = self._REGISTER_ROLE.get(role, role)
+        got = self._mock.regs.get(reg)
+        ok = got == want
+        print(f"  [{'PASS' if ok else 'FAIL'}] register {role} ({reg}) == 0x{want:x}"
+              + ("" if ok else f" (got {got if got is None else hex(got)})"))
+        return "1" if ok else "0"
+
+    def _xtensa_operation_count(self, args):
+        """xtensa_operation_count [kind] — number of model operations, total or of
+        a given kind (write_mem | read_mem | set_ar | set_sr | nar_write). Proves
+        the operation SEQUENCE/shape the flasher issued."""
+        if args:
+            return str(sum(1 for o in self._mock.ops if o[0] == args[0]))
+        return str(len(self._mock.ops))
+
+    # --- generic test + performance instrumentation --------------------------
+    def _value_equal(self, args):
+        """value_equal <a> <b> — 1 if the two strings are equal, else 0."""
+        return "1" if args[0] == args[1] else "0"
+
+    def _assert_equal(self, args):
+        """assert_equal <label> <got> <want> — print PASS/FAIL; returns 1/0."""
+        ok = args[1] == args[2]
+        print(f"  [{'PASS' if ok else 'FAIL'}] {args[0]} -> "
+              f"{args[1]}" + ("" if ok else f" (want {args[2]})"))
+        return "1" if ok else "0"
+
+    def _assert_less_than(self, args):
+        """assert_less_than <label> <got> <limit> — PASS if float(got) < limit."""
+        ok = float(args[1]) < float(args[2])
+        print(f"  [{'PASS' if ok else 'FAIL'}] {args[0]} -> {args[1]} "
+              f"< {args[2]}" + ("" if ok else " (TOO SLOW)"))
+        return "1" if ok else "0"
+
+    def _time_mark(self, args):
+        """time_mark <name> — record a timestamp + transaction count for a span."""
+        import time as _t
+        self._marks[args[0]] = (_t.perf_counter(), len(self.trace))
+        return ""
+
+    def _time_elapsed_ms(self, args):
+        """time_elapsed_ms <name> — milliseconds since time_mark <name> (3dp)."""
+        import time as _t
+        if args[0] not in self._marks:
+            return "0"
+        return f"{(_t.perf_counter() - self._marks[args[0]][0]) * 1000:.3f}"
+
+    def _jtag_transaction_count(self, args):
+        """jtag_transaction_count [name] — total bridge transactions, or those
+        since time_mark <name>. (Counts mww/mdw/dmi — the JTAG round-trip proxy.)"""
+        if args and args[0] in self._marks:
+            return str(len(self.trace) - self._marks[args[0]][1])
+        return str(len(self.trace))
 
     def run(self, tcl):
         return self.tcl.eval(tcl)

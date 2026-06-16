@@ -1,33 +1,32 @@
 # perf_s3_stub.tcl — the SAME Tcl harness as a PERFORMANCE instrument (#29).
-# Demonstrates: mark/elapsed time spans, jtag_count counts bridge transactions,
-# assert_lt gates on a threshold. Perf becomes a Tcl-scriptable, asserted test —
-# not just a one-off print.
+# Demonstrates: time_mark/time_elapsed_ms time a span, jtag_transaction_count
+# counts bridge transactions, assert_less_than gates on a threshold. Performance
+# becomes a Tcl-scriptable, asserted test — not just a one-off print.
 #
 #   python3 scripts/ocd_tcl_bridge.py --usb 1-1.3.3.4 --tcl scripts/perf_s3_stub.tcl
 
 puts "=== PURE: plan cost (no JTAG) ==="
-# Time how long computing the load plan takes (host-side only). This is the
-# reversed-memory math + section chunking — should be ~instant.
-mark plan
-stub_plan cmd_flash_write_deflated nwrites
-puts "  plan_load(flash_write_deflated) computed in [elapsed plan] ms"
+# Time how long computing the load plan takes (host-side only): the reversed-
+# memory math + section chunking — should be ~instant.
+time_mark plan
+xtensa_stub_plan_writes cmd_flash_write_deflated
+puts "  plan(cmd_flash_write_deflated) computed in [time_elapsed_ms plan] ms"
 
 puts "=== ON-TARGET: load throughput ==="
-set h [xhalt]
-if {$h == 1} {
-    # Time a real stub load (writes code+tramp+data over JTAG) and count the
-    # bridge transactions around it for context.
-    mark load
-    stub_load cmd_flash_write_deflated
-    set ms [elapsed load]
-    puts "  stub_load(flash_write_deflated, 6KB+) took $ms ms over JTAG"
+if {[xtensa_core_halt] == 1} {
+    # Time a real stub load (writes code+trampoline+data over JTAG).
+    time_mark load
+    xtensa_stub_load cmd_flash_write_deflated
+    set load_ms [time_elapsed_ms load]
+    puts "  xtensa_stub_load(cmd_flash_write_deflated, 6KB+) took $load_ms ms over JTAG"
     # A loose ceiling: a few KB over USB-JTAG should be well under 500 ms.
-    assert_lt "stub_load under 500ms" $ms 500
+    assert_less_than "stub load under 500ms" $load_ms 500
 
     # Time a bridge mdw burst + report its transaction count.
-    mark burst
+    time_mark burst
     mdw 0x40000000 64
-    puts "  mdw 64 words: [elapsed burst] ms, [jtag_count burst] bridge txns"
+    puts "  mdw 64 words: [time_elapsed_ms burst] ms, \
+[jtag_transaction_count burst] bridge transactions"
 } else {
     puts "  (core did not halt — skipping on-target perf)"
 }
