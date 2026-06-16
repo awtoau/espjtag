@@ -87,10 +87,15 @@ class OcdTclBridge:
     def __init__(self, j):
         self.j = j
         self.trace = []                     # (op, addr, val) — for -d3 comparison
-        # On a RISC-V part mww/mdw use System Bus Access; on Xtensa (S3) they route
-        # to the XDM (instruction injection) — same Tcl, the right hardware path.
-        self.core = (chips.lookup(j.read_idcode()) or {}).get("core", "riscv")
-        self.xdm = XtensaXDM(j) if self.core == "xtensa" else None
+        # j is None in --mock mode: only the pure + mock_* commands work (no JTAG).
+        if j is None:
+            self.core = "mock"
+            self.xdm = None
+        else:
+            # On a RISC-V part mww/mdw use System Bus Access; on Xtensa (S3) they
+            # route to the XDM (instruction injection) — same Tcl, right hardware.
+            self.core = (chips.lookup(j.read_idcode()) or {}).get("core", "riscv")
+            self.xdm = XtensaXDM(j) if self.core == "xtensa" else None
         self.tcl = MiniJimTcl()
         t = self.tcl
         t.register("mww", self._mww)
@@ -122,6 +127,15 @@ class OcdTclBridge:
         t.register("assert_eq", self._assert_eq)
         t.register("assert_lt", self._assert_lt)
         self._marks = {}
+        # MOCK-backed commands — run the flasher against MockXtensaXDM (NO JTAG),
+        # then assert on the recorded ops/mem/regs. The full no-hardware test path.
+        self._mock = None
+        t.register("mock_load", self._mock_load)
+        t.register("mock_run", self._mock_run)
+        t.register("mem_expect", self._mem_expect)
+        t.register("reg_expect", self._reg_expect)
+        t.register("op_count", self._op_count)
+        t.register("plan_no_overlap", self._plan_no_overlap)
         if self.core == "riscv":
             # the DMI-register globals esp32c6_soc_reset reads (just the DMI
             # addresses espjtag already knows), and the verbatim C6 procs.
@@ -265,19 +279,105 @@ class OcdTclBridge:
               f"< {args[2]}" + ("" if ok else " (TOO SLOW)"))
         return "1" if ok else "0"
 
+    # --- MOCK-backed commands (NO JTAG) --------------------------------------
+    def _mock_fl(self):
+        from espjtag.xtensa_mock import MockXtensaXDM
+        from espjtag.xtensa_flasher import XtensaFlasher
+        if self._mock is None:
+            self._mock = MockXtensaXDM()
+            self._mock_flasher = XtensaFlasher(self._mock, "esp32s3")
+        return self._mock_flasher
+
+    def _mock_load(self, args):
+        """mock_load <cmd> — load a stub against the MOCK (records writes, no JTAG).
+        Returns the write count."""
+        fl = self._mock_fl()
+        fl.load(args[0])
+        return str(len(self._mock.writes))
+
+    def _mock_run(self, args):
+        """mock_run <result> [arg ...] — script the stub's a2 return = <result>,
+        then run against the mock (records the start/wait_algorithm reg dance +
+        resume). Returns the a2 the flasher read back (should equal <result>)."""
+        fl = self._mock_fl()
+        self._mock.set_run_result(int(args[0], 0))
+        a = tuple(int(x, 0) for x in args[1:])
+        rc = fl.run(args=a)
+        return f"0x{rc:x}"
+
+    def _mem_expect(self, args):
+        """mem_expect <addr> <hexbytes> — assert the MOCK model RAM at addr equals
+        the golden bytes (validates the reversed code / normal data landed)."""
+        addr = int(args[0], 0)
+        want = bytes.fromhex(args[1])
+        nwords = (len(want) + 3) // 4
+        words = self._mock.read_mem(addr, nwords)
+        got = b"".join(w.to_bytes(4, "little") for w in words)[:len(want)]
+        ok = got == want
+        print(f"  [{'PASS' if ok else 'FAIL'}] mem@0x{addr:x} == {args[1]}"
+              + ("" if ok else f" (got {got.hex()})"))
+        return "1" if ok else "0"
+
+    def _reg_expect(self, args):
+        """reg_expect <a-reg> <val> — assert a register the run set (e.g. a8 a1)."""
+        name, want = args[0], int(args[1], 0)
+        got = self._mock.regs.get(name)
+        ok = got == want
+        print(f"  [{'PASS' if ok else 'FAIL'}] reg {name} == 0x{want:x}"
+              + ("" if ok else f" (got {got if got is None else hex(got)})"))
+        return "1" if ok else "0"
+
+    def _op_count(self, args):
+        """op_count [kind] — number of mock ops (write_mem/read_mem/set_ar/...),
+        total or of a given kind. Proves the op SEQUENCE/shape."""
+        if args:
+            return str(sum(1 for o in self._mock.ops if o[0] == args[0]))
+        return str(len(self._mock.ops))
+
+    def _plan_no_overlap(self, args):
+        """plan_no_overlap <cmd> — PURE: assert no two planned writes overlap
+        (auto-catches layout collisions like the stack/buffer-overlap bug)."""
+        from espjtag.xtensa_flasher import XtensaFlasher
+        p = XtensaFlasher(None, "esp32s3").plan_load(args[0])
+        spans = sorted((a, a + len(b)) for a, b in p["writes"])
+        bad = None
+        for i in range(1, len(spans)):
+            if spans[i][0] < spans[i - 1][1]:
+                bad = (spans[i - 1], spans[i])
+                break
+        ok = bad is None
+        print(f"  [{'PASS' if ok else 'FAIL'}] {args[0]} plan no-overlap"
+              + ("" if ok else f" — {hex(bad[0][0])}..{hex(bad[0][1])} vs {hex(bad[1][0])}"))
+        return "1" if ok else "0"
+
     def run(self, tcl):
         return self.tcl.eval(tcl)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--usb", required=True)
+    ap.add_argument("--usb", help="usb_path of the target (omit with --mock)")
+    ap.add_argument("--mock", action="store_true",
+                    help="NO HARDWARE: run only the pure + mock_* commands "
+                         "(the flasher against MockXtensaXDM). For --tcl tests.")
     ap.add_argument("--reset", action="store_true",
                     help="also run esp32c6_soc_reset (RESETS the chip)")
     ap.add_argument("--tcl", help="run a Tcl test script through the bridge "
                     "(e.g. tests for the S3 stub flasher) and exit")
     args = ap.parse_args()
 
+    if args.mock:
+        bridge = OcdTclBridge(None)
+        print("MOCK mode — no hardware; pure + mock_* commands only")
+        if not args.tcl:
+            print("(nothing to run; pass --tcl <script>)")
+            return 0
+        with open(args.tcl) as f:
+            bridge.run(f.read())
+        return 0
+
+    if not args.usb:
+        ap.error("--usb is required (or use --mock)")
     j = EspUsbJtag(args.usb)
     ic = j.read_idcode()
     br = OcdTclBridge(j)
