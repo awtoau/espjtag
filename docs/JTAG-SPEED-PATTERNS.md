@@ -166,7 +166,8 @@ invariant (the pyOCD `fast_program` bug class).
 - **Verify transcriptions against the upstream source of truth.** The C5 WDT
   table was wrong because it was hand-derived while OpenOCD's cfg had it
   verbatim; `verify_chips_vs_tcl.py` now executes the upstream Tcl against a
-  recording backend and diffs our tables in every check-all run.
-- **One gate after every change** (`check-all.sh`): invariant + drift + both
-  chips' selftests + 3-way cross-tool dump + recorded bench. If it's green, the
+  recording backend and diffs our tables in every check run.
+- **One gate after every change** (`check.py`, `--mock` no-hardware / `--real`
+  on-target): invariant + drift + S3 flasher model + both chips' selftests +
+  3-way cross-tool dump + recorded bench. If it's green, the
   change shipped with evidence.

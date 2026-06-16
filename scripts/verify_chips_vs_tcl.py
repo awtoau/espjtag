@@ -9,7 +9,7 @@ that class of drift impossible to miss: for each RISC-V chip, extract the
 MiniJimTcl with a RECORDING mww backend (no hardware), and require the recorded
 (addr, value) write set to equal what espjtag's chips.py wdt table would write.
 
-Run by check-all.sh as a hardware-free gate step. Exit 1 on any drift.
+Run by check.py --mock as a hardware-free gate step. Exit 1 on any drift.
 """
 import glob
 import re
