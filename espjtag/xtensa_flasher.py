@@ -106,8 +106,20 @@ class XtensaFlasher:
             self.x.write_mem(dram_org - len(rev), _bytes_to_words(rev))
         else:
             self.x.write_mem(dram_org, _bytes_to_words(data))
-        # 4. stack: top of dram area, grows down (OpenOCD allocs in data area).
-        #    stack_addr = base + stack_size; we place it below the data region.
+        # 4. stack + mem-arg buffers.
+        # SOURCE-OF-TRUTH LAYOUT (esp32s3.cfg + esp_algorithm.c, do NOT invent):
+        #   OpenOCD work area: _WA_ADDR=0x3FC9C000, _WA_SIZE=0x24000.
+        #   target_alloc_working_area grows UP from the base (new->addr = addr+size).
+        #   For the reversed S3 (esp_algorithm.c:527-541): code takes one IRAM area
+        #   (full iram_len from iram_org); data->bss->stack->mem-args allocate
+        #   SEQUENTIALLY from the work area, written REVERSED (data-bus vs
+        #   instruction-bus: a write to dram_org-off maps to the stub's view).
+        #   Linker (esp32s3.ld): code@0x3FC9C000 (data-bus view), data@0x3FCA0000.
+        # KNOWN-WRONG below: this stack/buffer placement is ad-hoc and does NOT
+        # match the work-area sequential allocation — that's why flash_map_get's
+        # buffer comes back untouched. FIX = mirror target_alloc_working_area:
+        # allocate stack then mem-args growing up from (work-area base + data+bss),
+        # reversed-addressed. (#29 next step.)
         stack_size = cfg["stack_default_sz"]
         stack_addr = dram_org - _align_up(len(data), 4) - 0x10
         stack_addr &= ~0xF                                       # 16-align
