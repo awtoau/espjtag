@@ -108,6 +108,11 @@ class OcdTclBridge:
         t.register("stub_load", self._stub_load)
         t.register("stub_run", self._stub_run)
         t.register("xhalt", self._xhalt)
+        # PURE validators — NO JTAG. plan_load() computes the memory image (addrs +
+        # bytes) the load WOULD write; these expose it so Tcl can assert the layout
+        # is right independent of hardware (the part paraphrase-bugs hid in).
+        t.register("stub_plan", self._stub_plan)
+        t.register("compare", self._compare)
         if self.core == "riscv":
             # the DMI-register globals esp32c6_soc_reset reads (just the DMI
             # addresses espjtag already knows), and the verbatim C6 procs.
@@ -186,6 +191,34 @@ class OcdTclBridge:
         except RuntimeError:
             return "TIMEOUT"
         return f"0x{rc:x}"
+
+    def _stub_plan(self, args):
+        """stub_plan <cmd> <field> — PURE (no JTAG). field is a stub address
+        (entry|tramp_mapped_addr|stack_addr|dram_org|...), or:
+          nwrites          — number of (addr,bytes) writes the load would do
+          waddr <i>        — hex address of write i
+          wbytes <i> <n>   — first n bytes of write i, hex (to golden-check the
+                             reversed code / normal data without touching silicon)
+        Lets Tcl validate the load LAYOUT deterministically."""
+        # plan_load is PURE (only reads STUBS). Make a flasher with NO target so
+        # this validator never touches JTAG. (x=None is fine — plan_load never
+        # uses self.x.)
+        from espjtag.xtensa_flasher import XtensaFlasher
+        fl = XtensaFlasher(None, "esp32s3")
+        p = fl.plan_load(args[0])
+        field = args[1]
+        if field == "nwrites":
+            return str(len(p["writes"]))
+        if field == "waddr":
+            return f"0x{p['writes'][int(args[2])][0]:x}"
+        if field == "wbytes":
+            i, n = int(args[2]), int(args[3])
+            return p["writes"][i][1][:n].hex()
+        return f"0x{p['stub'][field]:x}"
+
+    def _compare(self, args):
+        """compare <a> <b> — returns 1 if equal (string), else 0. For Tcl asserts."""
+        return "1" if args[0] == args[1] else "0"
 
     def run(self, tcl):
         return self.tcl.eval(tcl)

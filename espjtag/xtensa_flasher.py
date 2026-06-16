@@ -46,6 +46,13 @@ def _align_up(v, a):
     return (v + a - 1) & ~(a - 1)
 
 
+def _align4(b):
+    """pad bytes up to a 4-byte boundary (NUL pad) — normal (non-reversed) write."""
+    if len(b) % 4:
+        b = bytes(b) + b"\x00" * (4 - len(b) % 4)
+    return bytes(b)
+
+
 def _reverse_binary(src):
     """1:1 port of reverse_binary() (esp_algorithm.c:345). DO NOT change.
         size_t remaining = length % 4; offset = 0; aligned_len = ALIGN_UP(length,4)
@@ -89,33 +96,31 @@ class XtensaFlasher:
         self.loaded = None            # the cmd currently loaded, or None
         self.stub = {}                # resolved run-state for the loaded stub
 
-    def _load_section_from_image(self, payload, base_address, reverse, dram_org):
-        """1:1 port of load_section_from_image (esp_algorithm.c:368). Loops the
-        section in 1024-byte chunks; for reverse writes each chunk reversed to
-        dram_org - sec_wr - aligned_len; else writes to base_address + sec_wr."""
+    @staticmethod
+    def _plan_section(payload, base_address, reverse, dram_org):
+        """PURE: the (addr, bytes) writes load_section_from_image would do — same
+        1024-byte chunking + reverse logic, but returns the plan instead of
+        writing. Lets the layout be validated with NO JTAG."""
+        writes = []
         size = len(payload)
         sec_wr = 0
         while sec_wr < size:
             nb = min(1024, size - sec_wr)
             buf = payload[sec_wr:sec_wr + nb]
-            size_read = len(buf)
             if reverse:
-                aligned_len = _align_up(size_read, 4)
-                reversed_buf = _reverse_binary(buf)
-                self.x.write_mem(dram_org - sec_wr - aligned_len,
-                                 _bytes_to_words(reversed_buf))
+                aligned_len = _align_up(len(buf), 4)
+                writes.append((dram_org - sec_wr - aligned_len, _reverse_binary(buf)))
             else:
-                self.x.write_mem(base_address + sec_wr, _bytes_to_words(buf))
-            sec_wr += size_read
+                writes.append((base_address + sec_wr, _align4(buf)))
+            sec_wr += len(buf)
+        return writes
 
-    # --- load_func_image (esp_algorithm.c:498), REVERSE path, 1:1 -----------
-    def load(self, cmd):
-        """1:1 port of esp_algorithm_load_func_image for the reversed S3. The
-        memory map (esp_algorithm.c:527,469):
-          [code + tramp] reversed into the IRAM work area (dram_org-relative)
-          data (normal) at dram_org ; bss ; stack ; params
-        Addresses: iram_org=0x4038C000, dram_org=0x3FCA0000 (work area base
-        0x3FC9C000 + iram_len 0x4000 = dram_org)."""
+    def plan_load(self, cmd):
+        """PURE 1:1 port of esp_algorithm_load_func_image (reverse S3) that returns
+        the memory image as {'writes': [(addr, bytes), ...], 'stub': {...}} WITHOUT
+        touching JTAG. load() applies it; the Tcl harness validates it. Memory map
+        (esp_algorithm.c:527,469): [code+tramp] reversed into the IRAM area,
+        data normal at dram_org, then stack, then mem-args."""
         cfg = STUBS[self.chip][cmd]
         iram_org = cfg["iram_org"]
         dram_org = cfg["dram_org"]
@@ -123,48 +128,37 @@ class XtensaFlasher:
         data = cfg["data"]
         bss = cfg["bss_sz"]
         reverse = S3_REVERSED
+        writes = []
 
-        # --- Load code section (esp_algorithm.c:546-583) ---
-        # base_address = run->stub.code->address = work area = iram_org (the alloc
-        # returns the work-area base, which equals iram_org for the S3 code area).
-        code_size = 0
-        self._load_section_from_image(code, iram_org, reverse, dram_org)
-        code_size += _align_up(len(code), 4)
+        # code section -> iram_org (reversed)
+        writes += self._plan_section(code, iram_org, reverse, dram_org)
+        code_size = _align_up(len(code), 4)
 
-        # --- Load trampoline to the code area (esp_algorithm.c:586-624) ---
-        # reverse: tramp_addr = dram_org - code_size - aligned_tramp_size; the
-        # reversed tramp bytes go there. tramp_mapped_addr = iram_org + code_size.
+        # trampoline (esp_algorithm.c:586-624)
         tramp = TRAMP_WIN
-        tramp_sz = len(tramp)
-        al_tramp_size = _align_up(tramp_sz, 4)
+        al_tramp_size = _align_up(len(tramp), 4)
         if reverse:
-            reversed_tramp_addr = dram_org - code_size
-            reversed_tramp = _reverse_binary(tramp)
-            tramp_addr = reversed_tramp_addr - al_tramp_size
-            self.x.write_mem(tramp_addr, _bytes_to_words(reversed_tramp))
+            tramp_addr = (dram_org - code_size) - al_tramp_size
+            writes.append((tramp_addr, _reverse_binary(tramp)))
         else:
             tramp_addr = iram_org + code_size
-            self.x.write_mem(tramp_addr, _bytes_to_words(tramp))
+            writes.append((tramp_addr, _align4(tramp)))
         tramp_mapped_addr = iram_org + code_size
         code_size += al_tramp_size
 
-        # --- Load data section (esp_algorithm.c:639-677) ---
-        # data+bss alloc'd as one area; base = next work-area alloc after code =
-        # iram_org + iram_len = dram_org. Written NORMALLY (reverse=FALSE).
+        # data section -> dram_org (normal)
         data_addr = dram_org
-        self._load_section_from_image(data, data_addr, False, dram_org)
+        writes += self._plan_section(data, data_addr, False, dram_org)
         data_sec_sz = _align_up(len(data), 4)
         bss_sec_sz = _align_up(bss, 4)
 
-        # --- Stack (esp_algorithm.c:679-687) ---
-        # stack alloc'd after data+bss; stack_addr = stack->address + stack_size.
+        # stack (esp_algorithm.c:679-687)
         stack_size = cfg["stack_default_sz"]
         stack_area_addr = data_addr + data_sec_sz + bss_sec_sz
         stack_addr = stack_area_addr + stack_size
-        # next free work-area address (mem-args alloc from here, growing up)
         wa_next = stack_area_addr + stack_size
 
-        self.stub = {
+        stub = {
             "entry": cfg["entry_addr"],
             "tramp_mapped_addr": tramp_mapped_addr,
             "stack_addr": stack_addr,
@@ -174,6 +168,14 @@ class XtensaFlasher:
             "trap_record_addr": cfg["trap_record_addr"],
             "iram_org": iram_org, "dram_org": dram_org,
         }
+        return {"writes": writes, "stub": stub}
+
+    def load(self, cmd):
+        """Apply plan_load() to the target (the only JTAG side-effect here)."""
+        plan = self.plan_load(cmd)
+        for addr, b in plan["writes"]:
+            self.x.write_mem(addr, _bytes_to_words(b))
+        self.stub = plan["stub"]
         self.loaded = cmd
         return self.stub
 

@@ -18,7 +18,22 @@ proc report {label got} {
     puts "  \[INFO\] $label -> $got"
 }
 
-puts "=== S3 stub-flasher steps (#29) ==="
+proc check {label got want} {
+    expect $label [compare $got $want] 1
+}
+
+puts "=== PURE layout validation (NO JTAG — plan_load only) ==="
+# These assert the load LAYOUT deterministically, with zero hardware side-effects
+# — the part that paraphrase-bugs hid. Golden values are from the 1:1 port.
+check "cmd_test1 entry addr"   [stub_plan cmd_test1 entry]             0x4038c2c0
+check "cmd_test1 tramp addr"   [stub_plan cmd_test1 tramp_mapped_addr] 0x4038d010
+check "cmd_test1 stack addr"   [stub_plan cmd_test1 stack_addr]        0x3fca0530
+check "cmd_test1 dram_org"     [stub_plan cmd_test1 dram_org]          0x3fca0000
+# data is written NORMAL at dram_org (first 8 bytes = the data blob start)
+check "data@dram_org (normal)" [stub_plan cmd_test1 wbytes 6 8]        1818181810000000
+report "cmd_test1 nwrites" [stub_plan cmd_test1 nwrites]
+
+puts "=== ON-TARGET steps (JTAG) ==="
 
 # 1. halt the core
 set h [xhalt]
