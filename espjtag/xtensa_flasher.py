@@ -46,18 +46,33 @@ def _align_up(v, a):
     return (v + a - 1) & ~(a - 1)
 
 
-def _reverse_binary(buf):
-    """reverse_binary(): word-wise reverse for the S3 reversed-memory data write
-    (esp_algorithm.c). Byte order within each word is preserved (both buses are
-    little-endian); only the word ORDER is reversed across the span."""
-    out = bytearray(_align_up(len(buf), 4))
-    # pad to word, then reverse whole-span byte order? No: OpenOCD reverses the
-    # buffer as a byte array of aligned length (reverse_binary in helper/binarybuffer
-    # reverses bytes), and writes at dram_org - off - aligned_len. The net effect
-    # is the word at the lowest data address maps to the highest instr address.
-    padded = bytes(buf) + b"\x00" * (len(out) - len(buf))
-    out[:] = padded[::-1]
-    return bytes(out)
+def _reverse_binary(src):
+    """1:1 port of reverse_binary() (esp_algorithm.c:345). DO NOT change.
+        size_t remaining = length % 4; offset = 0; aligned_len = ALIGN_UP(length,4)
+        if remaining: memset(dest+remaining, 0xFF, 4-remaining);
+                      for i in 0..remaining: dest[i]=src[length-remaining+i];
+                      length -= remaining; offset = 4
+        for i in offset..aligned_len step 4:
+            dest[i+0]=src[length-i+offset-4]; ...+1..+3
+    """
+    length = len(src)
+    aligned_len = _align_up(length, 4)
+    dest = bytearray(aligned_len)
+    remaining = length % 4
+    offset = 0
+    if remaining > 0:
+        for k in range(remaining, 4):
+            dest[k] = 0xFF
+        for i in range(remaining):
+            dest[i] = src[length - remaining + i]
+        length -= remaining
+        offset = 4
+    for i in range(offset, aligned_len, 4):
+        dest[i + 0] = src[length - i + offset - 4]
+        dest[i + 1] = src[length - i + offset - 3]
+        dest[i + 2] = src[length - i + offset - 2]
+        dest[i + 3] = src[length - i + offset - 1]
+    return bytes(dest)
 
 
 class XtensaFlasher:
@@ -74,60 +89,87 @@ class XtensaFlasher:
         self.loaded = None            # the cmd currently loaded, or None
         self.stub = {}                # resolved run-state for the loaded stub
 
-    # --- load_func_image (esp_algorithm.c:498) -----------------------------
-    def load(self, cmd):
-        """Load the stub for `cmd` into S3 RAM exactly as esp_algorithm_load_
-        func_image does for the reversed-memory S3: one IRAM area from iram_org
-        holding [code + trampoline], data (reversed) to dram_org, then stack.
+    def _load_section_from_image(self, payload, base_address, reverse, dram_org):
+        """1:1 port of load_section_from_image (esp_algorithm.c:368). Loops the
+        section in 1024-byte chunks; for reverse writes each chunk reversed to
+        dram_org - sec_wr - aligned_len; else writes to base_address + sec_wr."""
+        size = len(payload)
+        sec_wr = 0
+        while sec_wr < size:
+            nb = min(1024, size - sec_wr)
+            buf = payload[sec_wr:sec_wr + nb]
+            size_read = len(buf)
+            if reverse:
+                aligned_len = _align_up(size_read, 4)
+                reversed_buf = _reverse_binary(buf)
+                self.x.write_mem(dram_org - sec_wr - aligned_len,
+                                 _bytes_to_words(reversed_buf))
+            else:
+                self.x.write_mem(base_address + sec_wr, _bytes_to_words(buf))
+            sec_wr += size_read
 
-        Sets self.stub = {entry, tramp_mapped_addr, stack_addr, trap_entry_addr,
-        trap_record_addr, dram_org, ...}. Returns it."""
+    # --- load_func_image (esp_algorithm.c:498), REVERSE path, 1:1 -----------
+    def load(self, cmd):
+        """1:1 port of esp_algorithm_load_func_image for the reversed S3. The
+        memory map (esp_algorithm.c:527,469):
+          [code + tramp] reversed into the IRAM work area (dram_org-relative)
+          data (normal) at dram_org ; bss ; stack ; params
+        Addresses: iram_org=0x4038C000, dram_org=0x3FCA0000 (work area base
+        0x3FC9C000 + iram_len 0x4000 = dram_org)."""
         cfg = STUBS[self.chip][cmd]
         iram_org = cfg["iram_org"]
         dram_org = cfg["dram_org"]
         code = cfg["code"]
         data = cfg["data"]
-        # NO Mach-O parsing: esp_flash.c:341-358 does image_open(...,"build") then
-        # image_add_section(code, EXEC) + image_add_section(data) — the cfg blobs
-        # are added as RAW section payloads (base 0), then loaded to iram_org/
-        # dram_org. The cefaedfe bytes at the start of `code` are the stub's OWN
-        # content, not a wrapper OpenOCD strips. So: write code->iram_org,
-        # data->dram_org (reversed for the S3). Verbatim from esp_algorithm.c.
-        # 1. code -> iram_org
-        self.x.write_mem(iram_org, _bytes_to_words(code))
-        code_size = _align_up(len(code), 4)
-        # 2. trampoline -> right after code; entry to resume at = iram_org+code_size
-        self.x.write_mem(iram_org + code_size, _bytes_to_words(TRAMP_WIN))
-        tramp_mapped_addr = iram_org + code_size
-        code_size += _align_up(len(TRAMP_WIN), 4)
-        # 3. data -> dram_org (reversed for the S3) ; bss follows (zeroed by stub)
-        if S3_REVERSED:
-            rev = _reverse_binary(data)
-            self.x.write_mem(dram_org - len(rev), _bytes_to_words(rev))
+        bss = cfg["bss_sz"]
+        reverse = S3_REVERSED
+
+        # --- Load code section (esp_algorithm.c:546-583) ---
+        # base_address = run->stub.code->address = work area = iram_org (the alloc
+        # returns the work-area base, which equals iram_org for the S3 code area).
+        code_size = 0
+        self._load_section_from_image(code, iram_org, reverse, dram_org)
+        code_size += _align_up(len(code), 4)
+
+        # --- Load trampoline to the code area (esp_algorithm.c:586-624) ---
+        # reverse: tramp_addr = dram_org - code_size - aligned_tramp_size; the
+        # reversed tramp bytes go there. tramp_mapped_addr = iram_org + code_size.
+        tramp = TRAMP_WIN
+        tramp_sz = len(tramp)
+        al_tramp_size = _align_up(tramp_sz, 4)
+        if reverse:
+            reversed_tramp_addr = dram_org - code_size
+            reversed_tramp = _reverse_binary(tramp)
+            tramp_addr = reversed_tramp_addr - al_tramp_size
+            self.x.write_mem(tramp_addr, _bytes_to_words(reversed_tramp))
         else:
-            self.x.write_mem(dram_org, _bytes_to_words(data))
-        # 4. stack + mem-arg buffers.
-        # SOURCE-OF-TRUTH LAYOUT (esp32s3.cfg + esp_algorithm.c, do NOT invent):
-        #   OpenOCD work area: _WA_ADDR=0x3FC9C000, _WA_SIZE=0x24000.
-        #   target_alloc_working_area grows UP from the base (new->addr = addr+size).
-        #   For the reversed S3 (esp_algorithm.c:527-541): code takes one IRAM area
-        #   (full iram_len from iram_org); data->bss->stack->mem-args allocate
-        #   SEQUENTIALLY from the work area, written REVERSED (data-bus vs
-        #   instruction-bus: a write to dram_org-off maps to the stub's view).
-        #   Linker (esp32s3.ld): code@0x3FC9C000 (data-bus view), data@0x3FCA0000.
-        # KNOWN-WRONG below: this stack/buffer placement is ad-hoc and does NOT
-        # match the work-area sequential allocation — that's why flash_map_get's
-        # buffer comes back untouched. FIX = mirror target_alloc_working_area:
-        # allocate stack then mem-args growing up from (work-area base + data+bss),
-        # reversed-addressed. (#29 next step.)
+            tramp_addr = iram_org + code_size
+            self.x.write_mem(tramp_addr, _bytes_to_words(tramp))
+        tramp_mapped_addr = iram_org + code_size
+        code_size += al_tramp_size
+
+        # --- Load data section (esp_algorithm.c:639-677) ---
+        # data+bss alloc'd as one area; base = next work-area alloc after code =
+        # iram_org + iram_len = dram_org. Written NORMALLY (reverse=FALSE).
+        data_addr = dram_org
+        self._load_section_from_image(data, data_addr, False, dram_org)
+        data_sec_sz = _align_up(len(data), 4)
+        bss_sec_sz = _align_up(bss, 4)
+
+        # --- Stack (esp_algorithm.c:679-687) ---
+        # stack alloc'd after data+bss; stack_addr = stack->address + stack_size.
         stack_size = cfg["stack_default_sz"]
-        stack_addr = dram_org - _align_up(len(data), 4) - 0x10
-        stack_addr &= ~0xF                                       # 16-align
+        stack_area_addr = data_addr + data_sec_sz + bss_sec_sz
+        stack_addr = stack_area_addr + stack_size
+        # next free work-area address (mem-args alloc from here, growing up)
+        wa_next = stack_area_addr + stack_size
+
         self.stub = {
             "entry": cfg["entry_addr"],
             "tramp_mapped_addr": tramp_mapped_addr,
             "stack_addr": stack_addr,
             "stack_size": stack_size,
+            "wa_next": wa_next,
             "trap_entry_addr": cfg["trap_entry_addr"],
             "trap_record_addr": cfg["trap_record_addr"],
             "iram_org": iram_org, "dram_org": dram_org,
@@ -155,10 +197,13 @@ class XtensaFlasher:
         # each buffer's address into its user-arg register. (run_image:185-198 — the
         # preloaded path bases mem args at stub.stack_addr and grows up; we place
         # them just below the stack base, clear of the SP, growing down.)
+        # mem-args allocate from the work area, continuing the bump (growing UP)
+        # after the stack — mirroring target_alloc_working_area (esp_algorithm.c:
+        # 168-184 non-preloaded path: alloc a buffer, write its addr into arg[idx]).
         mem_params = mem_params or []
-        base = s["stack_addr"] - s["stack_size"] - 0x10
+        base = s["wa_next"]
         for mp in mem_params:
-            base = (base - _align_up(mp["size"], 4)) & ~0xF
+            base = _align_up(base, 4)
             mp["_addr"] = base
             idx = mp["arg"]
             while len(args) <= idx:
@@ -166,6 +211,7 @@ class XtensaFlasher:
             args[idx] = base
             if mp.get("data"):                                  # PARAM_OUT-to-target
                 self.x.write_mem(base, _bytes_to_words(mp["data"]))
+            base += _align_up(mp["size"], 4)
         sp = (s["stack_addr"] & ~0xF) - 16                       # algo_regs_init_start
         # Build the reg_params exactly as esp_xtensa_algo_regs_init_start does
         # (esp_xtensa_algorithm.c:47), then call the ONE faithful start/wait_algorithm

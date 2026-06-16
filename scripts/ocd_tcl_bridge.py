@@ -100,6 +100,14 @@ class OcdTclBridge:
         t.register("poll", self._poll)
         t.register("sleep", self._sleep)
         t.register("echo", lambda a: (print(*a), "")[1])
+        # S3 stub-flasher (#29): drive the OpenOCD prebuilt flasher stub via Tcl,
+        # backed by espjtag.xtensa_flasher (the 1:1 port of esp_algorithm_*). Lets
+        # the #29 step-tests run as Tcl scripts through this bridge (the OpenOCD
+        # way) instead of hand-rolled python.
+        self._flasher = None
+        t.register("stub_load", self._stub_load)
+        t.register("stub_run", self._stub_run)
+        t.register("xhalt", self._xhalt)
         if self.core == "riscv":
             # the DMI-register globals esp32c6_soc_reset reads (just the DMI
             # addresses espjtag already knows), and the verbatim C6 procs.
@@ -148,6 +156,37 @@ class OcdTclBridge:
         # poll instead (its native reset path does the same). Intentional no-op.
         return ""
 
+    # --- S3 stub-flasher Tcl commands (#29) -----------------------------------
+    def _flasher_obj(self):
+        if self.xdm is None:
+            raise RuntimeError("stub flasher needs an Xtensa (S3) target")
+        if self._flasher is None:
+            from espjtag.xtensa_flasher import XtensaFlasher
+            self._flasher = XtensaFlasher(self.xdm, "esp32s3")
+        return self._flasher
+
+    def _xhalt(self, args):
+        """xhalt — powerup + halt the Xtensa core. Returns 1 on halted."""
+        self.xdm.powerup()
+        return "1" if self.xdm.halt() else "0"
+
+    def _stub_load(self, args):
+        """stub_load <cmd> — load a prebuilt flasher stub (e.g. cmd_test1,
+        cmd_flash_map_get). Returns 'entry stack tramp' addresses."""
+        st = self._flasher_obj().load(args[0])
+        return (f"0x{st['entry']:x} 0x{st['stack_addr']:x} "
+                f"0x{st['tramp_mapped_addr']:x}")
+
+    def _stub_run(self, args):
+        """stub_run [arg ...] — run the loaded stub with int args (a2..a6).
+        Returns the stub return code (a2) as 0xNN, or 'TIMEOUT' if it didn't halt."""
+        a = tuple(int(x, 0) for x in args)
+        try:
+            rc = self._flasher_obj().run(args=a, timeout_ms=3000)
+        except RuntimeError:
+            return "TIMEOUT"
+        return f"0x{rc:x}"
+
     def run(self, tcl):
         return self.tcl.eval(tcl)
 
@@ -157,12 +196,25 @@ def main():
     ap.add_argument("--usb", required=True)
     ap.add_argument("--reset", action="store_true",
                     help="also run esp32c6_soc_reset (RESETS the chip)")
+    ap.add_argument("--tcl", help="run a Tcl test script through the bridge "
+                    "(e.g. tests for the S3 stub flasher) and exit")
     args = ap.parse_args()
 
     j = EspUsbJtag(args.usb)
     ic = j.read_idcode()
     br = OcdTclBridge(j)
     print(f"IDCODE=0x{ic:08x} [{chips.name_for(ic) or '??'}]  core={br.core}")
+
+    if args.tcl:
+        with open(args.tcl) as f:
+            script = f.read()
+        try:
+            br.run(script)
+        finally:
+            if br.xdm:
+                br.xdm.resume()
+            usb.util.dispose_resources(j.dev)
+        return 0
 
     if br.core == "xtensa":
         # S3: leaf commands run on the Xtensa XDM. Demonstrate a Tcl `mdw` end-to-end.
