@@ -52,6 +52,7 @@ MOCK_STEPS = [
     ("tcl-drift (hw-free)", _s("verify_chips_vs_tcl.py")),
     ("s3-flasher (model)", _s("ocd_tcl_bridge.py", "--mock",
                               "--tcl", os.path.join(ROOT, "scripts", "test_s3_mock.tcl"))),
+    ("riscv-dmi (model)", _s("test_riscv_mock.py")),
 ]
 REAL_STEPS = [
     ("selftest+dmireset C6", _s("validate_dmireset.py", "--usb-path", C6_USB)),
