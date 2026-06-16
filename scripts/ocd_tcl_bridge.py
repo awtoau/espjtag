@@ -113,6 +113,15 @@ class OcdTclBridge:
         # is right independent of hardware (the part paraphrase-bugs hid in).
         t.register("stub_plan", self._stub_plan)
         t.register("compare", self._compare)
+        # Instrumentation: the same harness MEASURES, not just pass/fails. `mark`/
+        # `elapsed` time a span; `jtag_count` reports transactions; `assert_lt`/
+        # `assert_eq` gate on thresholds. (Perf becomes a Tcl-scriptable test.)
+        t.register("mark", self._mark)
+        t.register("elapsed", self._elapsed)
+        t.register("jtag_count", self._jtag_count)
+        t.register("assert_eq", self._assert_eq)
+        t.register("assert_lt", self._assert_lt)
+        self._marks = {}
         if self.core == "riscv":
             # the DMI-register globals esp32c6_soc_reset reads (just the DMI
             # addresses espjtag already knows), and the verbatim C6 procs.
@@ -219,6 +228,42 @@ class OcdTclBridge:
     def _compare(self, args):
         """compare <a> <b> — returns 1 if equal (string), else 0. For Tcl asserts."""
         return "1" if args[0] == args[1] else "0"
+
+    # --- instrumentation: perf measurement as Tcl ----------------------------
+    def _mark(self, args):
+        """mark <name> — record a timestamp + jtag-transaction count for a span."""
+        import time as _t
+        self._marks[args[0]] = (_t.perf_counter(), len(self.trace))
+        return ""
+
+    def _elapsed(self, args):
+        """elapsed <name> — ms since `mark <name>` (string, 3dp). 0 if no mark."""
+        import time as _t
+        if args[0] not in self._marks:
+            return "0"
+        t0, _ = self._marks[args[0]]
+        return f"{(_t.perf_counter() - t0) * 1000:.3f}"
+
+    def _jtag_count(self, args):
+        """jtag_count [name] — total leaf transactions, or those since `mark name`.
+        (Counts mww/mdw/dmi via self.trace; the proxy for JTAG round-trips.)"""
+        if args and args[0] in self._marks:
+            return str(len(self.trace) - self._marks[args[0]][1])
+        return str(len(self.trace))
+
+    def _assert_eq(self, args):
+        """assert_eq <label> <got> <want> — print PASS/FAIL."""
+        ok = args[1] == args[2]
+        print(f"  [{'PASS' if ok else 'FAIL'}] {args[0]} -> "
+              f"{args[1]}" + ("" if ok else f" (want {args[2]})"))
+        return "1" if ok else "0"
+
+    def _assert_lt(self, args):
+        """assert_lt <label> <got> <limit> — PASS if float(got) < float(limit)."""
+        ok = float(args[1]) < float(args[2])
+        print(f"  [{'PASS' if ok else 'FAIL'}] {args[0]} -> {args[1]} "
+              f"< {args[2]}" + ("" if ok else " (TOO SLOW)"))
+        return "1" if ok else "0"
 
     def run(self, tcl):
         return self.tcl.eval(tcl)
