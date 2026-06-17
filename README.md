@@ -6,6 +6,13 @@ adapter — just the USB cable.**
 
 An [awto.au](https://awto.au) project.
 
+> **Built on the shoulders of [OpenOCD](https://github.com/espressif/openocd-esp32)
+> and [probe-rs](https://github.com/probe-rs/probe-rs) — thank you for your
+> fantastic work.** The protocol logic here is a faithful 1:1 reimplementation of
+> theirs in pure Python, transcribed verbatim. Where our code is correct, it's
+> because theirs is. The rules we port by:
+> [`docs/FAITHFUL-REIMPLEMENTATION.md`](docs/FAITHFUL-REIMPLEMENTATION.md).
+
 **The speed** (measured fleet-wide, fair warm-transport comparison, ESP32-C6 —
 `docs/JTAG-BENCHMARK-ANALYSIS.md` + the recorded run DB):
 
