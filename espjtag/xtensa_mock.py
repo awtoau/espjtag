@@ -33,6 +33,9 @@ class MockXtensaXDM:
         self._run_result = (0,)           # what wait_algorithm reports for a2
         self._chip_dict = {"name": "S3"}
         self.idcode = idcode
+        # the real cache model the start/wait_algorithm port runs on
+        from .xtensa import XtensaCore
+        self.core = XtensaCore()
 
     # --- the XtensaXDM surface XtensaFlasher uses --------------------------
     def write_mem(self, addr, words):
@@ -70,6 +73,14 @@ class MockXtensaXDM:
         # result and mark STOPPED so wait_algorithm sees a halt.
         if naraddr == _DIR0EXEC and value == _INS_RFDO:
             self.resumes.append((self.regs.get(("sr", _EPC6_WSR)),))
+            # snapshot the a-regs AS PROGRAMMED at resume time. The unified
+            # start_algorithm writes reg_params through the register CACHE (flushed
+            # via write_dirty_registers), not _set_ar, so regs[] wouldn't otherwise
+            # see a0/a1/a8 etc. We read them from the cache here — before
+            # wait_algorithm restores the backup — so register_expect can assert
+            # what the run set. (The cache is the source of truth for the port.)
+            for _n in range(16):
+                self.regs[f"a{_n}"] = self.xtensa_reg_get(_XT_REG_IDX_A0 + _n)
             self.regs["a2"] = self._run_result[0] & 0xFFFFFFFF
             self._stopped = True
 
@@ -85,9 +96,19 @@ class MockXtensaXDM:
     from .xtensa import XtensaXDM as _RealXDM
     start_algorithm = _RealXDM.start_algorithm
     wait_algorithm = _RealXDM.wait_algorithm
-    _REG_WSR = _RealXDM._REG_WSR
-    _reg_set = _RealXDM._reg_set
-    _reg_get = _RealXDM._reg_get
+    # cache + resume helpers the algorithm port calls (they bottom out on this
+    # mock's nar_write/nar_read/_get_ar/_get_sr_a3/halt — so the mock is just a
+    # different backend, not a second implementation).
+    _reg_get_value = _RealXDM._reg_get_value
+    _reg_set_value = _RealXDM._reg_set_value
+    xtensa_reg_get = _RealXDM.xtensa_reg_get
+    xtensa_reg_set = _RealXDM.xtensa_reg_set
+    _wb_to_canonical = _RealXDM._wb_to_canonical
+    xtensa_write_sr_by_num = _RealXDM.xtensa_write_sr_by_num
+    xtensa_write_dirty_registers = _RealXDM.xtensa_write_dirty_registers
+    xtensa_prepare_resume = _RealXDM.xtensa_prepare_resume
+    xtensa_do_resume = _RealXDM.xtensa_do_resume
+    xtensa_resume = _RealXDM.xtensa_resume
     del _RealXDM
 
     # --- test controls -----------------------------------------------------
@@ -111,4 +132,5 @@ class MockXtensaXDM:
 from .xtensa import (                              # noqa: E402
     DIR0EXEC as _DIR0EXEC, DSR as _DSR, OCDDSR_STOPPED as _OCDDSR_STOPPED,
     INS_RFDO as _INS_RFDO, INS_WSR_EPC6_A3 as _EPC6_WSR,
+    XT_REG_IDX_A0 as _XT_REG_IDX_A0,
 )

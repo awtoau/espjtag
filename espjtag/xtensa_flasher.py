@@ -216,23 +216,27 @@ class XtensaFlasher:
             base += _align_up(mp["size"], 4)
         sp = (s["stack_addr"] & ~0xF) - 16                       # algo_regs_init_start
         # Build the reg_params exactly as esp_xtensa_algo_regs_init_start does
-        # (esp_xtensa_algorithm.c:47), then call the ONE faithful start/wait_algorithm
-        # port in xtensa.py. a2 is inout (the return code). Resume onto the
-        # trampoline, which callx8's the windowed entry (a8) natively.
+        # (esp_xtensa_algorithm.c:47-69), in the SAME order, then call the faithful
+        # start/wait_algorithm port in xtensa.py. a2 is PARAM_IN_OUT (return code);
+        # the rest PARAM_OUT. vecbase is NOT a reg_param — it's ainfo->trap_entry_addr
+        # (esp_xtensa_algorithm.c:133), set by xtensa_start_algorithm via VECBASE.
+        # Resume onto the trampoline, which callx8's the windowed entry (a8) natively.
         reg_params = [
-            ("vecbase", s["trap_entry_addr"], "out"),
-            ("ps", RUN_PS, "out"),                               # WOE+UM+INTLEVEL6
-            ("windowbase", 0, "out"),
-            ("windowstart", 1, "out"),
-            ("a0", 0, "out"),
+            ("a0", 0, "out"),                                    # TODO: move to tramp
             ("a1", sp, "out"),
             ("a8", s["entry"], "out"),                           # windowed entry
+            ("windowbase", 0, "out"),
+            ("windowstart", 1, "out"),
+            ("ps", RUN_PS, "out"),                               # WOE+UM+INTLEVEL6
             ("a2", args[0] if args else 0, "inout"),             # arg0 / return code
         ]
         for i, a in enumerate(args[1:], start=3):                # a3..a6 = args 1..4
             reg_params.append((f"a{i}", a & 0xFFFFFFFF, "out"))
-        self.x.start_algorithm(reg_params, s["tramp_mapped_addr"])
-        out, halted = self.x.wait_algorithm(reg_params, timeout=timeout_ms)
+        ainfo = self.x.start_algorithm(
+            reg_params, s["tramp_mapped_addr"], exit_point=0,
+            trap_entry_addr=s["trap_entry_addr"])
+        out, halted = self.x.wait_algorithm(
+            reg_params, exit_point=0, timeout=timeout_ms, algorithm_info=ainfo)
         if not halted:
             raise RuntimeError("stub did not halt at exit BREAK (timeout)")
         # read back PARAM_IN mem buffers

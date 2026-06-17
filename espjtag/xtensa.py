@@ -94,6 +94,192 @@ IDLE = 16                     # run-test-idle settle clocks (the XDM tdi_idle)
 # guess; a wrong value silently shifts every read.
 READ_LATENCY = 0
 
+# ============================================================================
+# Register cache model — PORTED FROM openocd-esp32 @ f10eceff22
+#   src/target/xtensa/xtensa_regs.h  (enum xtensa_reg_id, enum xtensa_reg_type)
+#   src/target/xtensa/xtensa.c:178-280  (struct xtensa_reg_desc xtensa_regs[])
+# Built on the NAR transport above so xtensa_write_dirty_registers /
+# xtensa_resume / xtensa_start_algorithm / xtensa_wait_algorithm can run 1:1
+# against the C. Target is ESP32-S3 = LX7 (XT_LX); the NX branches are ported
+# but never exercised.
+# ============================================================================
+
+# enum xtensa_reg_id (xtensa_regs.h:16-67) — only the indices the cache model
+# below references by name. PC=0, AR0..AR63 = 1..64, then the SFR block.
+# NB enum jumps: AR15 = 16, then ARLAST = 64 (Max 64 ARs); WINDOWBASE follows at 65.
+XT_REG_IDX_PC = 0
+XT_REG_IDX_AR0 = 1
+XT_REG_IDX_ARFIRST = XT_REG_IDX_AR0
+XT_REG_IDX_AR15 = 16
+XT_REG_IDX_ARLAST = 64                 # "Max 64 ARs" (xtensa_regs.h:34)
+XT_REG_IDX_WINDOWBASE = 65
+XT_REG_IDX_WINDOWSTART = 66
+XT_REG_IDX_PS = 67
+XT_REG_IDX_IBREAKENABLE = 68
+XT_REG_IDX_DDR = 69
+XT_REG_IDX_IBREAKA0 = 70
+XT_REG_IDX_CPENABLE = 76
+XT_REG_IDX_EXCCAUSE = 77
+XT_REG_IDX_DEBUGCAUSE = 78
+XT_REG_IDX_ICOUNT = 79
+XT_REG_IDX_ICOUNTLEVEL = 80
+XT_REG_IDX_A0 = 81
+XT_REG_IDX_A3 = 84
+XT_REG_IDX_A15 = 96
+XT_NUM_REGS = 97                       # XT_NUM_REGS (xtensa_regs.h:67)
+
+# enum xtensa_reg_type (xtensa_regs.h:74-84)
+XT_REG_GENERAL = 0      # part of the windowed register set (ARx)
+XT_REG_USER = 1
+XT_REG_SPECIAL = 2      # needs RSR to read
+XT_REG_DEBUG = 3
+XT_REG_RELGEN = 4       # Ax — relative general (AR + window-base offset)
+XT_REG_FR = 5
+XT_REG_TIE = 6
+XT_REG_OTHER = 7
+
+XT_REGF_NOREAD = 0x01   # (xtensa_regs.h) — ddr has it; we don't read it back
+
+# Special-register numbers (xtensa.c:166-172)
+XT_PS_REG_NUM = 0xE6
+XT_EPS_REG_NUM_BASE = 0xC0      # (EPS2 - 2), for adding DBGLEVEL
+XT_EPC_REG_NUM_BASE = 0xB0      # (EPC1 - 1), for adding DBGLEVEL
+XT_PC_REG_NUM_VIRTUAL = 0xFF    # marker for computing PC (EPC[DBGLEVEL])
+XT_VECBASE_REG_NUM = 0xE7
+XT_SR_DDR = 0x68                # xtensa_regs[XT_REG_IDX_DDR].reg_num (xtensa_regs.h:138 / xtensa.c:248)
+XT_REG_A3 = 0x03                # xtensa_regs[XT_REG_IDX_AR3].reg_num (xtensa_regs.h:142)
+
+# PS.RING field (xtensa.h:39-41)
+def XT_PS_RING(v):
+    return (v & 0x3) << 6
+XT_PS_RING_MSK = 0x3 << 6
+def XT_PS_RING_GET(v):
+    return (v >> 6) & 0x3
+
+# enum xtensa_mode (xtensa.h:211-217)
+XT_MODE_RING0, XT_MODE_RING1, XT_MODE_RING2, XT_MODE_RING3, XT_MODE_ANY = range(5)
+
+# XT_INS_* little-endian encoders (LX is LE => XT_ISBE false; xtensa.c:44-138).
+# _XT_INS_FORMAT_RSR (xtensa.c:44-50), LE branch:
+def XT_INS_RSR(sr, t):          # Read Special Register (xtensa.c:131; opcode 0x030000)
+    return 0x030000 | ((sr & 0xFF) << 8) | ((t & 0x0F) << 4)
+def XT_INS_WSR(sr, t):          # Write Special Register (xtensa.c:133; opcode 0x130000)
+    return 0x130000 | ((sr & 0xFF) << 8) | ((t & 0x0F) << 4)
+def XT_INS_WUR(ur, t):          # Write User Register (xtensa.c:143; opcode 0xF30000)
+    return 0xF30000 | ((ur & 0xFF) << 8) | ((t & 0x0F) << 4)
+def XT_INS_WFR(fr, t):          # Write Floating-Point Register (xtensa.c:148, RRR LE)
+    return 0xFA0000 | ((((t << 4) | 0x5) & 0xFF) << 4) | ((fr & 0x0F) << 12)
+def XT_INS_ROTW(n):             # Rotate Window by N (xtensa.c:138, LE branch)
+    return 0x408000 | ((n & 15) << 4)
+XT_INS_RFDO = 0xF1E000          # "Return From Debug Operation" (xtensa.c:97, LE branch)
+
+# debug.irq_level for the S3 (LX7) is 6: the debug-mode PC/PS live in EPC6/EPS6.
+# (NDEBUGLEVEL — set per chip; here transcribed for the S3, the only LX we run.)
+XT_LX_DEBUG_IRQ_LEVEL = 6
+AREGS_NUM = 64                  # core_config->aregs_num for LX (16 windows of 4)
+
+# OCDDSR exec-error bits (xtensa_debug_module.h:293-296) — checked by
+# xtensa_core_status_check after each queue execute.
+OCDDSR_EXECEXCEPTION = 1 << 1
+OCDDSR_EXECBUSY = 1 << 2
+OCDDSR_EXECOVERRUN = 1 << 3
+
+
+def XT_MK_REG_DESC(name, reg_num, type_, flags):
+    """struct xtensa_reg_desc (xtensa.c:178 XT_MK_REG_DESC). We keep only the
+    fields the cache model uses: name, reg_num, type, flags."""
+    return {"name": name, "reg_num": reg_num, "type": type_, "flags": flags}
+
+
+# struct xtensa_reg_desc xtensa_regs[XT_NUM_REGS] — transcribed VERBATIM from
+# xtensa.c:178-280. (ar16..ar63 generated; reg_num == AR index, type GENERAL.)
+xtensa_regs = [
+    XT_MK_REG_DESC("pc", XT_PC_REG_NUM_VIRTUAL, XT_REG_SPECIAL, 0),
+]
+for _n in range(64):            # ar0..ar63 (xtensa.c:180-243)
+    xtensa_regs.append(XT_MK_REG_DESC("ar%d" % _n, _n, XT_REG_GENERAL, 0))
+xtensa_regs += [
+    XT_MK_REG_DESC("windowbase", 0x48, XT_REG_SPECIAL, 0),
+    XT_MK_REG_DESC("windowstart", 0x49, XT_REG_SPECIAL, 0),
+    XT_MK_REG_DESC("ps", XT_PS_REG_NUM, XT_REG_SPECIAL, 0),  # PS (not mapped through EPS[])
+    XT_MK_REG_DESC("ibreakenable", 0x60, XT_REG_SPECIAL, 0),
+    XT_MK_REG_DESC("ddr", 0x68, XT_REG_DEBUG, XT_REGF_NOREAD),
+    XT_MK_REG_DESC("ibreaka0", 0x80, XT_REG_SPECIAL, 0),
+    XT_MK_REG_DESC("ibreaka1", 0x81, XT_REG_SPECIAL, 0),
+    XT_MK_REG_DESC("dbreaka0", 0x90, XT_REG_SPECIAL, 0),
+    XT_MK_REG_DESC("dbreaka1", 0x91, XT_REG_SPECIAL, 0),
+    XT_MK_REG_DESC("dbreakc0", 0xA0, XT_REG_SPECIAL, 0),
+    XT_MK_REG_DESC("dbreakc1", 0xA1, XT_REG_SPECIAL, 0),
+    XT_MK_REG_DESC("cpenable", 0xE0, XT_REG_SPECIAL, 0),
+    XT_MK_REG_DESC("exccause", 0xE8, XT_REG_SPECIAL, 0),
+    XT_MK_REG_DESC("debugcause", 0xE9, XT_REG_SPECIAL, 0),
+    XT_MK_REG_DESC("icount", 0xEC, XT_REG_SPECIAL, 0),
+    XT_MK_REG_DESC("icountlevel", 0xED, XT_REG_SPECIAL, 0),
+]
+# a0..a15 — WARNING: reg_num points to the index of the corresponding ARx
+# register, NOT the processor register number (xtensa.c:261-279).
+for _n in range(16):
+    xtensa_regs.append(XT_MK_REG_DESC("a%d" % _n, XT_REG_IDX_AR0 + _n, XT_REG_RELGEN, 0))
+assert len(xtensa_regs) == XT_NUM_REGS, (len(xtensa_regs), XT_NUM_REGS)
+
+
+class _Reg:
+    """struct reg (target/register.h) — only the fields xtensa.c touches. value
+    is a uint32 (cache regs are <=32-bit here). dirty/valid/exist mirror the C."""
+    __slots__ = ("name", "value", "dirty", "valid", "exist", "size")
+
+    def __init__(self, name, exist=True, size=32):
+        self.name = name
+        self.value = 0
+        self.dirty = False
+        self.valid = False
+        self.exist = exist
+        self.size = size
+
+
+class XtensaCore:
+    """The register cache (struct reg_cache) + the xtensa_regs / optregs
+    descriptor lookup + algo_context_backup. PORTED FROM xtensa.c. Owns:
+      reg_list[]        — one _Reg per cache index
+      regs[]            — descriptor for each cache index (xtensa_regs then optregs)
+      optregs[]         — the optreg descriptors (we add just eps6 for the S3)
+      eps_dbglevel_idx  — cache index of EPS[debug.irq_level] (xtensa.c:4093-4096)
+    """
+
+    def __init__(self):
+        self.regs = [dict(d) for d in xtensa_regs]           # base XT_NUM_REGS descriptors
+        self.optregs = []
+        self.reg_list = [_Reg(d["name"]) for d in xtensa_regs]
+        # ddr is XT_REGF_NOREAD; leave exist True (we never read it back). PC etc.
+        # all exist on the S3.
+        # --- optregs: the S3 has EPS6 (= EPS_BASE + irq_level) as the run-PS.
+        # xtensa.c:4093-4096 sets eps_dbglevel_idx = XT_NUM_REGS + num_optregs - 1
+        # for the optreg whose reg_num == XT_EPS_REG_NUM_BASE + debug.irq_level.
+        eps_num = XT_EPS_REG_NUM_BASE + XT_LX_DEBUG_IRQ_LEVEL    # 0xC0 + 6 = 0xC6 (EPS6)
+        self.optregs.append(XT_MK_REG_DESC("eps%d" % XT_LX_DEBUG_IRQ_LEVEL,
+                                           eps_num, XT_REG_SPECIAL, 0))
+        self.regs.append(self.optregs[-1])
+        self.reg_list.append(_Reg(self.optregs[-1]["name"]))
+        self.eps_dbglevel_idx = XT_NUM_REGS + len(self.optregs) - 1
+        self.num_regs = len(self.reg_list)
+        # algo_context_backup[i] — per-reg saved value (xtensa.h). Sized to the cache.
+        self.algo_context_backup = [0] * self.num_regs
+
+    def desc(self, i):
+        """The xtensa_reg_desc for cache index i (xtensa.c:726-727: base table for
+        i < XT_NUM_REGS, else optregs[i - XT_NUM_REGS])."""
+        return self.regs[i]
+
+    def register_get_by_name(self, name):
+        """register_get_by_name(core_cache, name, 0) (target/register.c:50) — first
+        existing reg with this name, no search_all."""
+        for r in self.reg_list:
+            if not r.exist:
+                continue
+            if r.name == name:
+                return r
+        return None
+
 
 class XtensaXDM:
     """Xtensa OCD access on an EspUsbJtag transport `j`. The S3 must be tabled
@@ -106,6 +292,8 @@ class XtensaXDM:
         # NAR traffic can leave read_idcode() returning stale values, so the flash
         # helpers must not re-derive the chip from a later read_idcode().
         self._chip_dict = chips.lookup(idcode) or {}
+        # The register cache (struct xtensa.core_cache) the algorithm port runs on.
+        self.core = XtensaCore()
 
     # --- NAR register access: ONE IR=NARSEL, single 8-bit addr + 32-bit data -----
     def nar_read(self, naraddr):
@@ -199,73 +387,330 @@ class XtensaXDM:
         self.nar_write(DIR0EXEC, INS_WSR_DDR_A3)     # DDR = a3
         return self.nar_read(DDR)
 
-    # --- xtensa_start_algorithm / xtensa_wait_algorithm (xtensa.c:2810/2911) ------
-    # ONE faithful port of OpenOCD's two functions, taking NAMED reg_params exactly
-    # like the C (struct reg_param: reg_name, value, direction). Both the bare-call
-    # path and the stub-flasher build their reg_params and call these — same as
-    # OpenOCD, where xtensa_start_algorithm is one function used by every caller.
-    #
-    # reg_params: list of (name, value, direction) where direction is "out" (write
-    # before run) or "inout" (write before, read back after). Names map to the
-    # esp setters: 'a0'..'a15' -> _set_ar; 'ps' -> EPS6; 'windowbase'/'windowstart'
-    # -> WB/WS; 'vecbase' -> VECBASE. PS uses EPS6 because on LX the run-PS lives in
-    # the debug-level EPS (xtensa_start_algorithm maps ps -> eps_dbglevel_idx).
-    _REG_WSR = {
-        "ps": INS_WSR_EPS6_A3, "windowbase": INS_WSR_WB_A3,
-        "windowstart": INS_WSR_WS_A3, "vecbase": INS_WSR_VECBASE_A3,
-    }
+    # ======================================================================
+    # Register cache access — PORTED FROM xtensa.c. xtensa_reg_get/set operate
+    # on self.core.reg_list[idx]; the cache is flushed to silicon by
+    # xtensa_write_dirty_registers. The cache is the model the algorithm port
+    # below runs on, exactly like the C.
+    # ======================================================================
+    def _reg_get_value(self, reg):
+        """xtensa_reg_get_value (xtensa.c:1031): buf_get_u32(reg->value, 0, 32)."""
+        return reg.value & 0xFFFFFFFF
 
-    def _reg_set(self, name, val):
-        if name in self._REG_WSR:
-            self._set_sr_a3(self._REG_WSR[name], val)
-        elif name[0] == "a" and name[1:].isdigit():
-            self._set_ar(int(name[1:]), val & 0xFFFFFFFF)
+    def _reg_set_value(self, reg, value):
+        """xtensa_reg_set_value (xtensa.c:1036): buf_set_u32 + reg->dirty = true."""
+        reg.value = value & 0xFFFFFFFF
+        reg.dirty = True
+
+    def xtensa_reg_get(self, reg_id):
+        """xtensa_reg_get (xtensa.c:1129)."""
+        return self._reg_get_value(self.core.reg_list[reg_id])
+
+    def xtensa_reg_set(self, reg_id, value):
+        """xtensa_reg_set (xtensa.c:1136): no-op if unchanged, else set+dirty."""
+        reg = self.core.reg_list[reg_id]
+        if self._reg_get_value(reg) == (value & 0xFFFFFFFF):
+            return
+        self._reg_set_value(reg, value)
+
+    def _wb_to_canonical(self, reg_idx, windowbase):
+        """xtensa_windowbase_offset_to_canonical (xtensa.c:538). LX: base_inc 4."""
+        if XT_REG_IDX_AR0 <= reg_idx <= XT_REG_IDX_ARLAST:
+            idx = reg_idx - XT_REG_IDX_AR0
+        elif XT_REG_IDX_A0 <= reg_idx <= XT_REG_IDX_A15:
+            idx = reg_idx - XT_REG_IDX_A0
         else:
-            raise ValueError(f"unknown reg_param {name!r}")
+            raise ValueError("Can't convert register %d to non-windowbased" % reg_idx)
+        base_inc = 4    # XT_LX
+        return ((idx + windowbase * base_inc) & (AREGS_NUM - 1)) + XT_REG_IDX_AR0
 
-    def _reg_get(self, name):
-        if name[0] == "a" and name[1:].isdigit():
-            return self._get_ar(int(name[1:]))
-        raise ValueError(f"cannot read reg_param {name!r}")
+    def xtensa_write_sr_by_num(self, sr_num, value):
+        """xtensa_write_sr_by_num (xtensa.c:1021): DDR=value; a3=DDR; sr=a3."""
+        self.nar_write(DDR, value)                                   # XDMREG_DDR
+        self.nar_write(DIR0EXEC, XT_INS_RSR(XT_SR_DDR, XT_REG_A3))
+        self.nar_write(DIR0EXEC, XT_INS_WSR(sr_num, XT_REG_A3))
 
-    def start_algorithm(self, reg_params, entry_point, trap=None):
-        """xtensa_start_algorithm (xtensa.c:2810): set the run regs, then resume to
-        entry_point. Mirrors the C: special regs (which clobber a3) are written
-        FIRST, the a-regs LAST. `entry_point` is set via EPC6 (the debug-level PC)
-        and the resume is RFDO. `trap` (optional): the exit BREAK is written there
-        by the caller; we don't manage exit_point here beyond the resume.
+    def xtensa_write_dirty_registers(self):
+        """xtensa_write_dirty_registers (xtensa.c:705). Writes the dirty cache regs
+        back to the core: SFR/USER/FR/TIE first (cpenable delayed), then A0..A15,
+        then the AR file by rotating the window, then a3 restored. LX (windowed)
+        path only; NX branches not ported (not exercised on the S3).
 
-        NOTE: full a0..a7 context SAVE/RESTORE is the caller's job (it knows what to
-        preserve) — OpenOCD saves the whole core_cache; we save the regs we touch."""
-        # special/named SR params first (a3 scratch), a-regs after
-        for name, val, _dir in reg_params:
-            if name in self._REG_WSR:
-                self._reg_set(name, val)
-        self._set_sr_a3(INS_WSR_EPC6_A3, entry_point)      # PC = entry
-        for name, val, _dir in reg_params:
-            if name not in self._REG_WSR:
-                self._reg_set(name, val)
-        # de-assert the debug-interrupt halt request, THEN RFDO — without this the
-        # core never leaves debug mode (DSR stays STOPPED, PC unchanged). Same step
-        # _call_windowed does before its RFDO; resume() is exactly this DCRCLR.
-        self.nar_write(DCRCLR, OCDDCR_DEBUGINTERRUPT)
-        self.nar_write(DIR0EXEC, INS_RFDO)                 # resume at EPC6
+        Each `xtensa_queue_dbg_reg_write(DDR,v)` + `xtensa_queue_exec_ins(...)` pair
+        maps to nar_write(DDR,v) / nar_write(DIR0EXEC, ins); the C batches them into
+        one queue execute, our nar_write serialises each (IDLE-clocked)."""
+        core = self.core
+        reg_list = core.reg_list
+        reg_list_size = core.num_regs
+        scratch_reg_dirty = False
+        delay_cpenable = False
+        windowbase = 0
+        a3 = 0
 
-    def wait_algorithm(self, reg_params, timeout=4000):
-        """xtensa_wait_algorithm (xtensa.c:2911): poll DSR until STOPPED (the exit
-        BREAK), then read back the 'inout' reg_params. Returns (out_dict, halted).
-        out_dict maps each inout reg name to its post-run value."""
+        # SFR/USER/FR/TIE first (xtensa.c:725-790)
+        for i in range(reg_list_size):
+            rlist = (xtensa_regs if i < XT_NUM_REGS else core.optregs)
+            ridx = i if i < XT_NUM_REGS else i - XT_NUM_REGS
+            if reg_list[i].dirty:
+                rd = rlist[ridx]
+                if rd["type"] in (XT_REG_SPECIAL, XT_REG_USER, XT_REG_FR, XT_REG_TIE):
+                    scratch_reg_dirty = True
+                    if i == XT_REG_IDX_CPENABLE:
+                        delay_cpenable = True
+                        continue
+                    regval = self.xtensa_reg_get(i)
+                    self.nar_write(DDR, regval)
+                    self.nar_write(DIR0EXEC, XT_INS_RSR(XT_SR_DDR, XT_REG_A3))
+                    if reg_list[i].exist:
+                        reg_num = rd["reg_num"]
+                        if rd["type"] == XT_REG_USER:
+                            self.nar_write(DIR0EXEC, XT_INS_WUR(reg_num, XT_REG_A3))
+                        elif rd["type"] == XT_REG_FR:
+                            self.nar_write(DIR0EXEC, XT_INS_WFR(reg_num, XT_REG_A3))
+                        elif rd["type"] == XT_REG_TIE:
+                            pass    # tie_reg_access — not configured on the S3
+                        else:       # SFR
+                            if reg_num == XT_PC_REG_NUM_VIRTUAL:
+                                # PC for the debug interrupt depends on NDEBUGLEVEL
+                                reg_num = XT_EPC_REG_NUM_BASE + XT_LX_DEBUG_IRQ_LEVEL
+                                self.nar_write(DIR0EXEC, XT_INS_WSR(reg_num, XT_REG_A3))
+                            else:
+                                self.nar_write(DIR0EXEC, XT_INS_WSR(reg_num, XT_REG_A3))
+                    reg_list[i].dirty = False
+        # NOTE: the MS (NX) delay path (xtensa.c:774-780/913-919) is NX-only; omitted.
+        if scratch_reg_dirty:
+            reg_list[XT_REG_IDX_A3].dirty = True            # xtensa_mark_register_dirty(A3)
+        if delay_cpenable:                                  # xtensa.c:793-802
+            regval = self.xtensa_reg_get(XT_REG_IDX_CPENABLE)
+            self.nar_write(DDR, regval)
+            self.nar_write(DIR0EXEC, XT_INS_RSR(XT_SR_DDR, XT_REG_A3))
+            self.nar_write(DIR0EXEC,
+                           XT_INS_WSR(xtensa_regs[XT_REG_IDX_CPENABLE]["reg_num"], XT_REG_A3))
+            reg_list[XT_REG_IDX_CPENABLE].dirty = False
+
+        preserve_a3 = True      # windowed (LX) — xtensa.c:804
+        if preserve_a3:         # save (windowed) A3 for scratch use (xtensa.c:805-814)
+            self.nar_write(DIR0EXEC, XT_INS_WSR(XT_SR_DDR, XT_REG_A3))   # DDR = a3
+            a3 = self.nar_read(DDR)
+
+        # windowed: grab WINDOWBASE; the ARx/Ax mismatch warning (xtensa.c:824-851)
+        # is diagnostic only and omitted.
+        windowbase = self.xtensa_reg_get(XT_REG_IDX_WINDOWBASE)
+
+        # Write A0-A15 (xtensa.c:854-870)
+        for i in range(16):
+            if reg_list[XT_REG_IDX_A0 + i].dirty:
+                regval = self.xtensa_reg_get(XT_REG_IDX_A0 + i)
+                self.nar_write(DDR, regval)
+                self.nar_write(DIR0EXEC, XT_INS_RSR(XT_SR_DDR, i))
+                reg_list[XT_REG_IDX_A0 + i].dirty = False
+                if i == 3:
+                    a3 = regval     # avoid stomping A3 during restore at end
+
+        # Write AR registers, rotating the window (xtensa.c:872-911)
+        for j in range(0, XT_REG_IDX_ARLAST, 16):
+            for i in range(16):
+                if i + j < AREGS_NUM:
+                    realadr = self._wb_to_canonical(XT_REG_IDX_AR0 + i + j, windowbase)
+                    if reg_list[realadr].dirty:
+                        regval = self.xtensa_reg_get(realadr)
+                        self.nar_write(DDR, regval)
+                        self.nar_write(DIR0EXEC,
+                                       XT_INS_RSR(XT_SR_DDR,
+                                                  xtensa_regs[XT_REG_IDX_AR0 + i]["reg_num"]))
+                        reg_list[realadr].dirty = False
+                        if (i + j) == 3:
+                            a3 = regval
+            # rotate window so we see the next 16; final rotate wraps to start.
+            self.nar_write(DIR0EXEC, XT_INS_ROTW(4))         # LX: 4
+
+        if preserve_a3:                                      # restore a3 (xtensa.c:921-924)
+            self.nar_write(DDR, a3)
+            self.nar_write(DIR0EXEC, XT_INS_RSR(XT_SR_DDR, XT_REG_A3))
+
+    # ======================================================================
+    # Resume — PORTED FROM xtensa.c. xtensa_resume -> prepare_resume (writes PC,
+    # hw breakpoints, flush dirty regs) -> do_resume (RFDO). The S3 has no hw
+    # breakpoints set in this path; the watchpoint/break single-step (which needs
+    # DEBUGCAUSE) is skipped because we always resume with address && !current.
+    # ======================================================================
+    def xtensa_prepare_resume(self, current, address, handle_breakpoints,
+                              debug_execution):
+        """xtensa_prepare_resume (xtensa.c:1648)."""
+        bpena = 0
+        # halt_request = false (xtensa.c:1668) — modelled by not re-asserting it.
+        if address and not current:
+            self.xtensa_reg_set(XT_REG_IDX_PC, address)     # xtensa.c:1670-1671
+        # else: DEBUGCAUSE-driven single-step (xtensa.c:1672-1688) — not reached
+        # here (start_algorithm always resumes address && !current).
+        # Write back hw breakpoints (xtensa.c:1692-1700) — none set: bpena stays 0.
+        self.xtensa_reg_set(XT_REG_IDX_IBREAKENABLE, bpena)  # LX (xtensa.c:1701-1702)
+        self.xtensa_write_dirty_registers()                  # xtensa.c:1704-1705
+
+    def xtensa_do_resume(self):
+        """xtensa_do_resume (xtensa.c:1711-1726): cause_reset (NX no-op on LX),
+        exec RFDO, then core status check. VERBATIM: the C body's only wire op on
+        LX is RFDO — it does NOT clear DEBUGINTERRUPT first (RFDO returns-from-debug
+        by itself). The earlier DCRCLR-before-RFDO was a paraphrase that wedged the
+        core on nested-call8 debug re-entry (the #29 flash_map_get hang)."""
+        # xtensa_cause_reset is NX-only (clears nx_stop_cause); no-op for LX.
+        self.nar_write(DIR0EXEC, XT_INS_RFDO)            # xtensa.c:1718 (RFDO only)
+        # xtensa_core_status_check omitted (diagnostic; reads DSR exec-error bits).
+
+    def xtensa_resume(self, current, address, handle_breakpoints, debug_execution):
+        """xtensa_resume (xtensa.c:1728)."""
+        self.xtensa_prepare_resume(current, address, handle_breakpoints,
+                                   debug_execution)
+        self.xtensa_do_resume()
+        # target->debug_reason / state transitions (xtensa.c:1747-1753) are host-side
+        # bookkeeping we don't model.
+
+    # ======================================================================
+    # xtensa_start_algorithm / xtensa_wait_algorithm — PORTED FROM xtensa.c:2810-3017.
+    # Rebuilt on the register cache + xtensa_resume. reg_params is a list of
+    # (reg_name, value, direction) with direction "out" (== PARAM_OUT, write only)
+    # or "inout" (== PARAM_IN_OUT, write before + read back). mem_params and the
+    # stub exit BREAK are managed by the caller (the flasher); trap_entry_addr maps
+    # to algorithm_info->trap_entry_addr (sets VECBASE), core_mode to ->core_mode.
+    # NOTE the C reaches registers via register_get_by_name on the cache — 'vecbase'
+    # is NOT a cache register, so it must come via trap_entry_addr, not a reg_param.
+    # ======================================================================
+    def start_algorithm(self, reg_params, entry_point, exit_point=0,
+                        trap_entry_addr=0, core_mode=XT_MODE_ANY, algorithm_info=None):
+        """xtensa_start_algorithm (xtensa.c:2810). algorithm_info is the
+        xtensa_algorithm dict (ctx_debug_reason/ctx_ps saved into it for wait);
+        created here if not supplied. Returns the algorithm_info so wait can restore."""
+        core = self.core
+        usr_ps = False
+        if algorithm_info is None:
+            algorithm_info = {"core_mode": core_mode, "trap_entry_addr": trap_entry_addr}
+
+        # NOTE: caller asserts target->state == TARGET_HALTED (xtensa.c:2825).
+
+        # backup whole core_cache (xtensa.c:2830-2833)
+        for i in range(core.num_regs):
+            core.algo_context_backup[i] = self.xtensa_reg_get(i)
+        # save debug reason — not modelled host-side. (xtensa.c:2835/2839)
+        algorithm_info["ctx_debug_reason"] = None
+        # save PS and set to debug_level - 1 (XT_LX) (xtensa.c:2840-2845)
+        algorithm_info["ctx_ps"] = self.xtensa_reg_get(core.eps_dbglevel_idx)
+        newps = (algorithm_info["ctx_ps"] & ~0xF) | (XT_LX_DEBUG_IRQ_LEVEL - 1)
+        self.xtensa_reg_set(core.eps_dbglevel_idx, newps)
+
+        # write mem params (xtensa.c:2846-2855) — caller's job (flasher writes
+        # mem-arg buffers before calling). No-op here.
+
+        # write reg params (xtensa.c:2856-2880)
+        for name, value, direction in reg_params:
+            reg = core.register_get_by_name(name)
+            if reg is None:
+                raise RuntimeError("BUG: register '%s' not found" % name)
+            # size check (xtensa.c:2867-2870) — all cache regs are 32-bit.
+            # memcmp(reg_name, "ps", 3) compares 3 bytes incl. the NUL => true (set
+            # usr_ps) iff name is NOT exactly "ps".
+            if name != "ps":
+                usr_ps = True
+            else:                       # XT_LX: ps maps to eps_dbglevel_idx
+                reg = core.reg_list[core.eps_dbglevel_idx]
+            self._reg_set_value(reg, value & 0xFFFFFFFF)
+            reg.valid = True
+
+        # Set stub exception vector table (xtensa.c:2882-2889)
+        if algorithm_info["trap_entry_addr"]:
+            self.xtensa_write_sr_by_num(XT_VECBASE_REG_NUM,
+                                        algorithm_info["trap_entry_addr"] & 0xFFFFFFFF)
+
+        # ignore custom core mode if custom PS value is specified (xtensa.c:2891-2905)
+        if not usr_ps:      # XT_LX
+            eps_reg_idx = core.eps_dbglevel_idx
+            ps = self.xtensa_reg_get(eps_reg_idx)
+            cur_core_mode = XT_PS_RING_GET(ps)
+            if (algorithm_info["core_mode"] != XT_MODE_ANY
+                    and algorithm_info["core_mode"] != cur_core_mode):
+                new_ps = (ps & ~XT_PS_RING_MSK) | XT_PS_RING(algorithm_info["core_mode"])
+                # core_mode not restored for now (xtensa.c:2900-2901)
+                algorithm_info["core_mode"] = cur_core_mode
+                self.xtensa_reg_set(eps_reg_idx, new_ps)
+                core.reg_list[eps_reg_idx].valid = True
+
+        # xtensa_resume(current=false, entry_point, handle_breakpoints=true,
+        # debug_execution=true) (xtensa.c:2907)
+        self.xtensa_resume(False, entry_point, True, True)
+        return algorithm_info
+
+    def wait_algorithm(self, reg_params, exit_point=0, timeout=4000,
+                       algorithm_info=None):
+        """xtensa_wait_algorithm (xtensa.c:2911). Polls DSR until STOPPED (the exit
+        BREAK), force-halts on failure, checks pc == exit_point, copies inout
+        reg_params out, then restores the whole core_cache from the backup and
+        flushes. Returns (out_dict, halted). out_dict maps each inout reg name to
+        its post-run value (buf_set_u32 of xtensa_reg_get_value)."""
+        core = self.core
+
+        # target_wait_state(HALTED, timeout) (xtensa.c:2925)
         halted = False
         for _ in range(timeout):
             if self.nar_read(DSR) & OCDDSR_STOPPED:
                 halted = True
                 break
+        if not halted:
+            # force a halt (xtensa.c:2927-2938)
+            self.halt()
+            halted2 = False
+            for _ in range(500):                # 500 ms (xtensa.c:2931)
+                if self.nar_read(DSR) & OCDDSR_STOPPED:
+                    halted2 = True
+                    break
+            if not halted2:
+                return {}, False                # ERROR_TARGET_TIMEOUT
+
+        # Read PC from the core, into the cache, then check it (xtensa.c:2940-2944).
+        # PC lives in EPC[debug.irq_level]; the cache fetch route is xtensa_reg_get
+        # after a fetch_all — here we read EPC6 directly off the core and seed PC.
+        pc = self._get_sr_a3(INS_RSR_EPC6_A3)
+        self._reg_set_value(core.reg_list[XT_REG_IDX_PC], pc)
+        core.reg_list[XT_REG_IDX_PC].dirty = False
+        if exit_point and pc != exit_point:
+            raise RuntimeError(
+                "failed algorithm halted at 0x%08x, expected 0x%08x" % (pc, exit_point))
+
+        # Copy core register values to reg_params[] (xtensa.c:2945-2959)
         out = {}
-        if halted:
-            for name, _val, direction in reg_params:
-                if direction == "inout":
-                    out[name] = self._reg_get(name)
-        return out, halted
+        for name, _value, direction in reg_params:
+            if direction != "out":      # direction != PARAM_OUT
+                reg = core.register_get_by_name(name)
+                if reg is None:
+                    raise RuntimeError("BUG: register '%s' not found" % name)
+                # The inout reg's live value: read it off the core, seed the cache.
+                if name[0] == "a" and name[1:].isdigit():
+                    live = self._get_ar(int(name[1:]))
+                    self._reg_set_value(reg, live)
+                    reg.dirty = False
+                out[name] = self._reg_get_value(reg)
+
+        # Read memory values to mem_params (xtensa.c:2960-2970) — caller's job.
+
+        # Restore core_cache from the backup, high index to low (xtensa.c:2975-3007).
+        for i in range(core.num_regs - 1, -1, -1):
+            reg = core.reg_list[i]
+            if i == XT_REG_IDX_PS:
+                continue        # restore mapped reg number of PS depends on NDEBUGLEVEL
+            elif i == XT_REG_IDX_DEBUGCAUSE:
+                # restoring DEBUGCAUSE causes exception in DIR — copy back, clear flags.
+                reg.value = core.algo_context_backup[i] & 0xFFFFFFFF
+                reg.dirty = False
+                reg.valid = False
+            elif (core.algo_context_backup[i] & 0xFFFFFFFF) != (reg.value & 0xFFFFFFFF):
+                reg.value = core.algo_context_backup[i] & 0xFFFFFFFF
+                reg.dirty = True
+                reg.valid = True
+        # target->debug_reason = ctx_debug_reason — host-side, not modelled.
+        # XT_LX: restore EPS[dbglevel] from ctx_ps (xtensa.c:3009-3010)
+        if algorithm_info is not None:
+            self.xtensa_reg_set(core.eps_dbglevel_idx, algorithm_info["ctx_ps"])
+
+        self.xtensa_write_dirty_registers()     # xtensa.c:3012
+        return out, halted or True
 
     def call_function(self, entry, args=(), stack=None, trap=None, timeout=4000,
                       windowed=True, bridge=None):
@@ -375,8 +820,9 @@ class XtensaXDM:
         self._set_ar(8, entry)                                 # callx8 target = ROM entry
         for i, a in enumerate(args):
             self._set_ar(2 + i, a)                             # call0 args a2..a7
-        # de-assert the debug-int halt request, then resume onto the stub
-        self.nar_write(DCRCLR, OCDDCR_DEBUGINTERRUPT)
+        # resume onto the stub. RFDO only (xtensa.c:1718 xtensa_do_resume) — do NOT
+        # clear DEBUGINTERRUPT first; RFDO returns-from-debug by itself, and the extra
+        # DCRCLR wedged the core on nested-call8 debug re-entry (#29).
         self.nar_write(DIR0EXEC, INS_RFDO)
         halted = False
         for _ in range(timeout):
