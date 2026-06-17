@@ -104,50 +104,30 @@ READ_LATENCY = 0
 # but never exercised.
 # ============================================================================
 
-# enum xtensa_reg_id (xtensa_regs.h:16-67) — only the indices the cache model
-# below references by name. PC=0, AR0..AR63 = 1..64, then the SFR block.
-# NB enum jumps: AR15 = 16, then ARLAST = 64 (Max 64 ARs); WINDOWBASE follows at 65.
-XT_REG_IDX_PC = 0
-XT_REG_IDX_AR0 = 1
-XT_REG_IDX_ARFIRST = XT_REG_IDX_AR0
-XT_REG_IDX_AR15 = 16
-XT_REG_IDX_ARLAST = 64                 # "Max 64 ARs" (xtensa_regs.h:34)
-XT_REG_IDX_WINDOWBASE = 65
-XT_REG_IDX_WINDOWSTART = 66
-XT_REG_IDX_PS = 67
-XT_REG_IDX_IBREAKENABLE = 68
-XT_REG_IDX_DDR = 69
-XT_REG_IDX_IBREAKA0 = 70
-XT_REG_IDX_CPENABLE = 76
-XT_REG_IDX_EXCCAUSE = 77
-XT_REG_IDX_DEBUGCAUSE = 78
-XT_REG_IDX_ICOUNT = 79
-XT_REG_IDX_ICOUNTLEVEL = 80
-XT_REG_IDX_A0 = 81
-XT_REG_IDX_A3 = 84
-XT_REG_IDX_A15 = 96
-XT_NUM_REGS = 97                       # XT_NUM_REGS (xtensa_regs.h:67)
+# The register-descriptor model (enum xtensa_reg_id, enum xtensa_reg_type, the
+# XT_PS/EPC/PC reg-num markers, and the verbatim 97-row xtensa_regs[] table) is
+# the single source of truth in xtensa_regs.py — CI-drift-tested row-for-row vs
+# openocd-esp32 @ f10eceff (scripts/test_xtensa_regs.py). Imported here so there
+# is ONE table, not two. (Re-exported below for the modules that import from
+# espjtag.xtensa.)
+from .xtensa_regs import (                          # noqa: E402,F401
+    XT_REG_IDX_PC, XT_REG_IDX_AR0, XT_REG_IDX_ARFIRST, XT_REG_IDX_AR3,
+    XT_REG_IDX_AR15, XT_REG_IDX_ARLAST, XT_REG_IDX_WINDOWBASE,
+    XT_REG_IDX_WINDOWSTART, XT_REG_IDX_PS, XT_REG_IDX_IBREAKENABLE,
+    XT_REG_IDX_DDR, XT_REG_IDX_IBREAKA0, XT_REG_IDX_CPENABLE, XT_REG_IDX_EXCCAUSE,
+    XT_REG_IDX_DEBUGCAUSE, XT_REG_IDX_ICOUNT, XT_REG_IDX_ICOUNTLEVEL,
+    XT_REG_IDX_A0, XT_REG_IDX_A3, XT_REG_IDX_A15, XT_NUM_REGS,
+    XT_REG_GENERAL, XT_REG_USER, XT_REG_SPECIAL, XT_REG_DEBUG, XT_REG_RELGEN,
+    XT_REG_FR, XT_REG_TIE, XT_REG_OTHER, XT_REGF_NOREAD,
+    XT_PS_REG_NUM, XT_EPC_REG_NUM_BASE, XT_PC_REG_NUM_VIRTUAL,
+    xtensa_regs as _XTENSA_REGS_TABLE, XtensaRegDesc,
+)
 
-# enum xtensa_reg_type (xtensa_regs.h:74-84)
-XT_REG_GENERAL = 0      # part of the windowed register set (ARx)
-XT_REG_USER = 1
-XT_REG_SPECIAL = 2      # needs RSR to read
-XT_REG_DEBUG = 3
-XT_REG_RELGEN = 4       # Ax — relative general (AR + window-base offset)
-XT_REG_FR = 5
-XT_REG_TIE = 6
-XT_REG_OTHER = 7
-
-XT_REGF_NOREAD = 0x01   # (xtensa_regs.h) — ddr has it; we don't read it back
-
-# Special-register numbers (xtensa.c:166-172)
-XT_PS_REG_NUM = 0xE6
+# xtensa.py-specific reg-num convenience constants not in the descriptor table.
 XT_EPS_REG_NUM_BASE = 0xC0      # (EPS2 - 2), for adding DBGLEVEL
-XT_EPC_REG_NUM_BASE = 0xB0      # (EPC1 - 1), for adding DBGLEVEL
-XT_PC_REG_NUM_VIRTUAL = 0xFF    # marker for computing PC (EPC[DBGLEVEL])
 XT_VECBASE_REG_NUM = 0xE7
-XT_SR_DDR = 0x68                # xtensa_regs[XT_REG_IDX_DDR].reg_num (xtensa_regs.h:138 / xtensa.c:248)
-XT_REG_A3 = 0x03                # xtensa_regs[XT_REG_IDX_AR3].reg_num (xtensa_regs.h:142)
+XT_SR_DDR = 0x68                # xtensa_regs[XT_REG_IDX_DDR].reg_num
+XT_REG_A3 = 0x03                # xtensa_regs[XT_REG_IDX_AR3].reg_num
 
 # PS.RING field (xtensa.h:39-41)
 def XT_PS_RING(v):
@@ -185,42 +165,19 @@ OCDDSR_EXECBUSY = 1 << 2
 OCDDSR_EXECOVERRUN = 1 << 3
 
 
+# The verbatim 97-row xtensa_regs[] table now lives in xtensa_regs.py (imported
+# above as _XTENSA_REGS_TABLE). Alias it under the historical name so existing
+# references (and the re-export surface) keep working. Descriptors are
+# XtensaRegDesc objects with attribute access (.name/.reg_num/.type/.dbreg_num).
+xtensa_regs = _XTENSA_REGS_TABLE
+
+
 def XT_MK_REG_DESC(name, reg_num, type_, flags):
-    """struct xtensa_reg_desc (xtensa.c:178 XT_MK_REG_DESC). We keep only the
-    fields the cache model uses: name, reg_num, type, flags."""
-    return {"name": name, "reg_num": reg_num, "type": type_, "flags": flags}
-
-
-# struct xtensa_reg_desc xtensa_regs[XT_NUM_REGS] — transcribed VERBATIM from
-# xtensa.c:178-280. (ar16..ar63 generated; reg_num == AR index, type GENERAL.)
-xtensa_regs = [
-    XT_MK_REG_DESC("pc", XT_PC_REG_NUM_VIRTUAL, XT_REG_SPECIAL, 0),
-]
-for _n in range(64):            # ar0..ar63 (xtensa.c:180-243)
-    xtensa_regs.append(XT_MK_REG_DESC("ar%d" % _n, _n, XT_REG_GENERAL, 0))
-xtensa_regs += [
-    XT_MK_REG_DESC("windowbase", 0x48, XT_REG_SPECIAL, 0),
-    XT_MK_REG_DESC("windowstart", 0x49, XT_REG_SPECIAL, 0),
-    XT_MK_REG_DESC("ps", XT_PS_REG_NUM, XT_REG_SPECIAL, 0),  # PS (not mapped through EPS[])
-    XT_MK_REG_DESC("ibreakenable", 0x60, XT_REG_SPECIAL, 0),
-    XT_MK_REG_DESC("ddr", 0x68, XT_REG_DEBUG, XT_REGF_NOREAD),
-    XT_MK_REG_DESC("ibreaka0", 0x80, XT_REG_SPECIAL, 0),
-    XT_MK_REG_DESC("ibreaka1", 0x81, XT_REG_SPECIAL, 0),
-    XT_MK_REG_DESC("dbreaka0", 0x90, XT_REG_SPECIAL, 0),
-    XT_MK_REG_DESC("dbreaka1", 0x91, XT_REG_SPECIAL, 0),
-    XT_MK_REG_DESC("dbreakc0", 0xA0, XT_REG_SPECIAL, 0),
-    XT_MK_REG_DESC("dbreakc1", 0xA1, XT_REG_SPECIAL, 0),
-    XT_MK_REG_DESC("cpenable", 0xE0, XT_REG_SPECIAL, 0),
-    XT_MK_REG_DESC("exccause", 0xE8, XT_REG_SPECIAL, 0),
-    XT_MK_REG_DESC("debugcause", 0xE9, XT_REG_SPECIAL, 0),
-    XT_MK_REG_DESC("icount", 0xEC, XT_REG_SPECIAL, 0),
-    XT_MK_REG_DESC("icountlevel", 0xED, XT_REG_SPECIAL, 0),
-]
-# a0..a15 — WARNING: reg_num points to the index of the corresponding ARx
-# register, NOT the processor register number (xtensa.c:261-279).
-for _n in range(16):
-    xtensa_regs.append(XT_MK_REG_DESC("a%d" % _n, XT_REG_IDX_AR0 + _n, XT_REG_RELGEN, 0))
-assert len(xtensa_regs) == XT_NUM_REGS, (len(xtensa_regs), XT_NUM_REGS)
+    """Build one XtensaRegDesc (used for the S3's eps6 optreg, not in the base
+    table). Same XtensaRegDesc as xtensa_regs.py so the cache is homogeneous."""
+    d = XtensaRegDesc(name, reg_num, type_, flags)
+    d.exist = True              # optregs we add are present on the S3
+    return d
 
 
 class _Reg:
@@ -247,9 +204,9 @@ class XtensaCore:
     """
 
     def __init__(self):
-        self.regs = [dict(d) for d in xtensa_regs]           # base XT_NUM_REGS descriptors
+        self.regs = list(xtensa_regs)                        # base XT_NUM_REGS descriptors
         self.optregs = []
-        self.reg_list = [_Reg(d["name"]) for d in xtensa_regs]
+        self.reg_list = [_Reg(d.name) for d in xtensa_regs]
         # ddr is XT_REGF_NOREAD; leave exist True (we never read it back). PC etc.
         # all exist on the S3.
         # --- optregs: the S3 has EPS6 (= EPS_BASE + irq_level) as the run-PS.
@@ -259,7 +216,7 @@ class XtensaCore:
         self.optregs.append(XT_MK_REG_DESC("eps%d" % XT_LX_DEBUG_IRQ_LEVEL,
                                            eps_num, XT_REG_SPECIAL, 0))
         self.regs.append(self.optregs[-1])
-        self.reg_list.append(_Reg(self.optregs[-1]["name"]))
+        self.reg_list.append(_Reg(self.optregs[-1].name))
         self.eps_dbglevel_idx = XT_NUM_REGS + len(self.optregs) - 1
         self.num_regs = len(self.reg_list)
         # algo_context_backup[i] — per-reg saved value (xtensa.h). Sized to the cache.
@@ -453,7 +410,7 @@ class XtensaXDM:
             ridx = i if i < XT_NUM_REGS else i - XT_NUM_REGS
             if reg_list[i].dirty:
                 rd = rlist[ridx]
-                if rd["type"] in (XT_REG_SPECIAL, XT_REG_USER, XT_REG_FR, XT_REG_TIE):
+                if rd.type in (XT_REG_SPECIAL, XT_REG_USER, XT_REG_FR, XT_REG_TIE):
                     scratch_reg_dirty = True
                     if i == XT_REG_IDX_CPENABLE:
                         delay_cpenable = True
@@ -462,12 +419,12 @@ class XtensaXDM:
                     self.nar_write(DDR, regval)
                     self.nar_write(DIR0EXEC, XT_INS_RSR(XT_SR_DDR, XT_REG_A3))
                     if reg_list[i].exist:
-                        reg_num = rd["reg_num"]
-                        if rd["type"] == XT_REG_USER:
+                        reg_num = rd.reg_num
+                        if rd.type == XT_REG_USER:
                             self.nar_write(DIR0EXEC, XT_INS_WUR(reg_num, XT_REG_A3))
-                        elif rd["type"] == XT_REG_FR:
+                        elif rd.type == XT_REG_FR:
                             self.nar_write(DIR0EXEC, XT_INS_WFR(reg_num, XT_REG_A3))
-                        elif rd["type"] == XT_REG_TIE:
+                        elif rd.type == XT_REG_TIE:
                             pass    # tie_reg_access — not configured on the S3
                         else:       # SFR
                             if reg_num == XT_PC_REG_NUM_VIRTUAL:
@@ -485,7 +442,7 @@ class XtensaXDM:
             self.nar_write(DDR, regval)
             self.nar_write(DIR0EXEC, XT_INS_RSR(XT_SR_DDR, XT_REG_A3))
             self.nar_write(DIR0EXEC,
-                           XT_INS_WSR(xtensa_regs[XT_REG_IDX_CPENABLE]["reg_num"], XT_REG_A3))
+                           XT_INS_WSR(xtensa_regs[XT_REG_IDX_CPENABLE].reg_num, XT_REG_A3))
             reg_list[XT_REG_IDX_CPENABLE].dirty = False
 
         preserve_a3 = True      # windowed (LX) — xtensa.c:804
@@ -517,7 +474,7 @@ class XtensaXDM:
                         self.nar_write(DDR, regval)
                         self.nar_write(DIR0EXEC,
                                        XT_INS_RSR(XT_SR_DDR,
-                                                  xtensa_regs[XT_REG_IDX_AR0 + i]["reg_num"]))
+                                                  xtensa_regs[XT_REG_IDX_AR0 + i].reg_num))
                         reg_list[realadr].dirty = False
                         if (i + j) == 3:
                             a3 = regval
