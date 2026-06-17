@@ -50,6 +50,9 @@ def _s(*a):
 MOCK_STEPS = [
     ("invariant (hw-free)", _s("incremental_invariant_test.py")),
     ("tcl-drift (hw-free)", _s("verify_chips_vs_tcl.py")),
+    ("xtensa-regs drift (hw-free)", _s("test_xtensa_regs.py")),
+    ("xtensa-cache (hw-free)", _s("test_xtensa_cache.py")),
+    ("xtensa-algorithm (hw-free)", _s("test_xtensa_algorithm.py")),
     ("s3-flasher (model)", _s("ocd_tcl_bridge.py", "--mock",
                               "--tcl", os.path.join(ROOT, "scripts", "test_s3_mock.tcl"))),
     ("riscv-dmi (model)", _s("test_riscv_mock.py")),
