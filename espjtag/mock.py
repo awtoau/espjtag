@@ -57,6 +57,26 @@ class MockEspUsbJtag:
         """Script a Debug-Module register read (e.g. DMSTATUS = allhalted)."""
         self.dm[address] = value & 0xFFFFFFFF
 
+    # The real debug ops are GENERIC over the transport surface above
+    # (dmi_write / dm_read), so we reuse EspUsbJtag's verbatim — the mock is just a
+    # different backend, exactly like MockXtensaXDM borrows XtensaXDM. This lets a
+    # test call j.halt() / j.read_register() and assert the DMI sequence with no
+    # hardware. (Methods that touch USB endpoints directly are NOT borrowed.)
+    from .debug import EspUsbJtag as _RealDM
+    halt = _RealDM.halt
+    resume = _RealDM.resume
+    examine = _RealDM.examine
+    _abstract_wait = _RealDM._abstract_wait
+    read_register = _RealDM.read_register
+    write_register = _RealDM.write_register
+    _wdt_disable = _RealDM._wdt_disable
+    _chip = _RealDM._chip                  # chips.lookup(read_idcode()) -> chip dict
+    _sb_setup = _RealDM._sb_setup
+    _sbcs_value = staticmethod(_RealDM._sbcs_value)   # keep it static (see debug.py)
+    read_mem32 = _RealDM.read_mem32
+    write_mem32 = _RealDM.write_mem32
+    del _RealDM
+
 
 class _StubCtx:
     def dispose(self, device):
