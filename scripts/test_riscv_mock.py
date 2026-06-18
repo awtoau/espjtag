@@ -15,7 +15,7 @@ from espjtag.constants import (                                # noqa: E402
     DMCONTROL, DM_DMACTIVE, DM_RESUMEREQ, DM_HALTREQ, DM_NDMRESET,
     DMSTATUS, DM_ALLHALTED, DM_ALLRUNNING, COMMAND, DATA0, ABSTRACTCS,
     CMD_ACCESS_REGISTER, AC_AARSIZE32, AC_TRANSFER, AC_WRITE,
-    SBCS, SBADDRESS0, SBDATA0)
+    SBCS, SBADDRESS0, SBDATA0, ABS_BUSY, ABS_CMDERR)
 
 _fail = 0
 
@@ -176,6 +176,51 @@ def test_c5_wdt_disable_runtime_sequence():
           sba[:len(want)], want)
 
 
+def test_abstract_busy_then_ready():
+    """_abstract_wait (debug.py:99) must POLL ABSTRACTCS while ABS_BUSY is set and
+    return 0 once it clears — read_register must not read DATA0 early."""
+    j = MockEspUsbJtag()
+    # ABSTRACTCS reads: busy, busy, then ready (clear)
+    j.set_dm_sequence(ABSTRACTCS, [ABS_BUSY, ABS_BUSY, 0])
+    j.set_dm(DATA0, 0x5A5A5A5A)
+    val = j.read_register(0x1001)
+    # it polled ABSTRACTCS at least 3 times (2 busy + 1 ready)
+    n_abscs = sum(1 for a in j.dmi_reads if a == ABSTRACTCS)
+    check("_abstract_wait polled ABSTRACTCS until !busy (>=3 reads)", n_abscs >= 3, True)
+    check("read_register returns DATA0 after busy clears", val, 0x5A5A5A5A)
+
+
+def test_abstract_cmderr_raises_and_clears():
+    """On an abstract-command error, read_register RAISES (never returns stale
+    DATA0 — the #33 lesson) and _abstract_wait clears cmderr (W1C) for next time."""
+    j = MockEspUsbJtag()
+    j.set_dm(ABSTRACTCS, ABS_CMDERR)                   # not busy, cmderr set
+    raised = False
+    try:
+        j.read_register(0x1001)
+    except RuntimeError:
+        raised = True
+    check("read_register RAISES on abstract cmderr", raised, True)
+    # the W1C clear of ABSTRACTCS must have been written
+    wrote_clear = any(a == ABSTRACTCS and (v & ABS_CMDERR)
+                      for a, v in j.dmi_writes)
+    check("_abstract_wait clears cmderr (W1C write to ABSTRACTCS)", wrote_clear, True)
+
+
+def test_per_chip_idcode_resolves():
+    """The mock parametrizes by IDCODE: each RISC-V part resolves to its chip dict
+    via the same chips.lookup the real transport uses, so chip-specific sequences
+    (e.g. wdt) are exercised per part."""
+    from espjtag import chips
+    for idcode, name, has_wdt in [(0x0000DC25, "C6", True),
+                                  (0x00017C25, "C5", True),
+                                  (0x00005C25, "C3", False)]:
+        j = MockEspUsbJtag(idcode=idcode)
+        c = j._chip()
+        check(f"{name}: IDCODE 0x{idcode:x} -> chip '{name}'", c.get("name"), name)
+        check(f"{name}: wdt table present == {has_wdt}", "wdt" in c, has_wdt)
+
+
 def main():
     print("=== RISC-V debug sequences — NO-HARDWARE (software model) ===")
     test_reset_run_dmi_sequence()
@@ -186,6 +231,9 @@ def main():
     test_write_mem32_sba_sequence()
     test_read_mem32_sba_sequence()
     test_c5_wdt_disable_runtime_sequence()
+    test_abstract_busy_then_ready()
+    test_abstract_cmderr_raises_and_clears()
+    test_per_chip_idcode_resolves()
     print("  (no hardware was touched)")
     return _fail
 

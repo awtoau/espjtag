@@ -24,6 +24,7 @@ class MockEspUsbJtag:
 
     def __init__(self, idcode=0x0000DC25):     # default: an ESP32-C6 IDCODE
         self.dm = {}                  # Debug-Module register model {address: u32}
+        self.dm_seq = {}              # {address: [v0, v1, ...]} scripted read queue
         self.dmi_writes = []          # [(address, value)] every dmi_write, in order
         self.dmi_reads = []           # [address]
         self.ops = []                 # full op log
@@ -39,6 +40,11 @@ class MockEspUsbJtag:
     def dmi_read(self, address, retries=8):
         self.dmi_reads.append(address)
         self.ops.append(("dmi_read", address))
+        # a scripted read sequence (e.g. ABSTRACTCS busy, busy, ready) takes
+        # priority and yields one value per read; its last value sticks.
+        seq = self.dm_seq.get(address)
+        if seq:
+            return (seq.pop(0) if len(seq) > 1 else seq[0]), 0
         return self.dm.get(address, 0), 0          # (data, op-status)
 
     def dm_read(self, address):
@@ -56,6 +62,12 @@ class MockEspUsbJtag:
     def set_dm(self, address, value):
         """Script a Debug-Module register read (e.g. DMSTATUS = allhalted)."""
         self.dm[address] = value & 0xFFFFFFFF
+
+    def set_dm_sequence(self, address, values):
+        """Script SUCCESSIVE reads of `address` (e.g. ABSTRACTCS = [busy, busy,
+        ready]); one value is consumed per read, the last sticks. Used to drive
+        retry/poll paths like _abstract_wait."""
+        self.dm_seq[address] = [v & 0xFFFFFFFF for v in values]
 
     # The real debug ops are GENERIC over the transport surface above
     # (dmi_write / dm_read), so we reuse EspUsbJtag's verbatim — the mock is just a
