@@ -353,6 +353,21 @@ class XtensaXDM:
             self.write_mem32(swd["conf"], conf)
 
     def resume(self):
+        """Resume the halted core — OpenOCD-verbatim: RFDO only (xtensa.c:1718,
+        see xtensa_do_resume below).
+
+        HISTORY (live-proven footgun): this used to be DCRCLR(DEBUGINTERRUPT)
+        only, which drops the halt REQUEST but does NOT return the core from
+        the debug exception — the core stays halted. On the bench that left a
+        XIAO ESP32-S3 stranded (no serial, no BLE, no ROM sync; survived USB
+        bus resets, chip resets and debug-domain powerdown) until a full
+        reflash cycle recovered it. Use clear_debug_interrupt() for the old
+        request-drop behaviour."""
+        self.nar_write(DIR0EXEC, INS_RFDO)
+
+    def clear_debug_interrupt(self):
+        """Drop a pending halt request (DCRCLR DEBUGINTERRUPT) WITHOUT resuming
+        the core — the raw operation resume() used to (mis)perform."""
         self.nar_write(DCRCLR, OCDDCR_DEBUGINTERRUPT)
 
     # --- call a function on the halted core (ported from xtensa_start_algorithm) --
@@ -373,10 +388,18 @@ class XtensaXDM:
         self.nar_write(DIR0EXEC, wsr_ins)            # sr = a3
 
     def _get_sr_a3(self, rsr_ins):
-        """read special-reg, using a3 as scratch (RSR a3,sr; WSR a3,DDR; read DDR)."""
+        """read special-reg, using a3 as scratch (RSR a3,sr; WSR a3,DDR; read DDR).
+
+        Saves + restores a3 like read_mem/write_mem do — this used to leave the
+        special-reg value in the live a3, corrupting the interrupted context on
+        resume (bench-measured fallout: a task-wdt HANG in the interrupted
+        thread right after a halt/sample/resume pass)."""
+        saved_a3 = self._save_a3()                   # preserve the app's a3
         self.nar_write(DIR0EXEC, rsr_ins)            # a3 = sr
         self.nar_write(DIR0EXEC, INS_WSR_DDR_A3)     # DDR = a3
-        return self.nar_read(DDR)
+        val = self.nar_read(DDR)
+        self._restore_a3(saved_a3)                   # hand a3 back to the app
+        return val
 
     # ======================================================================
     # Register cache access — PORTED FROM xtensa.c. xtensa_reg_get/set operate

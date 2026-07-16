@@ -7,7 +7,6 @@
     python3 scripts/check.py           # both (mock first, then real). Default.
 
 MOCK steps (no chip):
-  - incremental invariant         (pyOCD bug class, hardware-free)
   - tcl-drift                     (chips.py vs OpenOCD Tcl, hardware-free)
   - S3 flasher (software model)   (test_s3_mock.tcl via the Tcl bridge)
 REAL steps (need a chip):
@@ -48,7 +47,7 @@ def _s(*a):
 
 # (name, argv-after-python). Boards/flags resolved above.
 MOCK_STEPS = [
-    ("invariant (hw-free)", _s("incremental_invariant_test.py")),
+    # (invariant test moved out with the CubeProgrammer docs — stlinkprogrammer repo)
     ("tcl-drift (hw-free)", _s("verify_chips_vs_tcl.py")),
     ("xtensa-regs drift (hw-free)", _s("test_xtensa_regs.py")),
     ("xtensa-cache (hw-free)", _s("test_xtensa_cache.py")),
