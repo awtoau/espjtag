@@ -63,7 +63,16 @@ class EspUsbJtagTransport:
     # need listing (single-TAP is the class default above).
     _CHAIN_BY_IDCODE = chips.chain_by_idcode()
 
-    def __init__(self, usb_path=None, serial=None):
+    def __init__(self, usb_path=None, serial=None, tap=None):
+        # `tap` — optional TAP override for multi-TAP chains, in TDO-first order
+        # (same convention as idcode_index). None = the chips.py table default.
+        # ESP32-S3 (VERIFIED live, espjtag#50): tap0 = cpu0/procpu — the core a
+        # single-core (AMP) app RUNS ON: halting it shows PC in IRAM and a real
+        # DRAM sp. tap1 (the table default) = cpu1/appcpu, PARKED in ROM on an
+        # AMP build (PC at the reset vector, zeroed register file). Fault
+        # diagnosis of a running app needs tap=0; the table default stays tap1
+        # until the flasher is re-verified on tap0 (tracked in #50).
+        self._tap_override = tap
         # Pin the right unit when several 303a:1001 are on the bus. Two keys:
         #   serial   — the device's USB serial (the MAC); STABLE across re-enumer-
         #              ation. PREFER THIS: a board that drops and comes back under
@@ -483,6 +492,16 @@ class EspUsbJtagTransport:
             self.taps_after = layout["taps_after"]
             self.taps_before = layout["taps_before"]
             self.idcode_index = layout["idcode_index"]
+        # Explicit TAP selection (TDO-first index k of an N-TAP chain):
+        # k taps sit between the target and TDO, N-1-k between TDI and target.
+        tap = getattr(self, "_tap_override", None)
+        if tap is not None:
+            n = sum(1 for i in ids if i)          # IDCODE-bearing TAPs on the chain
+            if not 0 <= tap < n:
+                raise ValueError(f"tap={tap} out of range for {n}-TAP chain")
+            self.taps_after = tap
+            self.taps_before = n - 1 - tap
+            self.idcode_index = tap
         self._chain_detected = True
 
     def read_idcode(self):

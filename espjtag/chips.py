@@ -43,6 +43,13 @@ _C5_TWO_TAP = dict(taps_after=1, taps_before=0, idcode_index=1)
 # we target one with the other in BYPASS (one BYPASS bit toward TDO), so the scan
 # layout matches the C5's two-TAP shape. (A single-TAP layout here misaligns every
 # IR/DR scan by one bit — read_idcode only looked OK because both IDCODEs match.)
+#
+# WHICH CORE IS WHICH (VERIFIED live on a running AMP build, #50): TDO-first
+# tap0 (taps_after=0, idcode_index=0) = cpu0/procpu — the RUNNING core (halt
+# shows PC in IRAM, real DRAM sp). This table default (tap1) = cpu1/appcpu —
+# PARKED in ROM on an AMP build (PC at the reset vector, zeroed registers).
+# Callers doing fault diagnosis of a live app must pass EspUsbJtag(tap=0);
+# the default stays tap1 until the flasher is re-verified on tap0 (#50).
 _S3_TWO_TAP = dict(taps_after=1, taps_before=0, idcode_index=1)
 
 
