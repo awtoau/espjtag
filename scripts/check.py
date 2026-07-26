@@ -13,6 +13,7 @@ REAL steps (need a chip):
   - selftest + DMIRESET C6/C5     (drain_mode=validate byte accounting)
   - xcheck 3-way JTAG dump        (espjtag vs OpenOCD vs probe-rs)
   - S3 flasher (on target)        (test_s3_stub.tcl)
+  - reset guard on the S3 (#51)   (Xtensa reset paths refuse; non-destructive)
   - flash bench, recorded         (-> tmp/flash-bench.db keyed by git sha)
   - progression graph             (-> docs/images/flash-progression.png)
 
@@ -38,6 +39,7 @@ C6_MAC = ENV.get("C6_MAC", "E4:B0:63:41:C1:44")
 C6_TTY = ENV.get("C6_TTY", "/dev/ttyACM2")
 C5_USB = ENV.get("C5_USB", "1-1.2")                # c5-xiao-a
 S3_USB = ENV.get("S3_USB", "1-1.3.3.4")            # s3-xiao-sense (#29 flasher)
+S3_MAC = ENV.get("S3_MAC", "1C:DB:D4:76:82:08")    # s3-xiao-sense (serial-pinned)
 FLASHERS = ENV.get("FLASHERS", "espjtag-full,espjtag-incr,esptool-incr")
 
 
@@ -62,6 +64,7 @@ REAL_STEPS = [
     ("xcheck 3-way dump C6", _s("xcheck.py", "--usb", C6_USB, "--serial", C6_MAC)),
     ("s3-flasher (target)", _s("ocd_tcl_bridge.py", "--usb", S3_USB,
                                "--tcl", os.path.join(ROOT, "scripts", "test_s3_stub.tcl"))),
+    ("reset-guard S3 (#51)", _s("test_reset_guard_hw.py", "--serial", S3_MAC)),
     ("flash bench (record)", _s("flash_bench.py", "--usb", C6_USB, "--tty", C6_TTY,
                                 "--rounds", "3", "--flashers", FLASHERS,
                                 "--record", "--note", NOTE)),

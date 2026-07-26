@@ -347,6 +347,45 @@ def is_riscv(idcode):
     return bool(e) and e.get("core") == "riscv"
 
 
+class UnsupportedCoreError(RuntimeError):
+    """A RISC-V Debug Module operation (reset over JTAG) was attempted on a part
+    that doesn't expose one — an Xtensa ESP32-S2/S3, or an IDCODE not in the
+    per-chip table. Carries an actionable message; the reset entry points raise
+    it at the call site rather than letting a lower-level DMI failure surface
+    (espjtag#51)."""
+
+
+def require_riscv(idcode, op="reset over JTAG"):
+    """Guard for the RISC-V-only reset paths. Returns the chip entry for a known
+    RISC-V part; otherwise raises UnsupportedCoreError with an actionable message.
+
+    espjtag's reset pulses ndmreset in the RISC-V Debug Module, which the Xtensa
+    parts (ESP32-S2/S3) do not have — they use Xtensa OCD, a different debug
+    module with no DMCONTROL/ndmreset (constants.py). Shifting the RISC-V DMI IR
+    at an Xtensa TAP is at best inert (an undefined IR decodes to BYPASS) and at
+    worst a stray debug-domain poke — and this transport already owns the story of
+    an S3 stranded by a bad debug-domain write until a full reflash (xtensa.py
+    resume() history). So fail loudly here instead of writing into the dark."""
+    e = lookup(idcode)
+    if e and e.get("core") == "riscv":
+        return e
+    if e and e.get("core") == "xtensa":
+        raise UnsupportedCoreError(
+            f"{op}: {e['name']} is an Xtensa part (ESP32-S2/S3) — espjtag drives "
+            f"reset only on the RISC-V parts (C3/C5/C6/H2), which have the RISC-V "
+            f"Debug Module it pulses ndmreset in. Reset this chip with esptool "
+            f"`--after hard-reset` (its RTS reset cycles the S3's USB-JTAG "
+            f"cleanly) or an external EN toggle. Native Xtensa reset is tracked "
+            f"in espjtag#51."
+        )
+    raise UnsupportedCoreError(
+        f"{op}: unrecognised IDCODE 0x{idcode & 0xFFFFFFFF:08x} — espjtag resets "
+        f"only known RISC-V parts (C3/C5/C6/H2). If this is a new RISC-V part, add "
+        f"it to espjtag/chips.py (the single per-chip table); if it's an Xtensa "
+        f"part, reset it with esptool `--after hard-reset`."
+    )
+
+
 def is_verified(idcode):
     """False for entries explicitly flagged verified=False (e.g. the C3 IDCODE
     guess); True for a tabled, bench-confirmed part; False for unknown IDCODEs."""

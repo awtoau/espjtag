@@ -221,9 +221,55 @@ def test_per_chip_idcode_resolves():
         check(f"{name}: wdt table present == {has_wdt}", "wdt" in c, has_wdt)
 
 
+def test_reset_guard_rejects_non_riscv():
+    """The reset paths must FAIL LOUDLY on a non-RISC-V TAP instead of firing the
+    RISC-V DMI sequence into the dark (espjtag#51). An Xtensa S3 IDCODE and an
+    unrecognised IDCODE both raise UnsupportedCoreError with NO DMCONTROL writes;
+    a known RISC-V part passes the guard and does write. reset_run_from_rom guards
+    before its USB bus reset too."""
+    from espjtag import chips
+
+    # S3 (Xtensa) — reset_run raises, and does so BEFORE any DMI write.
+    s3 = MockEspUsbJtag(idcode=0x120034E5)
+    raised = False
+    try:
+        EspUsbJtag.reset_run(s3)
+    except chips.UnsupportedCoreError as e:
+        raised = True
+        check("S3 guard message names the Xtensa part", "Xtensa" in str(e), True)
+    check("reset_run raises UnsupportedCoreError on S3", raised, True)
+    check("reset_run wrote NO DMCONTROL before the guard fired",
+          [v for a, v in s3.dmi_writes if a == DMCONTROL], [])
+
+    # Unrecognised IDCODE — also rejected (conservative; add new parts to chips.py).
+    unknown = MockEspUsbJtag(idcode=0xDEADBEEF)
+    raised = False
+    try:
+        EspUsbJtag.reset_run(unknown)
+    except chips.UnsupportedCoreError:
+        raised = True
+    check("reset_run raises UnsupportedCoreError on unknown IDCODE", raised, True)
+
+    # reset_run_from_rom guards before the USB bus reset (never reaches usbreset).
+    raised = False
+    try:
+        EspUsbJtag.reset_run_from_rom(MockEspUsbJtag(idcode=0x120034E5))
+    except chips.UnsupportedCoreError:
+        raised = True
+    check("reset_run_from_rom raises UnsupportedCoreError on S3", raised, True)
+
+    # A known RISC-V part passes the guard (C6 default) — sanity that it's not a
+    # blanket block. reset_run should complete and emit DMCONTROL writes.
+    c6 = MockEspUsbJtag()
+    EspUsbJtag.reset_run(c6)
+    check("reset_run on C6 passes the guard and writes DMCONTROL",
+          bool([v for a, v in c6.dmi_writes if a == DMCONTROL]), True)
+
+
 def main():
     print("=== RISC-V debug sequences — NO-HARDWARE (software model) ===")
     test_reset_run_dmi_sequence()
+    test_reset_guard_rejects_non_riscv()
     test_halt_dmi_sequence()
     test_resume_dmi_sequence()
     test_read_register_abstract_sequence()

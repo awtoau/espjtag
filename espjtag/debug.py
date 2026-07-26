@@ -1031,6 +1031,7 @@ class EspUsbJtag(EspUsbJtagTransport):
         then deassert ndmreset and resume. The ndmreset is the full-system reset
         the C6 USJ core-reset can't do; haltreq holds the hart so the reset is
         clean; resumereq runs the freshly-strapped app. Verified vs OpenOCD."""
+        chips.require_riscv(self.read_idcode(), op="reset_run over JTAG")
         if log:
             log("  -- pre-reset diag --")
             self.diag(log)
@@ -1177,6 +1178,10 @@ class EspUsbJtag(EspUsbJtagTransport):
         invalidates this object's handle, so a NEW transport is opened internally
         for the JTAG phase; the caller's `self.dev` is disposed."""
         from .usbreset import reset_device, platform_reset_note
+
+        # Guard BEFORE the USB bus reset — no point re-enumerating an Xtensa part
+        # for a JTAG reset phase that can't run on it (espjtag#51).
+        chips.require_riscv(self.read_idcode(), op="reset_run_from_rom over JTAG")
 
         def _log(m):
             if log:

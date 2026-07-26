@@ -26,6 +26,7 @@ import time
 
 import usb.util
 
+from . import chips
 from .constants import (
     DMCONTROL, DM_DMACTIVE, DM_NDMRESET, DM_ACKHAVERESET, DM_RESUMEREQ,
     DM_HALTREQ,
@@ -46,6 +47,10 @@ def reset_run(usb_path=None, serial=None):
     of esptool `--after hard-reset`, whose RTS reset drops the USB-Serial/JTAG
     peripheral off the bus (esptool #970; openocd-esp32 #316/#342)."""
     j = EspUsbJtagTransport(usb_path, serial=serial)
+    # Refuse to fire the RISC-V DMI sequence at a non-RISC-V TAP (Xtensa S2/S3 or
+    # an unknown part) — read_idcode() also detects the chain, which the writes
+    # below rely on. See chips.require_riscv / espjtag#51.
+    chips.require_riscv(j.read_idcode(), op="reset_run over JTAG")
     j.dmi_write(DMCONTROL, DM_DMACTIVE)                              # claim DM
     j.dmi_write(DMCONTROL, DM_RESUMEREQ | DM_DMACTIVE)
     j.dmi_write(DMCONTROL, DM_HALTREQ | DM_NDMRESET | DM_DMACTIVE)   # assert reset

@@ -67,14 +67,22 @@ def main():
 
     if "--reset-run" in sys.argv:
         from .reset import reset_run
-        reset_run(usb_path=path, serial=serial)
+        try:
+            reset_run(usb_path=path, serial=serial)
+        except chips.UnsupportedCoreError as e:
+            print(f"reset-run: {e}", file=sys.stderr)
+            return 1
         print(f"reset-run: booted via ndmreset over JTAG (no USB re-enumeration)"
               f"{' serial=' + serial if serial else ''}")
         return 0
     if "--reset-from-rom" in sys.argv:
         j = EspUsbJtag(path, serial=serial) if serial else EspUsbJtag(path)
-        j.examine()
-        j.reset_run_from_rom(log=print)
+        try:
+            j.examine()
+            j.reset_run_from_rom(log=print)
+        except chips.UnsupportedCoreError as e:
+            print(f"reset-from-rom: {e}", file=sys.stderr)
+            return 1
         print("reset-from-rom: USB-bus reset + ndmreset — app should be booting.")
         return 0
     if "--selftest" in sys.argv:
