@@ -24,7 +24,7 @@ Tcl, kept side-by-side until proven — a correctness hedge, NOT because it's sl
 
 Validate against OpenOCD -d3 (the golden trace), not flaky device values.
 
-Usage:  python3 scripts/ocd_tcl_bridge.py --usb 1-1.3.3.3 [--reset]
+Usage:  python3 scripts/ocd_tcl_bridge.py (--usb 1-1.3.3.3 | --serial MAC) [--reset]
 """
 import argparse
 import os
@@ -375,6 +375,9 @@ class OcdTclBridge:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--usb", help="usb_path of the target (omit with --mock)")
+    ap.add_argument("--serial", help="target USB serial/MAC — STABLE across "
+                    "re-enumeration (preferred over --usb, which is a volatile "
+                    "bus-port path). Pass one of --usb / --serial.")
     ap.add_argument("--mock", action="store_true",
                     help="NO HARDWARE: run only the pure + mock_* commands "
                          "(the flasher against MockXtensaXDM). For --tcl tests.")
@@ -394,9 +397,9 @@ def main():
             bridge.run(f.read())
         return 0
 
-    if not args.usb:
-        ap.error("--usb is required (or use --mock)")
-    j = EspUsbJtag(args.usb)
+    if not args.usb and not args.serial:
+        ap.error("--usb or --serial is required (or use --mock)")
+    j = EspUsbJtag(args.usb, serial=args.serial) if args.serial else EspUsbJtag(args.usb)
     ic = j.read_idcode()
     br = OcdTclBridge(j)
     print(f"IDCODE=0x{ic:08x} [{chips.name_for(ic) or '??'}]  core={br.core}")
