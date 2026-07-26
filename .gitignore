@@ -7,4 +7,8 @@ dist/
 tmp/
 .claude/
 
+# Exported Claude Code transcripts — local archive only; they carry absolute
+# filesystem paths and this repo is public. Regenerate with scripts/export_chats.py.
+docs/chats/
+
 .claude/settings.local.json
